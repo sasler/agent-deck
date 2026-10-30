@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessParser, HarnessView, LimitWindow, Limits, Tokens } from '../types'
+import type { Activity, AgentCard, Harness, HarnessParser, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
   PARSERS,
@@ -49,6 +49,9 @@ const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, 
 const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { mode: 'cards' } as HarnessView)
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
+const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot'] }
+const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
+const COPILOT_ACCENT = '#8957E5'
 
 type $T = EngineInterface
 
@@ -128,7 +131,29 @@ export const barSvg = (percent: number, fill: string): string => {
   )
 }
 
-const windowName = (label: string) => (label === '5h' ? '5-hour limit' : label === '7d' ? 'Weekly limit' : `${label} limit`)
+const windowName = (label: string) =>
+  label === '5h' ? '5-hour limit' : label === '7d' ? 'Weekly limit' : label === 'mo' ? 'Monthly premium requests' : `${label} limit`
+
+/**
+ * Copilot's premium-request window from `gh api copilot_internal/user`: percent used,
+ * the monthly reset, and "used of entitlement". Undefined when unlimited or absent.
+ */
+export const copilotLimits = (d: unknown): { windows: LimitWindow[]; plan: string } | undefined => {
+  const o = (d && typeof d === 'object' ? d : {}) as Record<string, unknown>
+  const q = ((o.quota_snapshots ?? {}) as Record<string, Record<string, unknown>>).premium_interactions
+  if (!q || q.unlimited === true || typeof q.entitlement !== 'number' || q.entitlement <= 0) return undefined
+  const remaining = typeof q.remaining === 'number' ? q.remaining : q.entitlement
+  const percent = typeof q.percent_remaining === 'number' ? 100 - q.percent_remaining : ((q.entitlement - remaining) / q.entitlement) * 100
+  const reset = typeof o.quota_reset_date_utc === 'string' ? Date.parse(o.quota_reset_date_utc) : NaN
+  return {
+    windows: [{ label: 'mo', percent: Math.max(0, percent), resetsAt: Number.isNaN(reset) ? undefined : reset }],
+    plan: `${Math.max(0, q.entitlement - remaining)} of ${q.entitlement}`,
+  }
+}
+
+/** Whether a provider's meter shows, by the person's choice and what this session used. */
+export const isMeterShown = (choice: MeterChoice, p: MeterProvider, used: ReadonlySet<MeterProvider>): boolean =>
+  choice.mode === 'all' || (choice.mode === 'session' ? used.has(p) : choice.selected.includes(p))
 
 const toneColor = (tone: 'warm' | 'cold' | 'unknown') => (tone === 'warm' ? 'success' : tone === 'cold' ? 'error' : undefined)
 
@@ -144,7 +169,7 @@ const windowLabel = (minutes: number | undefined): string =>
 const statusText = (l: Limits): string | undefined => {
   const part = (name: string, ws: LimitWindow[]) =>
     ws.length ? `${name} ${ws.map(w => `${w.label} ${Math.round(w.percent)}%`).join(' · ')}` : ''
-  const text = [part('Codex', l.codex), part('Claude', l.claude)].filter(Boolean).join('  │  ')
+  const text = [part('Codex', l.codex), part('Claude', l.claude), part('Copilot', l.copilot ?? [])].filter(Boolean).join('  │  ')
   return text || undefined
 }
 
@@ -974,6 +999,45 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
 
 type AgentRunInput = { harness: string; prompt: string; title?: string; model?: string; cwd?: string; resume?: string }
 
+// ---------- Copilot's premium requests, and which meters show ----------
+
+const KEY_METERS = 'meters'
+let copilotPoller: { cancel: () => void } | undefined
+
+/** Reads Copilot's quota through the GitHub CLI; false where gh is missing, signed out or has no Copilot. */
+const refreshCopilotLimits = async ($: $T): Promise<boolean> => {
+  const r = await $.process.run(['gh', 'api', 'copilot_internal/user'], { timeoutMs: 20_000 }).catch(() => undefined)
+  if (!r || r.exitCode !== 0) return false
+  let reading: ReturnType<typeof copilotLimits>
+  try {
+    reading = copilotLimits(JSON.parse(r.stdout))
+  } catch {
+    return false
+  }
+  if (!reading) return false
+  const { windows, plan } = reading
+  await setLimits($, l => ({ ...l, copilot: windows, copilotPlan: plan }))
+  return true
+}
+
+const startCopilotLimits = async ($: $T) => {
+  if (copilotPoller || !(await refreshCopilotLimits($))) return
+  copilotPoller = $.clock.every(5 * 60_000, () => void refreshCopilotLimits($))
+}
+
+async function loadMeters($: $T) {
+  const stored = await $.store.get(KEY_METERS)
+  const o = (stored && typeof stored === 'object' ? stored : {}) as Partial<MeterChoice>
+  const mode = o.mode === 'session' || o.mode === 'selected' ? o.mode : 'all'
+  const selected = Array.isArray(o.selected) ? o.selected.filter(x => ['claude', 'codex', 'copilot'].includes(x)) : DEFAULT_METERS.selected
+  await update($, metersAtom, () => ({ mode, selected }))
+}
+
+async function saveMeters($: $T, choice: MeterChoice) {
+  await $.store.set(KEY_METERS, choice)
+  await update($, metersAtom, () => choice)
+}
+
 // ---------- the built-in Codex: on or off ----------
 
 const KEY_CODEX = 'codex-enabled'
@@ -1203,6 +1267,8 @@ export const register: Register = on => {
     if (codexOn) await startCodexWatcher($)
     void refreshClaudeLimits($)
     poller = $.clock.every(60_000, () => void refreshClaudeLimits($))
+    await loadMeters($).catch(() => undefined)
+    void startCopilotLimits($)
     openPane($)
     strataSince = (await $.clock.now()) - 5000
     strataTimer = $.clock.every(1000, () => void pollStrata($))
@@ -1222,6 +1288,8 @@ export const register: Register = on => {
     ticker?.cancel()
     runPoller?.cancel()
     harnessPoller?.cancel()
+    copilotPoller?.cancel()
+    copilotPoller = undefined
     return next(e)
   })
 
@@ -1501,6 +1569,7 @@ export const register: Register = on => {
     const hs = await read($, harnessesAtom)
     const found = await read($, foundAtom)
     const isCodexOn = await read($, codexAtom)
+    const meters = await read($, metersAtom)
     const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
     // Surfaces that draw SVG get thick bars; the terminal keeps its text meters.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
@@ -1931,6 +2000,7 @@ export const register: Register = on => {
             Adding and editing harnesses needs the desktop app or the terminal.
           </Text>
         )}
+        {metersSection()}
       </Box>
     )
 
@@ -2024,6 +2094,66 @@ export const register: Register = on => {
       )
     }
 
+    const presetOf = (id?: string) => hs.find(x => x.id === id)?.preset
+    const used = new Set<MeterProvider>(['claude'])
+    for (const c of list) {
+      if (c.provider === 'codex' || presetOf(c.harness) === 'codex-cli') used.add('codex')
+      if (presetOf(c.harness) === 'copilot') used.add('copilot')
+    }
+    // A provider shows only with a reading: Codex also only while its built-in mode is on.
+    const hasReading: Record<MeterProvider, boolean> = {
+      claude: lim.claude.length > 0,
+      codex: isCodexOn && lim.codex.length > 0,
+      copilot: (lim.copilot ?? []).length > 0,
+    }
+    const shown = new Set((['codex', 'claude', 'copilot'] as const).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
+
+    const METER_NAMES: Record<MeterProvider, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot' }
+    const metersSection = () => (
+      <Box flexDirection="column" gap={1} marginTop={1}>
+        <Text bold>Usage meters</Text>
+        {Select ? (
+          <Select
+            key="m-mode"
+            label="Show"
+            options={[
+              { value: 'all', label: 'All connected' },
+              { value: 'session', label: 'Used in this session' },
+              { value: 'selected', label: 'Selected' },
+            ]}
+            value={meters.mode}
+            onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })}
+          />
+        ) : (
+          <Text dimColor>{meters.mode === 'all' ? 'All connected' : meters.mode === 'session' ? 'Used in this session' : 'Selected'}</Text>
+        )}
+        {meters.mode === 'selected' && (
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            {(['claude', 'codex', 'copilot'] as const).map(x => {
+              const isOn = meters.selected.includes(x)
+              return (
+                <Button
+                  key={`m-${x}`}
+                  label={`${METER_NAMES[x]} ${isOn ? '✓' : '·'}`}
+                  variant={isOn ? 'primary' : undefined}
+                  onPress={() =>
+                    void saveMeters($, { ...meters, selected: isOn ? meters.selected.filter(y => y !== x) : [...meters.selected, x] })
+                  }
+                />
+              )
+            })}
+          </Box>
+        )}
+        <Text dimColor wrap="wrap">
+          {[
+            'Claude: this session.',
+            isCodexOn ? 'Codex: read from its session files.' : 'Codex: needs the built-in Codex on.',
+            hasReading.copilot ? 'Copilot: premium requests via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
+          ].join(' ')}
+        </Text>
+      </Box>
+    )
+
     const codexHarnesses = hs.filter(x => x.preset === 'codex-cli')
     const codexMode = isCodexOn ? 'builtin' : codexHarnesses.some(x => x.isEnabled) ? 'custom' : 'off'
 
@@ -2091,8 +2221,9 @@ export const register: Register = on => {
           <Button key="h-open" label="⚙ Harnesses" plain onPress={() => void setView({ mode: 'list' })} />
         </Box>
         <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
-          {isCodexOn && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
-          {limitRow('Claude', 'claude', lim.claude)}
+          {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
+          {shown.has('claude') && limitRow('Claude', 'claude', lim.claude)}
+          {shown.has('copilot') && limitRow('Copilot', COPILOT_ACCENT, lim.copilot ?? [], lim.copilotPlan)}
         </Box>
         {cacheBox}
         {list.length === 0 && <Text dimColor>No subagents yet. Codex, Claude and harness runs appear here.</Text>}

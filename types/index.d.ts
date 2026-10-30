@@ -90,6 +90,18 @@ export type Limits = {
   codex: LimitWindow[]
   claude: LimitWindow[]
   codexPlan?: string
+  /** Copilot's monthly premium requests, read with `gh api copilot_internal/user`. */
+  copilot?: LimitWindow[]
+  copilotPlan?: string
+}
+
+export type MeterProvider = 'claude' | 'codex' | 'copilot'
+
+/** Which usage meters the pane shows. */
+export type MeterChoice = {
+  /** all: every provider with a reading; session: those used in this session; selected: the list below. */
+  mode: 'all' | 'session' | 'selected'
+  selected: MeterProvider[]
 }
 
 export type CachePing = {
@@ -146,6 +158,7 @@ declare module 'claude-code' {
       found: Record<string, boolean>
       /** Whether the built-in Codex (codex tools, live view, usage meters) is on. */
       codexEnabled: boolean
+      meters: MeterChoice
     }
   }
 }

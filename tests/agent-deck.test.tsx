@@ -4,6 +4,8 @@ import {
   applyStrataRecord,
   applyToCard,
   barSvg,
+  copilotLimits,
+  isMeterShown,
   cacheHitPercent,
   clip,
   codexArgs,
@@ -16,7 +18,7 @@ import {
   strataTitle,
   toLimitWindows,
 } from '../hooks/register'
-import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor } from '../hooks/cache'
+import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { PRESETS, applyHarnessEvent, expandArgs, fromPreset, harnessError, parseLine, slugId, tokenizeArgs } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -427,5 +429,60 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   await ui.redraw()
   expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
   expect((await ui.findAll({ type: 'Button' } as never)).some(b => (b as { key?: string }).key === 'h-toggle-codex-cli' && (b as { text?: string }).text === 'Off')).toBe(true)
+  await ui.unmount()
+})
+
+test('Copilot premium requests become a meter', () => {
+  const r = copilotLimits({
+    quota_reset_date_utc: '2026-11-01T00:00:00.000Z',
+    quota_snapshots: {
+      chat: { unlimited: true, entitlement: 0, remaining: 0, percent_remaining: 100 },
+      premium_interactions: { unlimited: false, entitlement: 1500, remaining: 870, percent_remaining: 58 },
+    },
+  })
+  expect(r?.windows).toEqual([{ label: 'mo', percent: 42, resetsAt: Date.parse('2026-11-01T00:00:00.000Z') }])
+  expect(r?.plan).toBe('630 of 1500')
+  expect(copilotLimits({ quota_snapshots: { premium_interactions: { unlimited: true } } })).toBeUndefined()
+  expect(copilotLimits({})).toBeUndefined()
+})
+
+test('meters show by the choice made', () => {
+  const used = new Set(['claude', 'codex'] as const)
+  expect(isMeterShown({ mode: 'all', selected: [] }, 'copilot', used)).toBe(true)
+  expect(isMeterShown({ mode: 'session', selected: [] }, 'copilot', used)).toBe(false)
+  expect(isMeterShown({ mode: 'session', selected: [] }, 'codex', used)).toBe(true)
+  expect(isMeterShown({ mode: 'selected', selected: ['copilot'] }, 'copilot', used)).toBe(true)
+  expect(isMeterShown({ mode: 'selected', selected: ['copilot'] }, 'claude', used)).toBe(false)
+})
+
+test('only a base URL off the Anthropic API counts as a gateway', () => {
+  expect(isGatewayUrl(undefined)).toBe(false)
+  expect(isGatewayUrl('https://api.anthropic.com')).toBe(false)
+  expect(isGatewayUrl('https://api.anthropic.com/')).toBe(false)
+  expect(isGatewayUrl('https://llm-gateway.example.com')).toBe(true)
+})
+
+test('the meter choice is set in the Harnesses view', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Usage meters/ })).toBeDefined()
+  await ui.select({ key: 'm-mode', value: 'selected' })
+  await ui.redraw()
+  await ui.press({ key: 'm-claude' } as never)
+  await ui.redraw()
+  const buttons = (await ui.findAll({ type: 'Button' } as never)) as { key?: string; text?: string }[]
+  expect(buttons.find(b => b.key === 'm-claude')?.text).toBe('Claude ·')
+  expect(buttons.find(b => b.key === 'm-copilot')?.text).toBe('Copilot ✓')
   await ui.unmount()
 })

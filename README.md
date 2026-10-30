@@ -4,7 +4,12 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
 ## What it shows
 
-- **Usage limits.** Claude's 5-hour and 7-day windows, plus Codex's limits read from its session files, each as a meter with a percentage and a reset countdown.
+- **Usage limits.** Each provider's limits as a meter with a percentage and a reset countdown:
+  - Claude's 5-hour and weekly windows;
+  - Codex's limits, read from its session files;
+  - Copilot's monthly premium requests, read through the GitHub CLI (`gh api copilot_internal/user`).
+
+  Under ⚙ Harnesses → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
 - **Keep-warm.** Pick 2, 4 or 6 hours in the cache box, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
 - **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Send it again to go ahead. Change this with `/cache guard refuse|warn|off`.
@@ -78,6 +83,7 @@ In the desktop app, click **+** next to the prompt box, then **Plugins**, **Add 
 **Requirements**
 - **Node.js on your PATH.** It runs the Codex watcher and the background runner.
 - **The agent CLIs you want to use**, installed and signed in: `codex`, `copilot`, `opencode`, and so on.
+- **The GitHub CLI (`gh`), signed in,** for the Copilot usage meter.
 
 ## Commands
 

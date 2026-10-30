@@ -40,15 +40,19 @@ export const ttlFor = (i: TtlInputs): number => {
   return i.isMetered ? FIVE_MIN : HOUR
 }
 
+export const isGatewayUrl = (url: string | undefined): boolean =>
+  !!url?.trim() && !/^https:\/\/api\.anthropic\.com(\/v1)?\/?$/i.test(url.trim())
+
 async function resolveTtl($: $T): Promise<number> {
   const metered = await Promise.all([
     $.env.get('ANTHROPIC_API_KEY'),
     $.env.get('ANTHROPIC_AUTH_TOKEN'),
-    $.env.get('ANTHROPIC_BASE_URL'),
     $.env.get('CLAUDE_CODE_USE_BEDROCK'),
     $.env.get('CLAUDE_CODE_USE_VERTEX'),
     $.env.get('CLAUDE_CODE_USE_FOUNDRY'),
   ])
+  // The desktop app sets the base URL to Anthropic's own API; only another host is a gateway.
+  metered.push(isGatewayUrl(await $.env.get('ANTHROPIC_BASE_URL')) ? 'gateway' : undefined)
   const usage = await $.session.usage().catch(() => undefined)
   // Past a plan's limit the session draws on usage credits, which drop it to five minutes.
   const isOverPlan = usage?.rateLimits.some(r => r.percentUsed >= 100) ?? false
