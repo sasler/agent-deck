@@ -85,6 +85,20 @@ In the desktop app, click **+** next to the prompt box, then **Plugins**, **Add 
 - **The agent CLIs you want to use**, installed and signed in: `codex`, `copilot`, `opencode`, and so on.
 - **The GitHub CLI (`gh`), signed in,** for the Copilot usage meter.
 
+## Update
+
+agent-deck is not in the official plugin directory: this repository is its own marketplace, named `agent-deck`. To get a new version, refresh that marketplace, then update the plugin:
+
+```bash
+claude plugin marketplace update agent-deck
+```
+
+```bash
+claude plugin update agent-deck@agent-deck
+```
+
+Then restart Claude Code, or run `/reload-plugins`. At the prompt, `/plugin` → **Marketplaces** → `agent-deck` does the same, and can switch on auto-update, which is off by default for marketplaces other than Anthropic's.
+
 ## Commands
 
 | Command | What it does |
