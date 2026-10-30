@@ -1,7 +1,7 @@
 export type Provider = 'codex' | 'claude' | 'strata' | 'harness'
 
 /** How a harness's stdout is read. */
-export type HarnessParser = 'copilot' | 'opencode' | 'gemini' | 'cursor' | 'claude' | 'text'
+export type HarnessParser = 'codex' | 'copilot' | 'opencode' | 'gemini' | 'cursor' | 'claude' | 'text'
 
 /** A CLI agent agent-deck can start, as the person set it up in the Harnesses view. */
 export type Harness = {
@@ -26,6 +26,8 @@ export type Harness = {
 export type HarnessView =
   | { mode: 'cards' }
   | { mode: 'list' }
+  /** The built-in Codex: built in, or a custom harness. */
+  | { mode: 'codex' }
   | { mode: 'edit'; draft: Harness; originalId?: string; error?: string }
 
 export type AgentStatus = 'running' | 'done' | 'error' | 'aborted'
@@ -142,6 +144,8 @@ declare module 'claude-code' {
       harnessView: HarnessView
       /** Harness id → whether its command was found on PATH. */
       found: Record<string, boolean>
+      /** Whether the built-in Codex (codex tools, live view, usage meters) is on. */
+      codexEnabled: boolean
     }
   }
 }

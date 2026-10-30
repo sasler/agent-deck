@@ -48,6 +48,7 @@ const cacheAtom = atom({ plugin: 'agent-deck', key: 'cache' } as const, freshCac
 const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, [] as Harness[])
 const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { mode: 'cards' } as HarnessView)
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
+const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 
 type $T = EngineInterface
 
@@ -459,11 +460,20 @@ export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
   schedule($)
 }
 
+let watcher: { return?: (value?: unknown) => unknown } | undefined
+
+const stopWatcher = () => {
+  void watcher?.return?.(undefined)
+  watcher = undefined
+}
+
 const startWatcher = ($: $T, args: string[]) => {
+  if (watcher) return
   void (async () => {
     let buffer = ''
     try {
       const child = $.process.spawn({ argv: ['node', `${$.plugin.root}/bin/watch.mjs`, ...args] })
+      watcher = child as unknown as { return?: (value?: unknown) => unknown }
       for await (const piece of child) {
         if (piece.stream !== 'stdout') continue
         buffer += piece.text
@@ -477,8 +487,9 @@ const startWatcher = ($: $T, args: string[]) => {
         }
       }
     } catch (err) {
-      $.ui.toast(`agent-deck: live Codex view is off (needs Node.js on PATH): ${String((err as Error)?.message ?? err).slice(0, 120)}`)
+      if (watcher) $.ui.toast(`agent-deck: live Codex view is off (needs Node.js on PATH): ${String((err as Error)?.message ?? err).slice(0, 120)}`)
     }
+    watcher = undefined
   })()
 }
 
@@ -762,7 +773,7 @@ const detectHarnesses = async ($: $T, list: readonly Harness[]) => {
       found[h.id] = r?.exitCode === 0
     }),
   )
-  await update($, foundAtom, () => found)
+  await update($, foundAtom, cur => ({ ...cur, ...found }))
   return found
 }
 
@@ -792,7 +803,8 @@ async function loadHarnesses($: $T) {
     void detectHarnesses($, harnessList)
     return
   }
-  const candidates = PRESETS.filter(p => p.id !== 'custom' && p.id !== 'claude-cli').map(p => fromPreset(p))
+  // Codex has its own built-in mode; Claude Code and Custom are added by hand.
+  const candidates = PRESETS.filter(p => !['custom', 'claude-cli', 'codex-cli'].includes(p.id)).map(p => fromPreset(p))
   const found = await detectHarnesses($, candidates)
   await saveHarnesses($, candidates.filter(h => found[h.id]))
 }
@@ -962,6 +974,51 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
 
 type AgentRunInput = { harness: string; prompt: string; title?: string; model?: string; cwd?: string; resume?: string }
 
+// ---------- the built-in Codex: on or off ----------
+
+const KEY_CODEX = 'codex-enabled'
+let codexOn = false
+
+const registerCodexTools = async ($: $T) => {
+  for (const spec of [CODEX_TOOL_SPEC, CODEX_RESULT_SPEC]) {
+    await $.tool.register(spec).catch(err =>
+      $.ui.toast(`agent-deck: ${spec.name} tool not registered: ${String((err as Error)?.message ?? err)}`),
+    )
+  }
+}
+
+/** Starts the live view of Codex's own session files: every Codex run, and its usage limits. */
+const startCodexWatcher = async ($: $T) => {
+  const home = await codexHome($)
+  const root = await runsRoot($)
+  if (!home || !root) return
+  const since = (await $.clock.now()) - 30 * 60_000
+  startWatcher($, [`${home}/sessions`, root, await $.session.cwd(), String(since)])
+}
+
+/** The stored switch; on first use, on when `codex` is on PATH. */
+async function loadCodexEnabled($: $T) {
+  const stored = await $.store.get(KEY_CODEX)
+  const r = await $.process.run([(await isWindows($)) ? 'where' : 'which', 'codex'], { timeoutMs: 10_000 }).catch(() => undefined)
+  const isFound = r?.exitCode === 0
+  await update($, foundAtom, cur => ({ ...cur, codex: isFound }))
+  codexOn = typeof stored === 'boolean' ? stored : isFound
+  await update($, codexAtom, () => codexOn)
+}
+
+async function setCodexEnabled($: $T, on: boolean) {
+  codexOn = on
+  await $.store.set(KEY_CODEX, on)
+  await update($, codexAtom, () => on)
+  if (on) {
+    await registerCodexTools($)
+    await startCodexWatcher($)
+  } else {
+    stopWatcher()
+    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined }))
+  }
+}
+
 // ---------- Strata (the local model): one live card per request, read from its API monitor ----------
 
 const STRATA_URL = 'http://127.0.0.1:8080'
@@ -1123,11 +1180,8 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     // Registered before next(e) so the tools are listed from the first turn.
-    for (const spec of [CODEX_TOOL_SPEC, CODEX_RESULT_SPEC]) {
-      await $.tool.register(spec).catch(err =>
-        $.ui.toast(`agent-deck: ${spec.name} tool not registered: ${String((err as Error)?.message ?? err)}`),
-      )
-    }
+    await loadCodexEnabled($).catch(() => undefined)
+    if (codexOn) await registerCodexTools($)
     await loadHarnesses($).catch(err => $.ui.toast(`agent-deck: harnesses not loaded: ${String((err as Error)?.message ?? err)}`))
     const started = await next(e)
     sessionId = await $.session.id()
@@ -1146,10 +1200,7 @@ export const register: Register = on => {
     const root = await runsRoot($)
     if (root) await loadRuns($, root)
     await loadHarnessRuns($)
-    if (home && root) {
-      const since = (await $.clock.now()) - 30 * 60_000
-      startWatcher($, [`${home}/sessions`, root, await $.session.cwd(), String(since)])
-    }
+    if (codexOn) await startCodexWatcher($)
     void refreshClaudeLimits($)
     poller = $.clock.every(60_000, () => void refreshClaudeLimits($))
     openPane($)
@@ -1277,6 +1328,7 @@ export const register: Register = on => {
   // ---- Codex ----
 
   on('tool.call', { tool: 'mcp__agent-deck__codex' }, async ($, e) => {
+    if (!codexOn) return { deny: 'agent-deck: the built-in Codex is switched off under ⚙ Harnesses in the Agents pane.' }
     const input = e as unknown as {
       prompt: string
       title?: string
@@ -1448,6 +1500,7 @@ export const register: Register = on => {
     const view = await read($, viewAtom)
     const hs = await read($, harnessesAtom)
     const found = await read($, foundAtom)
+    const isCodexOn = await read($, codexAtom)
     const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
     // Surfaces that draw SVG get thick bars; the terminal keeps its text meters.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
@@ -1837,13 +1890,28 @@ export const register: Register = on => {
         <Text dimColor wrap="wrap">
           Coding agents Claude can start in the background with agent_run. Each run gets a live card here.
         </Text>
-        <Box flexDirection="column">
-          <Text>
-            <Text bold color={CODEX_ACCENT}>
-              ● Codex
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+          <Box flexDirection="column" flexShrink={1} minWidth={0}>
+            <Text wrap="truncate-end">
+              <Text bold color={CODEX_ACCENT}>
+                ● Codex
+              </Text>
+              <Text dimColor> built in</Text>
             </Text>
-            <Text dimColor> built in · the codex tool</Text>
-          </Text>
+            <Text dimColor wrap="truncate-end">
+              {isCodexOn ? 'the codex tool · live view of every Codex run · usage meters' : 'off'}
+            </Text>
+            {found.codex === false && <Text color="warning">codex is not on PATH</Text>}
+          </Box>
+          <Box flexDirection="row" gap={1} flexShrink={0}>
+            <Button
+              key="cx-toggle"
+              label={isCodexOn ? 'On' : 'Off'}
+              variant={isCodexOn ? 'primary' : undefined}
+              onPress={() => void setCodexEnabled($, !isCodexOn)}
+            />
+            {Select && <Button key="cx-edit" label="Edit" onPress={() => void setView({ mode: 'codex' })} />}
+          </Box>
         </Box>
         {hs.map(harnessRow)}
         {hs.length === 0 && <Text dimColor>No other harness yet.</Text>}
@@ -1956,6 +2024,60 @@ export const register: Register = on => {
       )
     }
 
+    const codexHarnesses = hs.filter(x => x.preset === 'codex-cli')
+    const codexMode = isCodexOn ? 'builtin' : codexHarnesses.some(x => x.isEnabled) ? 'custom' : 'off'
+
+    const pickCodexMode = async (mode: string) => {
+      if (mode === 'builtin' || mode === 'off') {
+        if (codexHarnesses.some(x => x.isEnabled)) {
+          await saveHarnesses($, hs.map(x => (x.preset === 'codex-cli' ? { ...x, isEnabled: false } : x)))
+        }
+        await setCodexEnabled($, mode === 'builtin')
+        return setView({ mode: 'list' })
+      }
+      await setCodexEnabled($, false)
+      const existing = codexHarnesses[0]
+      if (existing) {
+        await saveHarnesses($, hs.map(x => (x.id === existing.id ? { ...x, isEnabled: true } : x)))
+        return setView({ mode: 'edit', draft: { ...existing, isEnabled: true }, originalId: existing.id })
+      }
+      const preset = PRESETS.find(x => x.id === 'codex-cli')
+      if (preset) return setView({ mode: 'edit', draft: fromPreset(preset, hs.map(x => x.id)) })
+    }
+
+    const codexView = () => (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Text bold color={CODEX_ACCENT}>
+            ● Codex
+          </Text>
+          <Button key="cx-back" label="Back" onPress={() => void setView({ mode: 'list' })} />
+        </Box>
+        {Select && (
+          <Select
+            key="cx-mode"
+            label="Runs as"
+            options={[
+              { value: 'builtin', label: 'Built in' },
+              { value: 'custom', label: 'Custom harness' },
+              { value: 'off', label: 'Off' },
+            ]}
+            value={codexMode}
+            onSelect={v => void pickCodexMode(v)}
+          />
+        )}
+        <Text dimColor wrap="wrap">
+          Built in: the codex tool (model, effort, sandbox, resume), a live card for every Codex run, also ones started in a
+          terminal or the Codex app, and Codex usage meters.
+        </Text>
+        <Text dimColor wrap="wrap">
+          Custom harness: Codex runs through agent_run like the other harnesses, with a command and arguments you edit.
+          Only its own runs get cards, and there are no usage meters.
+        </Text>
+      </Box>
+    )
+
+    if (view.mode === 'codex') return codexView()
     if (view.mode === 'list') return listView()
     if (view.mode === 'edit') return editView(view)
 
@@ -1969,7 +2091,7 @@ export const register: Register = on => {
           <Button key="h-open" label="⚙ Harnesses" plain onPress={() => void setView({ mode: 'list' })} />
         </Box>
         <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
-          {limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
+          {isCodexOn && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
           {limitRow('Claude', 'claude', lim.claude)}
         </Box>
         {cacheBox}

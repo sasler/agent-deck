@@ -33,7 +33,15 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 - streams into a card in the pane;
 - delivers its final report back to the conversation as a new message when it finishes.
 
-`agent_result` reads a run on demand. Codex keeps its own `codex` and `codex_result` tools.
+`agent_result` reads a run on demand.
+
+**Codex** has three modes, chosen with Codex's **Edit** button in the Harnesses list:
+
+- **Built in.** The `codex` and `codex_result` tools, with model, effort, sandbox and resume. It also gives a live card for every Codex run, including ones started in a terminal or the Codex app, and the Codex usage meters.
+- **Custom harness.** Codex runs through `agent_run` like any other harness, from a `codex exec --json` command you can edit.
+- **Off.** For people who don't use Codex.
+
+On first start, the built-in Codex is on if `codex` is on your PATH. Its On/Off button switches it any time.
 
 Runs start without a shell, so nothing in a prompt is expanded or re-quoted. On Windows, an npm `.cmd` shim starts as the Node script it wraps; any other `.cmd`/`.bat` is refused, so point the command at the program itself.
 
@@ -41,6 +49,7 @@ The arguments are a template. `{prompt}`, `{model}`, `{session}` and `{cwd}` are
 
 | Preset | Command | Output read |
 | --- | --- | --- |
+| Codex | `codex exec --json --skip-git-repo-check …` | Codex exec JSON (custom mode) |
 | Copilot | `copilot -p {prompt} --output-format json --allow-all-tools …` | Copilot JSON events, including premium requests |
 | OpenCode | `opencode run --format json …` | OpenCode JSON events, including cost |
 | Gemini | `gemini -p {prompt} --output-format stream-json --yolo …` | Gemini stream-json |

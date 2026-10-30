@@ -376,3 +376,56 @@ test('usage bars are thick SVG on the desktop', async ($, on) => {
   expect(await ui.find({ text: /Codex/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('codex exec JSON events fill a card', () => {
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'Codex', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  const lines = [
+    '{"type":"thread.started","thread_id":"01a1"}',
+    '{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"pwsh -NoProfile -Command \'rg -n x\'","status":"in_progress"}}',
+    '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"pwsh -NoProfile -Command \'rg -n x\'","exit_code":1,"status":"failed"}}',
+    '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"All good."}}',
+    '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":800,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":10}}',
+  ]
+  let final = ''
+  for (const l of lines) for (const ev of parseLine('codex', l)) ev.kind === 'final' ? (final = ev.text) : applyHarnessEvent(card, ev)
+  expect(card.sessionRef).toBe('01a1')
+  expect(card.activity).toEqual([{ id: 'item_1', label: '$ rg -n x', status: 'error' }])
+  expect(card.tokens).toEqual({ input: 200, output: 50, cacheRead: 800, cacheWrite: 0, reasoning: 10 })
+  expect(final).toBe('All good.')
+})
+
+test('the built-in Codex switches off, or becomes a custom harness', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  // The mount runs no session.start: the switch starts at its default, off.
+  expect(await ui.find({ text: /^off$/ })).toBeDefined()
+  await ui.press({ key: 'cx-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
+  await ui.press({ key: 'cx-edit' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'cx-mode', value: 'custom' })
+  await ui.redraw()
+  expect(await ui.find({ text: /exec --json --skip-git-repo-check/ })).toBeDefined()
+  await ui.press({ key: 'h-save' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /codex · Codex exec JSON/ })).toBeDefined()
+  await ui.press({ key: 'cx-edit' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'cx-mode', value: 'builtin' })
+  await ui.redraw()
+  expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
+  expect((await ui.findAll({ type: 'Button' } as never)).some(b => (b as { key?: string }).key === 'h-toggle-codex-cli' && (b as { text?: string }).text === 'Off')).toBe(true)
+  await ui.unmount()
+})

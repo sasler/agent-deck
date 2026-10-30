@@ -9,6 +9,15 @@ export type Preset = Omit<Harness, 'isEnabled' | 'preset'> & { note: string }
 /** CLIs agent-deck knows how to read. Each one's args run it headless, printing JSON events. */
 export const PRESETS: Preset[] = [
   {
+    id: 'codex-cli',
+    name: 'Codex',
+    color: '#10A37F',
+    command: 'codex',
+    args: 'exec --json --skip-git-repo-check --model {model} {prompt}',
+    parser: 'codex',
+    note: 'OpenAI Codex CLI as a plain harness. Resuming a conversation and the usage meters need the built-in Codex.',
+  },
+  {
     id: 'copilot',
     name: 'Copilot',
     color: '#8957E5',
@@ -65,6 +74,7 @@ export const PRESETS: Preset[] = [
 ]
 
 export const PARSERS: { value: HarnessParser; label: string }[] = [
+  { value: 'codex', label: 'Codex exec JSON' },
   { value: 'copilot', label: 'Copilot JSON' },
   { value: 'opencode', label: 'OpenCode JSON' },
   { value: 'gemini', label: 'Gemini stream-json' },
@@ -397,7 +407,58 @@ const claude = (e: J): HarnessEvent[] => {
   return []
 }
 
-const PARSE: Record<Exclude<HarnessParser, 'text'>, (e: J) => HarnessEvent[]> = { copilot, opencode, gemini, cursor, claude }
+/** `codex exec --json`: thread, items (messages, reasoning, commands, edits, tool calls) and per-turn usage. */
+const codex = (e: J): HarnessEvent[] => {
+  switch (e.type) {
+    case 'thread.started':
+      return str(e.thread_id) ? [{ kind: 'session', id: e.thread_id as string }] : []
+    case 'item.started':
+    case 'item.updated':
+    case 'item.completed': {
+      const it = obj(e.item)
+      const id = String(it.id ?? '')
+      const isDone = e.type === 'item.completed'
+      switch (it.type) {
+        case 'agent_message': {
+          const text = isDone ? str(it.text) : undefined
+          return text ? [{ kind: 'text', text }, { kind: 'final', text }] : []
+        }
+        case 'reasoning': {
+          const text = isDone ? str(it.text) : undefined
+          return text ? [{ kind: 'reason', text }] : []
+        }
+        case 'command_execution': {
+          const cmd = String(it.command ?? '')
+          const short = (cmd.match(/(?:-Command|-lc|-c)\s+(['"])([\s\S]*)\1\s*$/)?.[2] ?? cmd).replace(/\s+/g, ' ').trim()
+          const failed = it.status === 'failed' || (typeof it.exit_code === 'number' && it.exit_code !== 0)
+          return [{ kind: 'act', id, label: `$ ${short}`, status: !isDone ? 'running' : failed ? 'error' : 'done' }]
+        }
+        case 'file_change': {
+          const paths = (Array.isArray(it.changes) ? it.changes : []).map(c => String(obj(c).path ?? '')).filter(Boolean)
+          return [{ kind: 'act', id, label: `edit ${paths.join(', ') || 'files'}`, status: !isDone ? 'running' : it.status === 'failed' ? 'error' : 'done' }]
+        }
+        case 'mcp_tool_call':
+          return [{ kind: 'act', id, label: `${String(it.server ?? 'mcp')}.${String(it.tool ?? 'tool')}`, status: !isDone ? 'running' : it.status === 'failed' ? 'error' : 'done' }]
+        case 'web_search':
+          return [{ kind: 'act', id, label: `search ${String(it.query ?? '')}`.trim(), status: isDone ? 'done' : 'running' }]
+      }
+      return []
+    }
+    case 'turn.completed': {
+      const u = obj(e.usage)
+      const cached = num(u.cached_input_tokens)
+      const written = num(u.cache_write_input_tokens)
+      return [{ kind: 'tokens', tokens: tok(num(u.input_tokens) - cached - written, num(u.output_tokens), cached, written, num(u.reasoning_output_tokens)), isAdded: true }]
+    }
+    case 'turn.failed':
+      return [{ kind: 'error', text: str(obj(e.error).message) ?? 'Codex turn failed' }]
+    case 'error':
+      return [{ kind: 'error', text: str(e.message) ?? 'Codex reported an error' }]
+  }
+  return []
+}
+
+const PARSE: Record<Exclude<HarnessParser, 'text'>, (e: J) => HarnessEvent[]> = { codex, copilot, opencode, gemini, cursor, claude }
 
 /** One stdout line of a harness, as the events agent-deck draws. */
 export const parseLine = (parser: HarnessParser, line: string): HarnessEvent[] => {
