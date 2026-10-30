@@ -21,11 +21,13 @@ import {
   cacheSessionEnd,
   cacheSessionStart,
   cacheView,
+  discardHeld,
   fmtDuration,
   fmtUsd,
   freshCache,
   priceOf,
   registerCache,
+  sendHeld,
   startKeepWarm,
   stopKeepWarm,
 } from './cache'
@@ -1513,7 +1515,8 @@ export const register: Register = on => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const list = await read($, agents)
     const n = await read($, tick)
-    const cv = cacheView(await read($, cacheAtom), await $.clock.now())
+    const cache = await read($, cacheAtom)
+    const cv = cacheView(cache, await $.clock.now())
     const running = list.filter(c => c.status === 'running')
     const codex = running.filter(c => c.provider === 'codex').length
     const strata = running.filter(c => c.provider === 'strata').length
@@ -1527,7 +1530,18 @@ export const register: Register = on => {
       ...[...others].map(([name, count]) => `${count} ${name}`),
     ].filter(Boolean)
     const hasCache = cv.tone !== 'unknown' || cv.keepwarm !== undefined
-    return (
+    const held = cache.held
+    const heldPreview = held ? held.text.replace(/\s+/g, ' ').trim() : ''
+    const heldRow = held && (
+      <Box flexDirection="row" gap={1} flexWrap="wrap" alignItems="center">
+        <Text color="warning" wrap="truncate-end">
+          ⚠ Held: “{heldPreview.length > 40 ? `${heldPreview.slice(0, 40)}…` : heldPreview}” · cold cache, {fmtUsd(held.usd)} to re-write
+        </Text>
+        <Button key="held-send" label="Send anyway" variant="primary" onPress={() => void sendHeld($)} />
+        <Button key="held-discard" label="Discard" onPress={() => void discardHeld($)} />
+      </Box>
+    )
+    const band = (
       <Box flexDirection="row" gap={1} flexWrap="wrap">
         <Button key="agent-deck-open" label="Agents" plain onPress={() => $.ui.open({ id: PANE, title: 'Agents' })} />
         {running.length > 0 ? (
@@ -1548,6 +1562,13 @@ export const register: Register = on => {
           </Text>
         )}
         {cv.keepwarm && <Text color="success">♨ {fmtDuration(cv.keepwarm.leftMs)}</Text>}
+      </Box>
+    )
+    if (!heldRow) return band
+    return (
+      <Box flexDirection="column">
+        {heldRow}
+        {band}
       </Box>
     )
   })

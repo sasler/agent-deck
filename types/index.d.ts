@@ -139,6 +139,8 @@ export type CacheState = {
   guard: 'refuse' | 'warn' | 'off'
   /** The lastRequestAt a refused cold send was refused at; the resend goes through. */
   ackedAt: number
+  /** The cold send the guard held back, for the band's Send anyway button; absent when it had attachments. */
+  held?: { text: string; usd?: number }
   coldWrites: ColdWrite[]
   /** Message count of the last main request, to spot a compaction. */
   transcript: number

@@ -348,6 +348,29 @@ export async function setGuard($: $T, guard: CacheState['guard']) {
   await save($)
 }
 
+/** The band's Send anyway: submits the held cold send, which the guard lets through as a plugin's prompt. */
+export async function sendHeld($: $T) {
+  const held = s.held
+  if (!held) return
+  s.held = undefined
+  s.ackedAt = 0
+  isColdWritePending = true
+  await save($)
+  const r = await $.prompt.submit({ text: held.text, asUser: true }).catch((err: unknown) => ({ drop: String((err as Error)?.message ?? err) }))
+  if (r?.drop !== undefined) {
+    isColdWritePending = false
+    s.held = held
+    await save($)
+    $.ui.toast(`agent-deck: the held prompt was not sent: ${r.drop}`)
+  }
+}
+
+export async function discardHeld($: $T) {
+  s.held = undefined
+  s.ackedAt = 0
+  await save($)
+}
+
 const guardText = (now: number) => {
   const p = priceOf(s.model)
   const rate = p ? `$${writeRate(p, s.ttlMs)}/MTok` : 'the cache-write rate'
@@ -432,6 +455,7 @@ export async function cacheAfterTurn($: $T, e: { usage?: TurnUsage | null; isAbo
   s.ttlMs = await resolveTtl($).catch(() => s.ttlMs)
   s.isWaitingForTurn = false
   s.ackedAt = 0
+  s.held = undefined
   const u = e.usage
   if (u) {
     if (u.model) s.model = u.model
@@ -539,12 +563,17 @@ export const registerCache = (on: On) => {
     }
     if (s.ackedAt === s.lastRequestAt) {
       s.ackedAt = 0
+      s.held = undefined
       isColdWritePending = true
+      await save($)
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
+    // Attachments can't be sent again by a plugin, so a prompt with any is only refused.
+    s.held = e.attachments?.length ? undefined : { text: e.text, usd: coldUsd(s) }
     await save($)
-    return { drop: `agent-deck: ${guardText(now)}. Send it again to pay it, or /clear and start from a note. /keepwarm keeps it warm through your next break.` }
+    const again = s.held ? 'Press Send anyway above the prompt, or send it again,' : 'Send it again'
+    return { drop: `agent-deck: ${guardText(now)}. ${again} to pay it, or /clear and start from a note. /keepwarm keeps it warm through your next break.` }
   })
 
   on('session.compact', async ($, e, next) => {

@@ -132,6 +132,36 @@ test('the band above the prompt offers an Agents button', async ($, on) => {
   }
 })
 
+test('a held cold send goes out from the band with Send anyway', async ($, on) => {
+  mock.clock(on, { now: Date.UTC(2026, 9, 30, 12) })
+  mock.store(on)
+  on('session.id', () => ({ value: 'sid-held' }))
+  on('env.get', () => ({ value: undefined }))
+  on('classic.SessionStart', () => ({}) as never)
+  const sent: string[] = []
+  on('prompt.submit', (_$, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  await $.classic.SessionStart({ source: 'resume', context_tokens: 197_817, seconds_since_last_response: 3 * 3600, model: 'claude-opus-5-5' } as never)
+  const first = await $.prompt.submit({ text: 'fix the parser', wait: false, origin: { kind: 'composer' } })
+  expect(first.drop).toMatch(/Send anyway/)
+  expect(sent).toEqual([])
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 100, scroll: undefined as never },
+  })
+  expect(await ui.find({ text: /Held: “fix the parser”/ })).toBeDefined()
+  await ui.press({ key: 'held-send' })
+  await ui.redraw()
+  expect(sent).toEqual(['fix the parser'])
+  expect(await ui.find({ key: 'held-send' })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('a Strata request becomes a live card, then a finished one', async () => {
   const input = JSON.stringify({
     model: 'strata-qwen-coder',

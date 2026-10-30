@@ -12,7 +12,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
   Under ⚙ Harnesses → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
 - **Keep-warm.** Pick 2, 4 or 6 hours in the cache box, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
-- **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Send it again to go ahead. Change this with `/cache guard refuse|warn|off`.
+- **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. Change this with `/cache guard refuse|warn|off`.
 - **Live agent cards.** Each running agent gets a card with:
   - its model and reasoning effort
   - the tools it is running
