@@ -19,7 +19,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { PRESETS, applyHarnessEvent, expandArgs, fromPreset, harnessError, parseLine, providerEnv, slugId, tokenizeArgs } from '../hooks/harness'
+import { PRESETS, agentRunSpec, applyHarnessEvent, expandArgs, fromPreset, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -364,6 +364,55 @@ test('the edit form sets up a Copilot on its own API', async ($, on) => {
   await ui.select({ key: 'h-provider-type', value: '' })
   await ui.redraw()
   expect(await ui.find({ key: 'h-provider-url' } as never)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('each harness has a way to list its models', () => {
+  const of = (id: string) => fromPreset(PRESETS.find(p => p.id === id)!)
+  expect(modelQuery(of('copilot'))).toEqual({ query: { source: 'acp', command: 'copilot' } })
+  expect(modelQuery(of('opencode'))).toEqual({ query: { source: 'lines', command: 'opencode', args: ['models'] } })
+  expect(modelQuery(of('codex-cli'))).toEqual({ query: { source: 'codex' } })
+  expect('models' in (modelQuery(of('claude-cli')) ?? {})).toBe(true)
+  expect(modelQuery(of('gemini'))).toBeUndefined()
+  const provider = { type: 'openai' as const, baseUrl: 'http://127.0.0.1:11434/v1' }
+  expect(modelQuery({ ...of('copilot'), provider })).toEqual({ query: { source: 'api', provider } })
+  expect(parseModels('{"models":[{"id":"a"},{"id":"a"},{"id":"b","name":"B"}]}')).toEqual({ models: [{ id: 'a' }, { id: 'b', name: 'B' }] })
+  expect(parseModels('{"error":"401"}')).toEqual({ error: '401' })
+  expect(parseModels('{"models":[]}')).toEqual({ error: 'It reported no models.' })
+  const spec = agentRunSpec([{ ...of('copilot'), models: [{ id: 'gpt-6-luna' }, { id: 'claude-sonnet-5.5' }] }])
+  expect(spec.description).toMatch(/models gpt-6-luna, claude-sonnet-5\.5/)
+})
+
+test('the edit form lists a harness\'s models and picks one', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agent Deck', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Model API, or add the Copilot \(own API\) preset/ })).toBeDefined()
+  await ui.select({ key: 'h-add', value: 'claude-cli' })
+  await ui.redraw()
+  expect(await ui.find({ key: 'h-model-pick' } as never)).toBeUndefined()
+  await ui.press({ key: 'h-models-list' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /7 models\./ })).toBeDefined()
+  await ui.select({ key: 'h-model-pick', value: 'claude-sonnet-5-5' })
+  await ui.redraw()
+  expect(await ui.find({ text: /--model claude-sonnet-5-5/ })).toBeDefined()
+  await ui.press({ key: 'h-save' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /claude · Claude stream-json · claude-sonnet-5-5/ })).toBeDefined()
+  await ui.select({ key: 'h-add', value: 'gemini' })
+  await ui.redraw()
+  expect(await ui.find({ text: /no way to list its models/ })).toBeDefined()
   await ui.unmount()
 })
 

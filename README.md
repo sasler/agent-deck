@@ -24,11 +24,19 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
 ## Harnesses: Copilot, OpenCode, Gemini, Cursor and more
 
-Open the pane (`/agent-deck`, or the **Agents** button above the prompt), then click **⚙ Harnesses**.
+Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the prompt), then click **⚙ Harnesses**. The pane's title shows the version that is running.
 
 - **Add** a harness from a preset (Copilot, OpenCode, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
 - **Edit** a harness's command, arguments, default model, color and output format.
 - **Switch** each harness on or off.
+- **Pick a model** for each harness. **List models** in the edit form asks the harness which models it can run, and the picker then sets its default:
+  - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their premium-request multiplier;
+  - OpenCode: `opencode models`;
+  - Codex (custom harness): Codex's own model cache;
+  - Claude Code: its aliases and current model ids;
+  - a harness on your own API: the API's `/models` endpoint.
+
+  Gemini, Cursor and custom CLIs have no way to list their models, so you type the id. The listed models are also offered to Claude in the `agent_run` tool.
 
 On first start, agent-deck adds the presets whose CLI it finds on your PATH.
 

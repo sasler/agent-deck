@@ -14,6 +14,9 @@ export type HarnessProvider = {
   wireApi?: 'completions' | 'responses'
 }
 
+/** One model a harness can run, as its CLI or API reported it. */
+export type HarnessModel = { id: string; name?: string; note?: string }
+
 /** A CLI agent agent-deck can start, as the person set it up in the Harnesses view. */
 export type Harness = {
   /** Lowercase, letters, digits and dashes: what `agent_run` names. */
@@ -31,6 +34,8 @@ export type Harness = {
   parser: HarnessParser
   /** Set: the CLI runs against this API. Copilot and Claude Code read it from environment variables. */
   provider?: HarnessProvider
+  /** The models it last reported, from List models in the edit form. */
+  models?: HarnessModel[]
   isEnabled: boolean
   /** The preset it came from, if any. */
   preset?: string
@@ -41,7 +46,14 @@ export type HarnessView =
   | { mode: 'list' }
   /** The built-in Codex: built in, or a custom harness. */
   | { mode: 'codex' }
-  | { mode: 'edit'; draft: Harness; originalId?: string; error?: string }
+  | {
+      mode: 'edit'
+      draft: Harness
+      originalId?: string
+      error?: string
+      /** List models: asking, or what went wrong. */
+      modelsState?: 'loading' | { error: string }
+    }
 
 export type AgentStatus = 'running' | 'done' | 'error' | 'aborted'
 

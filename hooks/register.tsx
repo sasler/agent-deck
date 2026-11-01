@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
+import type { Activity, AgentCard, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
   PARSERS,
@@ -12,9 +12,13 @@ import {
   expandArgs,
   fromPreset,
   harnessError,
+  modelLabel,
+  modelQuery,
   parseLine,
+  parseModels,
   providerEnv,
   providerTypesFor,
+  type ModelQuery,
   slugId,
 } from './harness'
 import {
@@ -336,9 +340,25 @@ const refreshClaudeLimits = async ($: $T) => {
   await setLimits($, l => ({ ...l, claude }))
 }
 
+let version: string | undefined
+
+/** "Agent Deck 0.9.1": the pane's title, with the version read from the plugin's manifest. */
+const paneTitle = async ($: $T): Promise<string> => {
+  if (version === undefined) {
+    try {
+      version = String(JSON.parse((await readText($, `${$.plugin.root}/.claude-plugin/plugin.json`)) ?? '{}').version ?? '')
+    } catch {
+      version = ''
+    }
+  }
+  return version ? `Agent Deck ${version}` : 'Agent Deck'
+}
+
 const openPane = ($: $T) => {
   try {
-    void $.ui.open({ id: PANE, title: 'Agents' }).catch(() => {})
+    void paneTitle($)
+      .then(title => $.ui.open({ id: PANE, title }))
+      .catch(() => {})
   } catch {}
 }
 
@@ -1005,6 +1025,18 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
   return run
 }
 
+/** Runs bin/models.mjs for a harness. The query can hold a key, so it goes through a file the script deletes. */
+const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: HarnessModel[] } | { error: string }> => {
+  const root = await harnessRunsRoot($)
+  if (!root) return { error: 'no home directory (USERPROFILE/HOME)' }
+  const file = `${root}/models-${await newRunId($)}.json`
+  await $.fs.write(file, JSON.stringify({ ...q, env: { ...providerEnv(h, h.model), ...q.env } }))
+  const r = await $.process
+    .run(['node', `${$.plugin.root}/bin/models.mjs`, file], { timeoutMs: 60_000 })
+    .catch(err => ({ exitCode: 1, stdout: '', stderr: String((err as Error)?.message ?? err) }))
+  return parseModels(r.stdout || r.stderr)
+}
+
 type AgentRunInput = { harness: string; prompt: string; title?: string; model?: string; cwd?: string; resume?: string }
 
 // ---------- Copilot's premium requests, and which meters show ----------
@@ -1302,8 +1334,8 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'agent-deck' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Agents' })
-    return { text: 'Agents pane opened.' }
+    await $.ui.open({ id: PANE, title: await paneTitle($) })
+    return { text: 'Agent Deck pane opened.' }
   }).catch(() => ({ text: 'agent-deck: could not open the pane.' }))
 
   on('turn.complete', async ($, e, next) => {
@@ -1549,7 +1581,7 @@ export const register: Register = on => {
     )
     const band = (
       <Box flexDirection="row" gap={1} flexWrap="wrap">
-        <Button key="agent-deck-open" label="Agents" plain onPress={() => $.ui.open({ id: PANE, title: 'Agents' })} />
+        <Button key="agent-deck-open" label="Agents" plain onPress={() => openPane($)} />
         {running.length > 0 ? (
           <Text color={CODEX_ACCENT}>
             {SPIN[n % SPIN.length]} {parts.join(' · ')} running
@@ -2011,6 +2043,12 @@ export const register: Register = on => {
         </Box>
         {hs.map(harnessRow)}
         {hs.length === 0 && <Text dimColor>No other harness yet.</Text>}
+        {Select && Input && (
+          <Text dimColor wrap="wrap">
+            Edit a harness to pick its model from the ones it reports. Copilot and Claude Code can also run on your own API
+            key (BYOK): Edit → Model API, or add the Copilot (own API) preset.
+          </Text>
+        )}
         {Select && Input ? (
           <Select
             key="h-add"
@@ -2052,6 +2090,8 @@ export const register: Register = on => {
       const setP = (x: Harness, patch: Partial<HarnessProvider>): Harness => ({
         ...x,
         provider: { type: x.provider?.type ?? types[0]!, baseUrl: x.provider?.baseUrl ?? '', ...x.provider, ...patch },
+        // Another endpoint serves other models.
+        models: 'baseUrl' in patch || 'type' in patch ? undefined : x.models,
       })
       return (
         <Box key="h-provider" flexDirection="column" gap={1}>
@@ -2061,7 +2101,7 @@ export const register: Register = on => {
             options={[{ value: '', label: "The CLI's own service" }, ...PROVIDER_TYPES.filter(t => types.includes(t.value))]}
             value={p?.type ?? ''}
             onSelect={s =>
-              void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined }))
+              void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined, models: undefined }))
             }
           />
           {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
@@ -2083,6 +2123,69 @@ export const register: Register = on => {
               {`The key is kept in agent-deck's settings as plain text and handed to the CLI as ${
                 d.parser === 'copilot' ? 'COPILOT_PROVIDER_API_KEY' : 'ANTHROPIC_API_KEY'
               }; it is not written into run files.`}
+            </Text>
+          )}
+        </Box>
+      )
+    }
+
+    /** The default model: picked from what the harness reports, or typed. */
+    const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
+      const d = v.draft
+      const how = modelQuery(d)
+      const known: HarnessModel[] = d.models ?? []
+      const st = v.modelsState
+      const listModels = async () => {
+        if (!how) return
+        if ('models' in how) return patchDraft(x => ({ ...x, models: how.models }))
+        await update($, viewAtom, cur => (cur.mode === 'edit' ? { ...cur, modelsState: 'loading' } : cur))
+        const r = await queryModels($, how.query, d)
+        await update($, viewAtom, cur =>
+          cur.mode !== 'edit'
+            ? cur
+            : 'error' in r
+              ? { ...cur, modelsState: { error: r.error } }
+              : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
+        )
+      }
+      const options = [
+        { value: '', label: "The CLI's default" },
+        ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
+        ...(d.model && !known.some(m => m.id === d.model) ? [{ value: d.model, label: `${d.model} (typed)` }] : []),
+      ]
+      return (
+        <Box key="h-models" flexDirection="column" gap={1}>
+          {Select && known.length > 0 && (
+            <Select
+              key="h-model-pick"
+              label="Model"
+              options={options}
+              value={d.model ?? ''}
+              onSelect={s => void patchDraft(x => ({ ...x, model: s || undefined }))}
+            />
+          )}
+          {field('h-model', known.length ? 'or type one' : 'Default model', d.model ?? '', (x, s) => ({ ...x, model: s }))}
+          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+            {how && (
+              <Button
+                key="h-models-list"
+                label={st === 'loading' ? 'Asking…' : known.length ? 'Refresh models' : 'List models'}
+                onPress={() => void (st === 'loading' ? undefined : listModels())}
+              />
+            )}
+            <Text dimColor wrap="wrap">
+              {!how
+                ? 'This CLI has no way to list its models; type the id it takes.'
+                : known.length
+                  ? `${known.length} model${known.length === 1 ? '' : 's'}${d.provider?.baseUrl ? ' from the API' : ''}.`
+                  : d.provider?.baseUrl
+                    ? "Asks the API's /models endpoint."
+                    : 'Asks the CLI which models your account can use.'}
+            </Text>
+          </Box>
+          {st && st !== 'loading' && (
+            <Text color="error" wrap="wrap">
+              {`Could not list models: ${st.error}`}
             </Text>
           )}
         </Box>
@@ -2133,7 +2236,7 @@ export const register: Register = on => {
           {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
           {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
           {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }), 2)}
-          {field('h-model', 'Default model', d.model ?? '', (x, s) => ({ ...x, model: s }))}
+          {modelSection(v)}
           {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
           {Select && (
             <Select

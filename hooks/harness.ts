@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessParser, HarnessProvider, Tokens } from '../types'
+import type { Activity, AgentCard, Harness, HarnessModel, HarnessParser, HarnessProvider, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -139,6 +139,60 @@ export const providerEnv = (h: Pick<Harness, 'parser' | 'provider'>, model?: str
   }
   return env
 }
+
+// ---------- which models a harness can run ----------
+
+/** Claude Code takes these aliases and full ids; it has no command that lists them. */
+const CLAUDE_MODELS: HarnessModel[] = [
+  { id: 'opus', note: 'alias' },
+  { id: 'sonnet', note: 'alias' },
+  { id: 'haiku', note: 'alias' },
+  { id: 'claude-fable-5-1', name: 'Fable 5.1' },
+  { id: 'claude-opus-5-5', name: 'Opus 5.5' },
+  { id: 'claude-sonnet-5-5', name: 'Sonnet 5.5' },
+  { id: 'claude-haiku-5-5', name: 'Haiku 5.5' },
+]
+
+/** What bin/models.mjs is asked to do; the env and provider can hold a key, so it goes through a file it deletes. */
+export type ModelQuery = {
+  source: 'acp' | 'lines' | 'codex' | 'api'
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  provider?: HarnessProvider
+}
+
+/** How to find a harness's models: a fixed list, a query, or nothing this CLI offers. */
+export const modelQuery = (h: Harness): { models: HarnessModel[] } | { query: ModelQuery } | undefined => {
+  if (h.provider?.baseUrl.trim()) return { query: { source: 'api', provider: h.provider } }
+  switch (h.parser) {
+    case 'copilot':
+      return { query: { source: 'acp', command: h.command } }
+    case 'opencode':
+      return { query: { source: 'lines', command: h.command, args: ['models'] } }
+    case 'codex':
+      return { query: { source: 'codex' } }
+    case 'claude':
+      return { models: CLAUDE_MODELS }
+    default:
+      return undefined
+  }
+}
+
+/** Reads models.mjs's answer. */
+export const parseModels = (stdout: string): { models: HarnessModel[] } | { error: string } => {
+  try {
+    const j = JSON.parse(stdout) as { models?: HarnessModel[]; error?: string }
+    if (j.error) return { error: j.error }
+    const seen = new Set<string>()
+    const models = (j.models ?? []).filter(m => typeof m.id === 'string' && m.id && !seen.has(m.id) && seen.add(m.id))
+    return models.length ? { models } : { error: 'It reported no models.' }
+  } catch {
+    return { error: stdout.trim().slice(0, 200) || 'No answer.' }
+  }
+}
+
+export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
 
 // ---------- arguments ----------
 
@@ -594,6 +648,15 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
 
 // ---------- the tools ----------
 
+const MAX_HINTED_MODELS = 15
+
+const modelsHint = (h: Harness) => {
+  const ids = (h.models ?? []).map(m => m.id)
+  if (!ids.length) return ''
+  const more = ids.length > MAX_HINTED_MODELS ? ` and ${ids.length - MAX_HINTED_MODELS} more` : ''
+  return `, models ${ids.slice(0, MAX_HINTED_MODELS).join(', ')}${more}`
+}
+
 export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
   name: 'agent_run',
   isDeferred: false,
@@ -602,7 +665,7 @@ export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
     'The run is its own process and survives session drops; its live output, model and tokens show in the Agents pane. ' +
     "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
     (enabled.length
-      ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''})`).join('; ')}. `
+      ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${modelsHint(h)})`).join('; ')}. `
       : 'No harness is enabled yet: the person adds them under ⚙ Harnesses in the Agents pane. ') +
     'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
   inputSchema: {
