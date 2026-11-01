@@ -19,7 +19,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { PRESETS, applyHarnessEvent, expandArgs, fromPreset, harnessError, parseLine, slugId, tokenizeArgs } from '../hooks/harness'
+import { PRESETS, applyHarnessEvent, expandArgs, fromPreset, harnessError, parseLine, providerEnv, slugId, tokenizeArgs } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -307,6 +307,64 @@ test('harness edits are checked', () => {
   expect(harnessError({ ...h, command: 'copilot -p' }, [])).toMatch(/one word/)
   expect(fromPreset(PRESETS.find(p => p.id === 'copilot')!, ['copilot']).id).toBe('copilot-2')
   expect(slugId('My Agent!')).toBe('my-agent')
+})
+
+test('a harness on its own API gets the env its CLI reads, and is checked', () => {
+  const byok = fromPreset(PRESETS.find(p => p.id === 'copilot-api')!)
+  expect(harnessError(byok, [])).toMatch(/base URL/)
+  const h = { ...byok, model: 'qwen3-coder', provider: { type: 'openai' as const, baseUrl: 'https://openrouter.ai/api/v1', apiKey: 'sk-test', wireApi: 'responses' as const } }
+  expect(harnessError(h, [])).toBeUndefined()
+  expect(harnessError({ ...h, model: undefined }, [])).toMatch(/default model/)
+  expect(providerEnv(h, 'qwen3-coder')).toEqual({
+    COPILOT_PROVIDER_BASE_URL: 'https://openrouter.ai/api/v1',
+    COPILOT_PROVIDER_TYPE: 'openai',
+    COPILOT_PROVIDER_API_KEY: 'sk-test',
+    COPILOT_PROVIDER_WIRE_API: 'responses',
+    COPILOT_MODEL: 'qwen3-coder',
+  })
+  const claude = { ...fromPreset(PRESETS.find(p => p.id === 'claude-cli')!), provider: { type: 'anthropic' as const, baseUrl: 'https://gw.example.com', apiKey: 'k' } }
+  expect(harnessError(claude, [])).toBeUndefined()
+  expect(providerEnv(claude)).toEqual({ ANTHROPIC_BASE_URL: 'https://gw.example.com', ANTHROPIC_API_KEY: 'k' })
+  expect(harnessError({ ...claude, provider: { ...claude.provider, type: 'openai' } }, [])).toMatch(/takes an anthropic API/)
+  const gemini = { ...fromPreset(PRESETS.find(p => p.id === 'gemini')!), provider: claude.provider }
+  expect(harnessError(gemini, [])).toMatch(/Only Copilot and Claude Code/)
+  expect(providerEnv(fromPreset(PRESETS.find(p => p.id === 'copilot')!))).toEqual({})
+})
+
+test('the edit form sets up a Copilot on its own API', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'h-add', value: 'copilot-api' })
+  await ui.redraw()
+  expect(await ui.find({ text: /BYOK/ })).toBeDefined()
+  await ui.press({ key: 'h-save' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /base URL/ })).toBeDefined()
+  await ui.input({ key: 'h-provider-url', text: 'http://127.0.0.1:11434/v1/', kind: 'change' })
+  await ui.input({ key: 'h-provider-key', text: 'sk-test', kind: 'change' })
+  await ui.input({ key: 'h-model', text: 'qwen3-coder', kind: 'change' })
+  await ui.redraw()
+  expect(await ui.find({ text: /against http:\/\/127\.0\.0\.1:11434/ })).toBeDefined()
+  await ui.press({ key: 'h-save' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /copilot · Copilot JSON · qwen3-coder · API http:\/\/127\.0\.0\.1:11434\/v1$/ })).toBeDefined()
+  await ui.press({ key: 'h-edit-copilot-api' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'h-provider-type', value: '' })
+  await ui.redraw()
+  expect(await ui.find({ key: 'h-provider-url' } as never)).toBeUndefined()
+  await ui.unmount()
 })
 
 test('Copilot JSON events fill a card', () => {

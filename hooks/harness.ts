@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessParser, Tokens } from '../types'
+import type { Activity, AgentCard, Harness, HarnessParser, HarnessProvider, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -25,6 +25,18 @@ export const PRESETS: Preset[] = [
     args: '-p {prompt} --output-format json --allow-all-tools --model {model} --resume {session}',
     parser: 'copilot',
     note: 'GitHub Copilot CLI. --allow-all-tools lets it run any tool without asking; narrow it with --allow-tool/--deny-tool.',
+  },
+  {
+    id: 'copilot-api',
+    name: 'Copilot (own API)',
+    color: '#6E40C9',
+    command: 'copilot',
+    args: '-p {prompt} --output-format json --allow-all-tools --model {model} --resume {session}',
+    parser: 'copilot',
+    provider: { type: 'openai', baseUrl: '' },
+    note:
+      "GitHub Copilot CLI's agent, with its model calls sent to your own API instead of GitHub (BYOK): OpenRouter, OpenAI, Azure, Anthropic, " +
+      'or a local Ollama, vLLM or LM Studio. The model must support tool calls and streaming. Set the default model to the id the API expects.',
   },
   {
     id: 'opencode',
@@ -88,6 +100,44 @@ export const fromPreset = (p: Preset, taken: readonly string[] = []): Harness =>
   for (let i = 2; taken.includes(id); i++) id = `${p.id}-${i}`
   const { note: _note, ...rest } = p
   return { ...rest, id, isEnabled: true, preset: p.id }
+}
+
+// ---------- your own API (BYOK) ----------
+
+export const PROVIDER_TYPES: { value: HarnessProvider['type']; label: string }[] = [
+  { value: 'openai', label: 'OpenAI-compatible' },
+  { value: 'azure', label: 'Azure OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+]
+
+/** The CLIs that can be pointed at another API, and the provider types each accepts. */
+const PROVIDER_SUPPORT: Partial<Record<HarnessParser, readonly HarnessProvider['type'][]>> = {
+  copilot: ['openai', 'azure', 'anthropic'],
+  claude: ['anthropic'],
+}
+
+export const providerTypesFor = (parser: HarnessParser): readonly HarnessProvider['type'][] => PROVIDER_SUPPORT[parser] ?? []
+
+/** The environment that points a harness's CLI at its provider; empty without one. */
+export const providerEnv = (h: Pick<Harness, 'parser' | 'provider'>, model?: string): Record<string, string> => {
+  const p = h.provider
+  if (!p?.baseUrl.trim()) return {}
+  const env: Record<string, string> = {}
+  const put = (k: string, v?: string) => {
+    if (v?.trim()) env[k] = v.trim()
+  }
+  if (h.parser === 'copilot') {
+    put('COPILOT_PROVIDER_BASE_URL', p.baseUrl)
+    put('COPILOT_PROVIDER_TYPE', p.type)
+    put('COPILOT_PROVIDER_API_KEY', p.apiKey)
+    if (p.type === 'openai' && p.wireApi === 'responses') put('COPILOT_PROVIDER_WIRE_API', 'responses')
+    put('COPILOT_MODEL', model)
+  } else if (h.parser === 'claude') {
+    put('ANTHROPIC_BASE_URL', p.baseUrl)
+    put('ANTHROPIC_API_KEY', p.apiKey)
+    put('ANTHROPIC_MODEL', model)
+  }
+  return env
 }
 
 // ---------- arguments ----------
@@ -158,6 +208,13 @@ export const harnessError = (h: Harness, others: readonly Harness[]): string | u
   if (!h.command.trim()) return 'Name the command to run, for example copilot.'
   if (/\s/.test(h.command.trim())) return 'The command is one word; put its arguments under Arguments.'
   if (!h.args.includes('{prompt}')) return 'The arguments need {prompt} where the task goes.'
+  if (h.provider) {
+    const types = providerTypesFor(h.parser)
+    if (!types.length) return 'Only Copilot and Claude Code output can run against your own API; switch the API off or pick that output.'
+    if (!types.includes(h.provider.type)) return `This CLI takes an ${types.join(' or ')} API, not ${h.provider.type}.`
+    if (!/^https?:\/\/\S+$/.test(h.provider.baseUrl.trim())) return "Give the API's base URL, starting with http:// or https://."
+    if (h.parser === 'copilot' && !h.model?.trim()) return 'Set the default model to the id your API expects; Copilot needs one with its own API.'
+  }
   return undefined
 }
 

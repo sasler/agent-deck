@@ -48,6 +48,14 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 On first start, the built-in Codex is on if `codex` is on your PATH. Its On/Off button switches it any time.
 
+**Your own API (BYOK).** Copilot and Claude Code harnesses can send their model calls to an API you choose instead of their own service, the way Copilot's *bring your own key* works: the CLI's agent still runs on your machine, with its tools and file edits, and only the model calls go to your endpoint. Add the **Copilot (own API)** preset, or open any Copilot or Claude Code harness's **Edit** form, and set **Model API**:
+
+- **OpenAI-compatible**: OpenAI, OpenRouter, or a local Ollama, vLLM or LM Studio (`http://127.0.0.1:11434/v1`), with Chat Completions or Responses wire format;
+- **Azure OpenAI**;
+- **Anthropic**, or an Anthropic-compatible gateway (the only kind Claude Code takes).
+
+Then give the **API base URL** and **API key**, and set the default model to the id the API expects. The model has to support tool calls and streaming. agent-deck passes these to the CLI as environment variables (`COPILOT_PROVIDER_*` and `COPILOT_MODEL`, or `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`). The key is kept in agent-deck's settings as plain text. A run gets it through a file in its folder that the runner deletes before the CLI starts, so it isn't left in run files or shown in the command.
+
 Runs start without a shell, so nothing in a prompt is expanded or re-quoted. On Windows, an npm `.cmd` shim starts as the Node script it wraps; any other `.cmd`/`.bat` is refused, so point the command at the program itself.
 
 The arguments are a template. `{prompt}`, `{model}`, `{session}` and `{cwd}` are filled in, and a flag whose value is empty is dropped along with its placeholder. For example, `--model {model}` disappears when no model is set. The edit form shows the exact command it will run.
@@ -56,6 +64,7 @@ The arguments are a template. `{prompt}`, `{model}`, `{session}` and `{cwd}` are
 | --- | --- | --- |
 | Codex | `codex exec --json --skip-git-repo-check …` | Codex exec JSON (custom mode) |
 | Copilot | `copilot -p {prompt} --output-format json --allow-all-tools …` | Copilot JSON events, including premium requests |
+| Copilot (own API) | the same, with a Model API set | Copilot JSON events |
 | OpenCode | `opencode run --format json …` | OpenCode JSON events, including cost |
 | Gemini | `gemini -p {prompt} --output-format stream-json --yolo …` | Gemini stream-json |
 | Cursor | `cursor-agent -p {prompt} --output-format stream-json --force …` | Cursor stream-json |

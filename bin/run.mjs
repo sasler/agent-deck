@@ -3,7 +3,9 @@
 //
 //   node run.mjs <runDir>
 //
-// <runDir>/spec.json holds { argv: [command, ...args], cwd, stdin? }. The child's
+// <runDir>/spec.json holds { argv: [command, ...args], cwd, stdin? }. An optional
+// <runDir>/env.json adds environment variables (an API key, say); it is read and
+// deleted before the child starts, so it does not outlive the start. The child's
 // stdout goes to events.jsonl, stderr to stderr.log, its pid to pid.txt and,
 // once it exits, its exit code to exit.txt.
 import { spawn } from 'node:child_process'
@@ -31,6 +33,14 @@ if (process.env.AGENT_DECK_DETACHED !== '1') {
 
 const spec = JSON.parse(fs.readFileSync(path.join(dir, 'spec.json'), 'utf8'))
 const [command, ...args] = spec.argv
+const envFile = path.join(dir, 'env.json')
+let extraEnv = {}
+try {
+  extraEnv = JSON.parse(fs.readFileSync(envFile, 'utf8'))
+} catch {}
+try {
+  fs.rmSync(envFile, { force: true })
+} catch {}
 const isWindows = process.platform === 'win32'
 
 /** Finds a command on PATH the way a shell would, extensions included on Windows. */
@@ -98,6 +108,7 @@ try {
   child = spawn(argv[0], argv.slice(1), {
     cwd: spec.cwd || undefined,
     stdio: [spec.stdin === undefined ? 'ignore' : 'pipe', out, err],
+    env: { ...process.env, ...extraEnv },
     windowsHide: true,
     shell: false,
   })

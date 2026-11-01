@@ -3,6 +3,17 @@ export type Provider = 'codex' | 'claude' | 'strata' | 'harness'
 /** How a harness's stdout is read. */
 export type HarnessParser = 'codex' | 'copilot' | 'opencode' | 'gemini' | 'cursor' | 'claude' | 'text'
 
+/** The API a harness's CLI sends its model calls to, instead of the CLI's own service (BYOK). */
+export type HarnessProvider = {
+  type: 'openai' | 'azure' | 'anthropic'
+  /** The endpoint, for example https://openrouter.ai/api/v1 or http://127.0.0.1:11434/v1. */
+  baseUrl: string
+  /** Kept in agent-deck's settings as plain text; never written into a run's files or shown in its command. */
+  apiKey?: string
+  /** Copilot only: the OpenAI wire format, completions (the default) or responses. */
+  wireApi?: 'completions' | 'responses'
+}
+
 /** A CLI agent agent-deck can start, as the person set it up in the Harnesses view. */
 export type Harness = {
   /** Lowercase, letters, digits and dashes: what `agent_run` names. */
@@ -18,6 +29,8 @@ export type Harness = {
   args: string
   model?: string
   parser: HarnessParser
+  /** Set: the CLI runs against this API. Copilot and Claude Code read it from environment variables. */
+  provider?: HarnessProvider
   isEnabled: boolean
   /** The preset it came from, if any. */
   preset?: string

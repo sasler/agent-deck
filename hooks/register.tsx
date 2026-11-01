@@ -1,17 +1,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessParser, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
+import type { Activity, AgentCard, Harness, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
   PARSERS,
   PRESETS,
+  PROVIDER_TYPES,
   agentRunSpec,
   applyHarnessEvent,
   expandArgs,
   fromPreset,
   harnessError,
   parseLine,
+  providerEnv,
+  providerTypesFor,
   slugId,
 } from './harness'
 import {
@@ -830,8 +833,8 @@ async function loadHarnesses($: $T) {
     void detectHarnesses($, harnessList)
     return
   }
-  // Codex has its own built-in mode; Claude Code and Custom are added by hand.
-  const candidates = PRESETS.filter(p => !['custom', 'claude-cli', 'codex-cli'].includes(p.id)).map(p => fromPreset(p))
+  // Codex has its own built-in mode; Claude Code, Custom and the own-API Copilot are added by hand.
+  const candidates = PRESETS.filter(p => !['custom', 'claude-cli', 'codex-cli', 'copilot-api'].includes(p.id)).map(p => fromPreset(p))
   const found = await detectHarnesses($, candidates)
   await saveHarnesses($, candidates.filter(h => found[h.id]))
 }
@@ -990,6 +993,9 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
   await $.fs.write(`${dir}/prompt.txt`, input.prompt)
   await $.fs.write(`${dir}/meta.json`, JSON.stringify(meta, null, 2))
   await $.fs.write(`${dir}/spec.json`, JSON.stringify({ argv, cwd }, null, 2))
+  // The runner reads and deletes env.json before the CLI starts, so a key does not stay in the run's folder.
+  const env = providerEnv(h, model)
+  if (Object.keys(env).length) await $.fs.write(`${dir}/env.json`, JSON.stringify(env))
   const started = await $.process.run(['node', `${$.plugin.root}/bin/run.mjs`, dir], { timeoutMs: 20_000 })
   if (started.exitCode !== 0) throw new Error(started.stderr.trim() || `node exited ${started.exitCode} (agent_run needs Node.js on PATH)`)
   const run: HarnessRun = { ...meta, dir, offset: 0, partial: '', final: '', isFinished: false }
@@ -1955,7 +1961,7 @@ export const register: Register = on => {
             <Text dimColor> {hr.id}</Text>
           </Text>
           <Text dimColor wrap="truncate-end">
-            {[hr.command, parserLabel(hr.parser), hr.model ?? ''].filter(Boolean).join(' · ')}
+            {[hr.command, parserLabel(hr.parser), hr.model ?? '', hr.provider ? `API ${hr.provider.baseUrl}` : ''].filter(Boolean).join(' · ')}
           </Text>
           {found[hr.id] === false && <Text color="warning">{hr.command} is not on PATH</Text>}
         </Box>
@@ -2038,6 +2044,51 @@ export const register: Register = on => {
         />
       )
 
+    /** Where the CLI sends its model calls: its own service, or an API set here (BYOK). */
+    const providerSection = (d: Harness) => {
+      const types = providerTypesFor(d.parser)
+      if (!types.length || !Select) return undefined
+      const p = d.provider
+      const setP = (x: Harness, patch: Partial<HarnessProvider>): Harness => ({
+        ...x,
+        provider: { type: x.provider?.type ?? types[0]!, baseUrl: x.provider?.baseUrl ?? '', ...x.provider, ...patch },
+      })
+      return (
+        <Box key="h-provider" flexDirection="column" gap={1}>
+          <Select
+            key="h-provider-type"
+            label="Model API"
+            options={[{ value: '', label: "The CLI's own service" }, ...PROVIDER_TYPES.filter(t => types.includes(t.value))]}
+            value={p?.type ?? ''}
+            onSelect={s =>
+              void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined }))
+            }
+          />
+          {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
+          {p && field('h-provider-key', 'API key', p.apiKey ?? '', (x, s) => setP(x, { apiKey: s }))}
+          {p && p.type === 'openai' && d.parser === 'copilot' && (
+            <Select
+              key="h-provider-wire"
+              label="Wire format"
+              options={[
+                { value: 'completions', label: 'Chat Completions' },
+                { value: 'responses', label: 'Responses (GPT-5 series)' },
+              ]}
+              value={p.wireApi ?? 'completions'}
+              onSelect={s => void patchDraft(x => setP(x, { wireApi: s as HarnessProvider['wireApi'] }))}
+            />
+          )}
+          {p && (
+            <Text dimColor wrap="wrap">
+              {`The key is kept in agent-deck's settings as plain text and handed to the CLI as ${
+                d.parser === 'copilot' ? 'COPILOT_PROVIDER_API_KEY' : 'ANTHROPIC_API_KEY'
+              }; it is not written into run files.`}
+            </Text>
+          )}
+        </Box>
+      )
+    }
+
     const editView = (v: Extract<HarnessView, { mode: 'edit' }>) => {
       const d = v.draft
       const preset = PRESETS.find(p => p.id === d.preset)
@@ -2051,6 +2102,12 @@ export const register: Register = on => {
           args: d.args.trim(),
           color: d.color.trim() || '#14B8A6',
           model: d.model?.trim() || undefined,
+          provider: d.provider && {
+            type: d.provider.type,
+            baseUrl: d.provider.baseUrl.trim().replace(/\/+$/, ''),
+            apiKey: d.provider.apiKey?.trim() || undefined,
+            wireApi: d.provider.type === 'openai' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
+          },
         }
         const error = harnessError(clean, others)
         if (error) return setView({ ...v, error })
@@ -2087,11 +2144,13 @@ export const register: Register = on => {
               onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser }))}
             />
           )}
+          {providerSection(d)}
           <Text dimColor wrap="wrap">
             {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
           </Text>
           <Text dimColor wrap="wrap">
             runs: <Text mono>{`${d.command} ${showArgs(expandArgs(d.args, { prompt: '<task>', model: d.model }))}`}</Text>
+            {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
           </Text>
           {v.error && (
             <Text color="error" wrap="wrap">
