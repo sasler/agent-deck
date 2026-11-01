@@ -354,12 +354,18 @@ export async function sendHeld($: $T) {
   if (!held) return
   s.held = undefined
   s.ackedAt = 0
+  // The band says so at once: a cold re-write can take a while before any reply shows.
+  s.sending = { text: held.text, at: await $.clock.now(), tokens: s.ctx }
   isColdWritePending = true
   await save($)
-  const r = await $.prompt.submit({ text: held.text, asUser: true }).catch((err: unknown) => ({ drop: String((err as Error)?.message ?? err) }))
+  $.ui.toast(`agent-deck: sent. Re-writing ${fmtTok(s.ctx)} tokens of cache first, so the reply can take a minute.`)
+  const r = await $.prompt
+    .submit({ text: held.text, asUser: true, wait: false })
+    .catch((err: unknown) => ({ drop: String((err as Error)?.message ?? err) }))
   if (r?.drop !== undefined) {
     isColdWritePending = false
     s.held = held
+    s.sending = undefined
     await save($)
     $.ui.toast(`agent-deck: the held prompt was not sent: ${r.drop}`)
   }
@@ -456,6 +462,7 @@ export async function cacheAfterTurn($: $T, e: { usage?: TurnUsage | null; isAbo
   s.isWaitingForTurn = false
   s.ackedAt = 0
   s.held = undefined
+  s.sending = undefined
   const u = e.usage
   if (u) {
     if (u.model) s.model = u.model

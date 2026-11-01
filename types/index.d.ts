@@ -53,6 +53,8 @@ export type HarnessView =
       error?: string
       /** List models: asking, or what went wrong. */
       modelsState?: 'loading' | { error: string }
+      /** Other… was picked: the model is typed rather than chosen from the list. */
+      isTypingModel?: boolean
     }
 
 export type AgentStatus = 'running' | 'done' | 'error' | 'aborted'
@@ -166,6 +168,8 @@ export type CacheState = {
   ackedAt: number
   /** The cold send the guard held back, for the band's Send anyway button; absent when it had attachments. */
   held?: { text: string; usd?: number }
+  /** A held send that Send anyway just submitted, shown in the band until its turn ends. */
+  sending?: { text: string; at: number; tokens: number }
   coldWrites: ColdWrite[]
   /** Message count of the last main request, to spot a compaction. */
   transcript: number

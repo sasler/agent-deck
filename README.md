@@ -12,7 +12,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
   Under ⚙ Harnesses → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
 - **Keep-warm.** Pick 2, 4 or 6 hours in the cache box, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
-- **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. Change this with `/cache guard refuse|warn|off`.
+- **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. After **Send anyway** the band says at once that it was sent and that the cache is being re-written, since that can take a while before the reply starts. Change this with `/cache guard refuse|warn|off`.
 - **Live agent cards.** Each running agent gets a card with:
   - its model and reasoning effort
   - the tools it is running
@@ -29,14 +29,14 @@ Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the 
 - **Add** a harness from a preset (Copilot, OpenCode, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
 - **Edit** a harness's command, arguments, default model, color and output format.
 - **Switch** each harness on or off.
-- **Pick a model** for each harness. **List models** in the edit form asks the harness which models it can run, and the picker then sets its default:
+- **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in one **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. The list comes from:
   - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their premium-request multiplier;
   - OpenCode: `opencode models`;
   - Codex (custom harness): Codex's own model cache;
   - Claude Code: its aliases and current model ids;
   - a harness on your own API: the API's `/models` endpoint.
 
-  Gemini, Cursor and custom CLIs have no way to list their models, so you type the id. The listed models are also offered to Claude in the `agent_run` tool.
+  Gemini, Cursor and custom CLIs have no way to list their models, so the form shows a field to type the id. The listed models are also offered to Claude in the `agent_run` tool.
 
 On first start, agent-deck adds the presets whose CLI it finds on your PATH.
 

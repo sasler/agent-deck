@@ -30,6 +30,7 @@ import {
   cacheView,
   discardHeld,
   fmtDuration,
+  fmtTok,
   fmtUsd,
   freshCache,
   priceOf,
@@ -1602,10 +1603,19 @@ export const register: Register = on => {
         {cv.keepwarm && <Text color="success">♨ {fmtDuration(cv.keepwarm.leftMs)}</Text>}
       </Box>
     )
-    if (!heldRow) return band
+    const sending = cache.sending
+    const sendingPreview = sending ? sending.text.replace(/\s+/g, ' ').trim() : ''
+    const sendingRow = sending && !held && (
+      <Text color="success" wrap="truncate-end">
+        ✓ Sent “{sendingPreview.length > 40 ? `${sendingPreview.slice(0, 40)}…` : sendingPreview}” · re-writing {fmtTok(sending.tokens)} tokens of
+        cache first, so the reply can take a minute
+      </Text>
+    )
+    if (!heldRow && !sendingRow) return band
     return (
       <Box flexDirection="column">
         {heldRow}
+        {sendingRow}
         {band}
       </Box>
     )
@@ -2004,7 +2014,7 @@ export const register: Register = on => {
             variant={hr.isEnabled ? 'primary' : undefined}
             onPress={() => void saveHarnesses($, hs.map(x => (x.id === hr.id ? { ...x, isEnabled: !x.isEnabled } : x)))}
           />
-          {Input && <Button key={`h-edit-${hr.id}`} label="Edit" onPress={() => void setView({ mode: 'edit', draft: { ...hr }, originalId: hr.id })} />}
+          {Input && <Button key={`h-edit-${hr.id}`} label="Edit" onPress={() => void openEdit({ ...hr }, hr.id)} />}
         </Box>
       </Box>
     )
@@ -2057,7 +2067,7 @@ export const register: Register = on => {
             value=""
             onSelect={v => {
               const p = PRESETS.find(x => x.id === v)
-              if (p) void setView({ mode: 'edit', draft: fromPreset(p, hs.map(h => h.id)) })
+              if (p) void openEdit(fromPreset(p, hs.map(h => h.id)))
             }}
           />
         ) : (
@@ -2129,65 +2139,102 @@ export const register: Register = on => {
       )
     }
 
-    /** The default model: picked from what the harness reports, or typed. */
+    /** Asks the harness for its models; a fixed list fills in at once. */
+    const loadModels = async (d: Harness) => {
+      const how = modelQuery(d)
+      if (!how) return
+      // An answer that comes back after the form moved on to another harness or endpoint is dropped.
+      const isSame = (x: Harness) => x.parser === d.parser && x.command === d.command && x.provider?.baseUrl === d.provider?.baseUrl
+      const patchEdit = (fn: (cur: Extract<HarnessView, { mode: 'edit' }>) => HarnessView) =>
+        update($, viewAtom, cur => (cur.mode === 'edit' && isSame(cur.draft) ? fn(cur) : cur))
+      if ('models' in how) return patchEdit(cur => ({ ...cur, modelsState: undefined, draft: { ...cur.draft, models: how.models } }))
+      await patchEdit(cur => ({ ...cur, modelsState: 'loading' }))
+      const r = await queryModels($, how.query, d)
+      await patchEdit(cur =>
+        'error' in r
+          ? { ...cur, modelsState: { error: r.error } }
+          : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
+      )
+    }
+
+    /** Opens the edit form, asking for the harness's models right away when it has none yet. */
+    const openEdit = async (draft: Harness, originalId?: string) => {
+      await setView({ mode: 'edit', draft, originalId })
+      if (!draft.models?.length) await loadModels(draft)
+    }
+
+    const OTHER_MODEL = '__other__'
+
+    /**
+     * The model, as one control: a dropdown of what the harness reports (its default first,
+     * Other… last), or a text field where it reports nothing.
+     */
     const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
       const d = v.draft
       const how = modelQuery(d)
       const known: HarnessModel[] = d.models ?? []
       const st = v.modelsState
-      const listModels = async () => {
-        if (!how) return
-        if ('models' in how) return patchDraft(x => ({ ...x, models: how.models }))
-        await update($, viewAtom, cur => (cur.mode === 'edit' ? { ...cur, modelsState: 'loading' } : cur))
-        const r = await queryModels($, how.query, d)
-        await update($, viewAtom, cur =>
-          cur.mode !== 'edit'
-            ? cur
-            : 'error' in r
-              ? { ...cur, modelsState: { error: r.error } }
-              : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
+      const isLoading = st === 'loading'
+      const isCustom = !!d.model && !known.some(m => m.id === d.model)
+      const typed = (label: string) => field('h-model', label, d.model ?? '', (x, s) => ({ ...x, model: s }))
+      const refresh = (label: string) => (
+        <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
+      )
+      if (known.length && Select) {
+        const options = [
+          { value: '', label: "Default (the CLI's choice)" },
+          ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
+          { value: OTHER_MODEL, label: 'Other…' },
+        ]
+        const isTyping = v.isTypingModel || isCustom
+        return (
+          <Box key="h-models" flexDirection="column" gap={1}>
+            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+              <Select
+                key="h-model-pick"
+                label="Model"
+                options={options}
+                value={isTyping ? OTHER_MODEL : (d.model ?? '')}
+                onSelect={s =>
+                  void update($, viewAtom, cur =>
+                    cur.mode !== 'edit'
+                      ? cur
+                      : s === OTHER_MODEL
+                        ? { ...cur, isTypingModel: true }
+                        : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined } },
+                  )
+                }
+              />
+              {isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻')}
+            </Box>
+            {isTyping && typed('Model id')}
+            {st && st !== 'loading' && (
+              <Text color="error" wrap="wrap">
+                {`Could not refresh the models: ${st.error}`}
+              </Text>
+            )}
+          </Box>
         )
       }
-      const options = [
-        { value: '', label: "The CLI's default" },
-        ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
-        ...(d.model && !known.some(m => m.id === d.model) ? [{ value: d.model, label: `${d.model} (typed)` }] : []),
-      ]
       return (
         <Box key="h-models" flexDirection="column" gap={1}>
-          {Select && known.length > 0 && (
-            <Select
-              key="h-model-pick"
-              label="Model"
-              options={options}
-              value={d.model ?? ''}
-              onSelect={s => void patchDraft(x => ({ ...x, model: s || undefined }))}
-            />
-          )}
-          {field('h-model', known.length ? 'or type one' : 'Default model', d.model ?? '', (x, s) => ({ ...x, model: s }))}
-          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-            {how && (
-              <Button
-                key="h-models-list"
-                label={st === 'loading' ? 'Asking…' : known.length ? 'Refresh models' : 'List models'}
-                onPress={() => void (st === 'loading' ? undefined : listModels())}
-              />
-            )}
-            <Text dimColor wrap="wrap">
-              {!how
-                ? 'This CLI has no way to list its models; type the id it takes.'
-                : known.length
-                  ? `${known.length} model${known.length === 1 ? '' : 's'}${d.provider?.baseUrl ? ' from the API' : ''}.`
-                  : d.provider?.baseUrl
-                    ? "Asks the API's /models endpoint."
-                    : 'Asks the CLI which models your account can use.'}
+          {isLoading ? (
+            <Text>
+              Model <Text dimColor>· asking {d.provider?.baseUrl ? 'the API' : d.command || 'the CLI'} which models it has…</Text>
             </Text>
-          </Box>
-          {st && st !== 'loading' && (
-            <Text color="error" wrap="wrap">
-              {`Could not list models: ${st.error}`}
-            </Text>
+          ) : (
+            typed('Model')
           )}
+          {!how && <Text dimColor wrap="wrap">This CLI can't list its models: type the id it takes, or leave it empty for its default.</Text>}
+          {how && st && st !== 'loading' && (
+            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+              <Text color="error" wrap="wrap">
+                {`Could not list models: ${st.error}`}
+              </Text>
+              {refresh('Try again')}
+            </Box>
+          )}
+          {how && !st && refresh('List models')}
         </Box>
       )
     }
@@ -2236,18 +2283,18 @@ export const register: Register = on => {
           {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
           {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
           {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }), 2)}
-          {modelSection(v)}
-          {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
           {Select && (
             <Select
               key="h-parser"
               label="Output"
               options={PARSERS}
               value={d.parser}
-              onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser }))}
+              onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser, models: undefined }))}
             />
           )}
           {providerSection(d)}
+          {modelSection(v)}
+          {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
           <Text dimColor wrap="wrap">
             {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
           </Text>
@@ -2352,10 +2399,10 @@ export const register: Register = on => {
       const existing = codexHarnesses[0]
       if (existing) {
         await saveHarnesses($, hs.map(x => (x.id === existing.id ? { ...x, isEnabled: true } : x)))
-        return setView({ mode: 'edit', draft: { ...existing, isEnabled: true }, originalId: existing.id })
+        return openEdit({ ...existing, isEnabled: true }, existing.id)
       }
       const preset = PRESETS.find(x => x.id === 'codex-cli')
-      if (preset) return setView({ mode: 'edit', draft: fromPreset(preset, hs.map(x => x.id)) })
+      if (preset) return openEdit(fromPreset(preset, hs.map(x => x.id)))
     }
 
     const codexView = () => (

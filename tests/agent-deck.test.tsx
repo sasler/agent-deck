@@ -136,6 +136,11 @@ test('a held cold send goes out from the band with Send anyway', async ($, on) =
   mock.clock(on, { now: Date.UTC(2026, 9, 30, 12) })
   mock.store(on)
   on('session.id', () => ({ value: 'sid-held' }))
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push(String((e as { text?: string }).text ?? e))
+    return { value: undefined } as never
+  })
   on('env.get', () => ({ value: undefined }))
   on('classic.SessionStart', () => ({}) as never)
   const sent: string[] = []
@@ -159,6 +164,8 @@ test('a held cold send goes out from the band with Send anyway', async ($, on) =
   await ui.redraw()
   expect(sent).toEqual(['fix the parser'])
   expect(await ui.find({ key: 'held-send' })).toBeUndefined()
+  expect(await ui.find({ text: /✓ Sent “fix the parser” · re-writing 198k tokens/ })).toBeDefined()
+  expect(toasts.join(' ')).toMatch(/sent\. Re-writing/)
   await ui.unmount()
 })
 
@@ -400,19 +407,38 @@ test('the edit form lists a harness\'s models and picks one', async ($, on) => {
   expect(await ui.find({ text: /Model API, or add the Copilot \(own API\) preset/ })).toBeDefined()
   await ui.select({ key: 'h-add', value: 'claude-cli' })
   await ui.redraw()
-  expect(await ui.find({ key: 'h-model-pick' } as never)).toBeUndefined()
-  await ui.press({ key: 'h-models-list' } as never)
-  await ui.redraw()
-  expect(await ui.find({ text: /7 models\./ })).toBeDefined()
+  // A fixed list fills in as the form opens: one dropdown, no extra field.
+  const pick = (await ui.find({ key: 'h-model-pick' } as never)) as { props: { options: { value: string }[] } }
+  expect(pick.props.options.map(o => o.value)).toEqual(['', 'opus', 'sonnet', 'haiku', 'claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', '__other__'])
+  expect(await ui.find({ key: 'h-model' } as never)).toBeUndefined()
   await ui.select({ key: 'h-model-pick', value: 'claude-sonnet-5-5' })
   await ui.redraw()
   expect(await ui.find({ text: /--model claude-sonnet-5-5/ })).toBeDefined()
+  await ui.select({ key: 'h-model-pick', value: '__other__' })
+  await ui.redraw()
+  await ui.input({ key: 'h-model', text: 'claude-next', kind: 'change' })
+  await ui.redraw()
+  expect(await ui.find({ text: /--model claude-next/ })).toBeDefined()
   await ui.press({ key: 'h-save' } as never)
   await ui.redraw()
-  expect(await ui.find({ text: /claude · Claude stream-json · claude-sonnet-5-5/ })).toBeDefined()
+  expect(await ui.find({ text: /claude · Claude stream-json · claude-next/ })).toBeDefined()
+  // Editing it again keeps the typed model in Other…'s field.
+  await ui.press({ key: 'h-edit-claude-cli' } as never)
+  await ui.redraw()
+  expect(((await ui.find({ key: 'h-model' } as never)) as { props: { value: string } }).props.value).toBe('claude-next')
+  await ui.press({ key: 'h-cancel' } as never)
+  await ui.redraw()
+  // A query that fails says why, offers Try again, and leaves the field to type in.
+  await ui.select({ key: 'h-add', value: 'copilot' })
+  await ui.redraw()
+  expect(await ui.find({ text: /Could not list models: no home directory/ })).toBeDefined()
+  expect(await ui.find({ key: 'h-models-list' } as never)).toBeDefined()
+  expect(await ui.find({ key: 'h-model' } as never)).toBeDefined()
+  await ui.press({ key: 'h-cancel' } as never)
+  await ui.redraw()
   await ui.select({ key: 'h-add', value: 'gemini' })
   await ui.redraw()
-  expect(await ui.find({ text: /no way to list its models/ })).toBeDefined()
+  expect(await ui.find({ text: /can't list its models/ })).toBeDefined()
   await ui.unmount()
 })
 
