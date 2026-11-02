@@ -1467,7 +1467,7 @@ export const register: Register = on => {
   // ---- Codex ----
 
   on('tool.call', { tool: 'mcp__agent-deck__codex' }, async ($, e) => {
-    if (!codexOn) return { deny: 'agent-deck: the built-in Codex is switched off under ⚙ Harnesses in the Agents pane.' }
+    if (!codexOn) return { deny: 'agent-deck: the built-in Codex is switched off under ⚙ Settings in the Agents pane.' }
     const input = e as unknown as {
       prompt: string
       title?: string
@@ -1545,7 +1545,7 @@ export const register: Register = on => {
     const h = harnessList.find(x => x.id === input.harness)
     if (!h) {
       const ids = harnessList.filter(x => x.isEnabled).map(x => x.id)
-      return { deny: `agent-deck: no harness "${input.harness}". ${ids.length ? `Enabled: ${ids.join(', ')}.` : 'None is enabled: add one under ⚙ Harnesses in the Agents pane.'}` }
+      return { deny: `agent-deck: no harness "${input.harness}". ${ids.length ? `Enabled: ${ids.join(', ')}.` : 'None is enabled: add one under ⚙ Settings in the Agents pane.'}` }
     }
     if (!h.isEnabled) return { deny: `agent-deck: the ${h.name} harness is switched off in the Agents pane.` }
     const run = await launchHarnessRun($, h, input)
@@ -2052,7 +2052,7 @@ export const register: Register = on => {
     const listView = () => (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text bold>Harnesses</Text>
+          <Text bold>Settings</Text>
           <Button key="h-done" label="Done" onPress={() => void setView({ mode: 'cards' })} />
         </Box>
         <Text dimColor wrap="wrap">
@@ -2478,7 +2478,9 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={0}>
         <Box flexDirection="row" justifyContent="flex-end">
-          <Button key="h-open" label="⚙ Harnesses" plain onPress={() => void setView({ mode: 'list' })} />
+          <Button key="h-open" label="Settings" plain dimColor onPress={() => void setView({ mode: 'list' })}>
+            <Text size="title">⚙</Text>
+          </Button>
         </Box>
         <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
           {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}

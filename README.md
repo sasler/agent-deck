@@ -9,7 +9,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
   - Codex's limits, read from its session files;
   - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`).
 
-  Under ⚙ Harnesses → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
+  Under ⚙ (settings) → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
 - **Keep-warm.** Pick 2, 4 or 6 hours in the cache box, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
 - **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. After **Send anyway** the band says at once that it was sent and that the cache is being re-written, since that can take a while before the reply starts. Change this with `/cache guard refuse|warn|off`.
@@ -24,7 +24,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
 ## Harnesses: Copilot, OpenCode, Gemini, Cursor and more
 
-Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the prompt), then click **⚙ Harnesses**. The pane's title shows the version that is running.
+Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the prompt), then click the **⚙** gear at the top right to open its settings. The pane's title shows the version that is running.
 
 - **Add** a harness from a preset (Copilot, OpenCode, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
 - **Edit** a harness's command, arguments, default model, color and output format.
@@ -49,7 +49,7 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 `agent_result` reads a run on demand.
 
-**Codex** has three modes, chosen with Codex's **Edit** button in the Harnesses list:
+**Codex** has three modes, chosen with Codex's **Edit** button in ⚙ settings:
 
 - **Built in.** The `codex` and `codex_result` tools, with model, effort, sandbox and resume. It also gives a live card for every Codex run, including ones started in a terminal or the Codex app, and the Codex usage meters.
 - **Custom harness.** Codex runs through `agent_run` like any other harness, from a `codex exec --json` command you can edit.

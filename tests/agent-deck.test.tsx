@@ -352,8 +352,13 @@ test('the edit form sets up a Copilot on its own API', async ($, on) => {
     requestId: 'agent-deck',
     props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
   })
+  // Settings open from a large gear, named Settings for a reader.
+  const gear = (await ui.findAll({ type: 'Button' } as never)).find(b => (b as { key?: string }).key === 'h-open') as { text?: string; props?: { label?: string } } | undefined
+  expect(gear?.text).toBe('⚙')
+  expect(gear?.props?.label).toBe('Settings')
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  expect(await ui.find({ text: 'Settings' })).toBeDefined()
   await ui.select({ key: 'h-add', value: 'copilot-api' })
   await ui.redraw()
   expect(await ui.find({ text: /BYOK/ })).toBeDefined()

@@ -689,7 +689,7 @@ export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
     "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
     (enabled.length
       ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${modelsHint(h)})`).join('; ')}. `
-      : 'No harness is enabled yet: the person adds them under ⚙ Harnesses in the Agents pane. ') +
+      : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
     'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
   inputSchema: {
     type: 'object',
