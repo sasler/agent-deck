@@ -192,6 +192,18 @@ export const parseModels = (stdout: string): { models: HarnessModel[] } | { erro
   }
 }
 
+/** Copilot Fusion routes each prompt between models; its effort level is a CLI flag, so each level is a model here. */
+const FUSION_TIERS = ['standard', 'high', 'max'] as const
+const COPILOT_FUSION: HarnessModel[] = FUSION_TIERS.map(t => ({
+  id: `fusion-${t}`,
+  name: `Copilot Fusion ${t[0]!.toUpperCase()}${t.slice(1)}`,
+  note: 'picks models per prompt',
+}))
+
+/** Copilot's models with Fusion's levels first; GitHub's own models only, not a harness on your own API. */
+export const withFusion = (h: Pick<Harness, 'parser' | 'provider'>, models: HarnessModel[]): HarnessModel[] =>
+  h.parser === 'copilot' && !h.provider?.baseUrl.trim() ? [...COPILOT_FUSION, ...models.filter(m => !m.id.startsWith('fusion-'))] : models
+
 export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
 
 // ---------- arguments ----------
@@ -242,6 +254,15 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
     }
     out.push(word.replace(PLACEHOLDER, (_, n: keyof ArgValues) => v[n] ?? ''))
   }
+  return out
+}
+
+/** A harness's arguments; Copilot's `fusion-high` becomes `--model fusion --fusion-tier high`. */
+export const harnessArgs = (h: Pick<Harness, 'parser' | 'args'>, v: ArgValues): string[] => {
+  const tier = h.parser === 'copilot' ? /^fusion-(standard|high|max)$/.exec(v.model ?? '')?.[1] : undefined
+  const out = expandArgs(h.args, tier ? { ...v, model: 'fusion' } : v)
+  const at = out.findIndex((w, i) => w === 'fusion' && out[i - 1] === '--model')
+  if (tier && at > 0) out.splice(at + 1, 0, '--fusion-tier', tier)
   return out
 }
 

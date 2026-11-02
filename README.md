@@ -31,6 +31,7 @@ Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the 
 - **Switch** each harness on or off.
 - **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in one **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. The list comes from:
   - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their price category (low, medium or high);
+    it also offers **Copilot Fusion** at Standard, High or Max, which lets Copilot pick the models for each prompt (`--model fusion --fusion-tier …`; needs a recent Copilot CLI, `copilot update`);
   - OpenCode: `opencode models`;
   - Codex (custom harness): Codex's own model cache;
   - Claude Code: its aliases and current model ids;

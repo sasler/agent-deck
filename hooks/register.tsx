@@ -9,8 +9,8 @@ import {
   PROVIDER_TYPES,
   agentRunSpec,
   applyHarnessEvent,
-  expandArgs,
   fromPreset,
+  harnessArgs,
   harnessError,
   modelLabel,
   modelQuery,
@@ -20,6 +20,7 @@ import {
   providerTypesFor,
   type ModelQuery,
   slugId,
+  withFusion,
 } from './harness'
 import {
   DEFAULT_WINDOW_MS,
@@ -1038,7 +1039,7 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     model,
   }
   const dir = `${root}/${id}`
-  const argv = [h.command, ...expandArgs(h.args, { prompt: input.prompt, model, session: input.resume, cwd })]
+  const argv = [h.command, ...harnessArgs(h, { prompt: input.prompt, model, session: input.resume, cwd })]
   await $.fs.write(`${dir}/prompt.txt`, input.prompt)
   await $.fs.write(`${dir}/meta.json`, JSON.stringify(meta, null, 2))
   await $.fs.write(`${dir}/spec.json`, JSON.stringify({ argv, cwd }, null, 2))
@@ -1063,7 +1064,8 @@ const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: 
   const r = await $.process
     .run(['node', `${$.plugin.root}/bin/models.mjs`, file], { timeoutMs: 60_000 })
     .catch(err => ({ exitCode: 1, stdout: '', stderr: String((err as Error)?.message ?? err) }))
-  return parseModels(r.stdout || r.stderr)
+  const found = parseModels(r.stdout || r.stderr)
+  return 'models' in found ? { models: withFusion(h, found.models) } : found
 }
 
 type AgentRunInput = { harness: string; prompt: string; title?: string; model?: string; cwd?: string; resume?: string }
@@ -2327,7 +2329,7 @@ export const register: Register = on => {
             {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
           </Text>
           <Text dimColor wrap="wrap">
-            runs: <Text mono>{`${d.command} ${showArgs(expandArgs(d.args, { prompt: '<task>', model: d.model }))}`}</Text>
+            runs: <Text mono>{`${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', model: d.model }))}`}</Text>
             {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
           </Text>
           {v.error && (
