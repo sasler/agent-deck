@@ -5,9 +5,9 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 ## What it shows
 
 - **Usage limits.** Each provider's limits as a meter with a percentage and a reset countdown:
-  - Claude's 5-hour and weekly windows;
+  - Claude's 5-hour and weekly windows, and every other limit your plan reports, such as a Team or Enterprise plan's spend limit or a weekly Opus limit;
   - Codex's limits, read from its session files;
-  - Copilot's monthly premium requests, read through the GitHub CLI (`gh api copilot_internal/user`).
+  - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`).
 
   Under ⚙ Harnesses → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
@@ -18,7 +18,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
   - the tools it is running
   - the latest output
   - tokens in and out, cache-hit rate and an API-equivalent cost
-  - Copilot's premium requests, for Copilot runs
+  - the AI credits a Copilot run used
 
   Finished cards collapse into a list.
 
@@ -30,7 +30,7 @@ Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the 
 - **Edit** a harness's command, arguments, default model, color and output format.
 - **Switch** each harness on or off.
 - **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in one **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. The list comes from:
-  - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their premium-request multiplier;
+  - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their price category (low, medium or high);
   - OpenCode: `opencode models`;
   - Codex (custom harness): Codex's own model cache;
   - Claude Code: its aliases and current model ids;
@@ -71,7 +71,7 @@ The arguments are a template. `{prompt}`, `{model}`, `{session}` and `{cwd}` are
 | Preset | Command | Output read |
 | --- | --- | --- |
 | Codex | `codex exec --json --skip-git-repo-check …` | Codex exec JSON (custom mode) |
-| Copilot | `copilot -p {prompt} --output-format json --allow-all-tools …` | Copilot JSON events, including premium requests |
+| Copilot | `copilot -p {prompt} --output-format json --allow-all-tools …` | Copilot JSON events, including AI credits |
 | Copilot (own API) | the same, with a Model API set | Copilot JSON events |
 | OpenCode | `opencode run --format json …` | OpenCode JSON events, including cost |
 | Gemini | `gemini -p {prompt} --output-format stream-json --yolo …` | Gemini stream-json |

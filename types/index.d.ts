@@ -101,13 +101,16 @@ export type AgentCard = {
   accent?: string
   /** The harness's own session id, to resume it. */
   sessionRef?: string
-  /** Copilot's premium requests used. */
-  premiumRequests?: number
+  /** Copilot's AI credits used (its nano AI units / 10^9). */
+  aiCredits?: number
   error?: string
 }
 
 export type LimitWindow = {
+  /** Short tag for the one-line meter: 5h, 7d, mo. */
   label: string
+  /** Full name for the bar meter; absent, one is made from the label. */
+  name?: string
   percent: number
   /** Epoch milliseconds. */
   resetsAt?: number
@@ -117,7 +120,7 @@ export type Limits = {
   codex: LimitWindow[]
   claude: LimitWindow[]
   codexPlan?: string
-  /** Copilot's monthly premium requests, read with `gh api copilot_internal/user`. */
+  /** Copilot's monthly AI credits, read with `gh api copilot_internal/user`. */
   copilot?: LimitWindow[]
   copilotPlan?: string
 }

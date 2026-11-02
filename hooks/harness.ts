@@ -282,7 +282,7 @@ export type HarnessEvent =
   | { kind: 'tokens'; tokens: Tokens; isAdded?: boolean }
   | { kind: 'cost'; usd: number; isAdded?: boolean }
   | { kind: 'session'; id: string }
-  | { kind: 'premium'; count: number }
+  | { kind: 'credits'; credits: number }
   | { kind: 'error'; text: string }
   | { kind: 'final'; text: string }
 
@@ -308,6 +308,10 @@ const tok = (input: number, output: number, cacheRead: number, cacheWrite: numbe
   cacheWrite,
   reasoning,
 })
+
+/** Copilot bills in AI credits and reports them as nano AI units. */
+const aiCredits = (nanoAiu: unknown): HarnessEvent[] =>
+  typeof nanoAiu === 'number' && Number.isFinite(nanoAiu) ? [{ kind: 'credits', credits: nanoAiu / 1e9 }] : []
 
 const copilot = (e: J): HarnessEvent[] => {
   const d = obj(e.data)
@@ -346,16 +350,17 @@ const copilot = (e: J): HarnessEvent[] => {
         t.reasoning += num(u.reasoningTokens)
       }
       const out: HarnessEvent[] = [{ kind: 'tokens', tokens: { ...t, input: Math.max(0, t.input) } }]
-      if (typeof d.totalPremiumRequests === 'number') out.push({ kind: 'premium', count: d.totalPremiumRequests })
+      out.push(...aiCredits(d.totalNanoAiu))
       return out
     }
+    case 'session.shutdown':
+      return aiCredits(d.totalNanoAiu ?? obj(d.accountingSnapshot).totalNanoAiu)
     case 'session.error':
       return [{ kind: 'error', text: str(d.message) ?? str(d.errorType) ?? 'Copilot reported an error' }]
     case 'result': {
       const out: HarnessEvent[] = []
       if (str(e.sessionId)) out.push({ kind: 'session', id: e.sessionId as string })
-      const premium = obj(e.usage).premiumRequests
-      if (typeof premium === 'number') out.push({ kind: 'premium', count: premium })
+      out.push(...aiCredits(obj(e.usage).totalNanoAiu))
       return out
     }
   }
@@ -635,8 +640,8 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
     case 'session':
       card.sessionRef = ev.id
       break
-    case 'premium':
-      card.premiumRequests = ev.count
+    case 'credits':
+      card.aiCredits = ev.credits
       break
     case 'error':
       card.error = ev.text

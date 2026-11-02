@@ -85,7 +85,7 @@ const fromAcp = () =>
             list.map(m => ({
               id: m.modelId,
               name: m.name !== m.modelId ? m.name : undefined,
-              note: m._meta?.copilotUsage ? `${m._meta.copilotUsage} premium` : undefined,
+              note: m._meta?.copilotPriceCategory ? `${m._meta.copilotPriceCategory} price` : undefined,
             })),
           )
         }

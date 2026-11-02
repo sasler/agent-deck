@@ -141,23 +141,57 @@ export const barSvg = (percent: number, fill: string): string => {
   )
 }
 
-const windowName = (label: string) =>
-  label === '5h' ? '5-hour limit' : label === '7d' ? 'Weekly limit' : label === 'mo' ? 'Monthly premium requests' : `${label} limit`
+const windowName = (w: LimitWindow) =>
+  w.name ?? (w.label === '5h' ? '5-hour limit' : w.label === '7d' ? 'Weekly limit' : `${w.label} limit`)
+
+/** Short tag and full name of each Claude window; Team and Enterprise plans report more than 5h and 7d. */
+const CLAUDE_WINDOWS: Record<string, { label: string; name: string }> = {
+  five_hour: { label: '5h', name: '5-hour limit' },
+  seven_day: { label: '7d', name: 'Weekly limit' },
+  seven_day_opus: { label: 'Opus', name: 'Weekly Opus limit' },
+  seven_day_sonnet: { label: 'Sonnet', name: 'Weekly Sonnet limit' },
+  spend_limit: { label: '$', name: 'Spend limit' },
+}
+
+/** Every rate-limit window the session reports, the known ones first, in a fixed order. */
+export const claudeLimits = (rateLimits: readonly { kind: string; percentUsed: number; resetsAt?: string }[]): LimitWindow[] => {
+  const order = Object.keys(CLAUDE_WINDOWS)
+  const rank = (kind: string) => (order.includes(kind) ? order.indexOf(kind) : order.length)
+  return [...rateLimits]
+    .sort((a, b) => rank(a.kind) - rank(b.kind))
+    .map(r => {
+      const known = CLAUDE_WINDOWS[r.kind]
+      const words = r.kind.replace(/_/g, ' ')
+      return {
+        label: known?.label ?? words,
+        name: known?.name ?? `${words[0]?.toUpperCase() ?? ''}${words.slice(1)} limit`,
+        percent: r.percentUsed,
+        resetsAt: r.resetsAt ? Date.parse(r.resetsAt) || undefined : undefined,
+      }
+    })
+}
+
+/** AI credits from Copilot's nano AI units (`totalNanoAiu`), rounded for display. */
+export const fmtCredits = (credits: number): string =>
+  credits >= 100 ? String(Math.round(credits)) : credits >= 1 ? credits.toFixed(1) : credits.toFixed(2)
 
 /**
- * Copilot's premium-request window from `gh api copilot_internal/user`: percent used,
- * the monthly reset, and "used of entitlement". Undefined when unlimited or absent.
+ * Copilot's monthly AI credits from `gh api copilot_internal/user`: percent used, the
+ * monthly reset, and "used of entitlement". Undefined when unlimited or absent.
  */
 export const copilotLimits = (d: unknown): { windows: LimitWindow[]; plan: string } | undefined => {
   const o = (d && typeof d === 'object' ? d : {}) as Record<string, unknown>
   const q = ((o.quota_snapshots ?? {}) as Record<string, Record<string, unknown>>).premium_interactions
   if (!q || q.unlimited === true || typeof q.entitlement !== 'number' || q.entitlement <= 0) return undefined
-  const remaining = typeof q.remaining === 'number' ? q.remaining : q.entitlement
-  const percent = typeof q.percent_remaining === 'number' ? 100 - q.percent_remaining : ((q.entitlement - remaining) / q.entitlement) * 100
+  const used =
+    typeof q.credits_used === 'number' && q.credits_used > 0
+      ? q.credits_used
+      : q.entitlement - (typeof q.remaining === 'number' ? q.remaining : q.entitlement)
+  const percent = typeof q.percent_remaining === 'number' ? 100 - q.percent_remaining : (used / q.entitlement) * 100
   const reset = typeof o.quota_reset_date_utc === 'string' ? Date.parse(o.quota_reset_date_utc) : NaN
   return {
-    windows: [{ label: 'mo', percent: Math.max(0, percent), resetsAt: Number.isNaN(reset) ? undefined : reset }],
-    plan: `${Math.max(0, q.entitlement - remaining)} of ${q.entitlement}`,
+    windows: [{ label: 'mo', name: 'Monthly AI credits', percent: Math.max(0, percent), resetsAt: Number.isNaN(reset) ? undefined : reset }],
+    plan: `${fmtCredits(Math.max(0, used))} of ${q.entitlement} AI credits`,
   }
 }
 
@@ -331,13 +365,7 @@ const setLimits = async ($: $T, fn: (l: Limits) => Limits) => {
 const refreshClaudeLimits = async ($: $T) => {
   const usage = await $.session.usage().catch(() => undefined)
   if (!usage) return
-  const claude: LimitWindow[] = usage.rateLimits
-    .filter(r => r.kind === 'five_hour' || r.kind === 'seven_day')
-    .map(r => ({
-      label: r.kind === 'five_hour' ? '5h' : '7d',
-      percent: r.percentUsed,
-      resetsAt: r.resetsAt ? Date.parse(r.resetsAt) || undefined : undefined,
-    }))
+  const claude = claudeLimits(usage.rateLimits)
   await setLimits($, l => ({ ...l, claude }))
 }
 
@@ -888,7 +916,7 @@ const harnessFooter = (run: HarnessRun, card: AgentCard | undefined) => {
     `[${run.name} run ${run.id} · harness ${run.harness} · model ${card?.model ?? run.model ?? 'default'}` +
     (card?.sessionRef ? ` · session ${card.sessionRef}` : '') +
     (t && t.input + t.output > 0 ? ` · in ${fmtTokens(t.input + t.cacheRead + t.cacheWrite)} out ${fmtTokens(t.output)}` : '') +
-    (card?.premiumRequests ? ` · ${card.premiumRequests} premium request${card.premiumRequests === 1 ? '' : 's'}` : '') +
+    (card?.aiCredits ? ` · ${fmtCredits(card.aiCredits)} AI credits` : '') +
     ']'
   )
 }
@@ -1040,7 +1068,7 @@ const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: 
 
 type AgentRunInput = { harness: string; prompt: string; title?: string; model?: string; cwd?: string; resume?: string }
 
-// ---------- Copilot's premium requests, and which meters show ----------
+// ---------- Copilot's AI credits, and which meters show ----------
 
 const KEY_METERS = 'meters'
 let copilotPoller: { cancel: () => void } | undefined
@@ -1667,7 +1695,7 @@ export const register: Register = on => {
 
     const limitWindow = (name: string, w: LimitWindow) => (
       <Box key={`${name}-${w.label}`} flexDirection="row" gap={1} flexShrink={0}>
-        <Box width={2} flexShrink={0}>
+        <Box width={Math.max(2, w.label.length)} flexShrink={0}>
           <Text dimColor>{w.label}</Text>
         </Box>
         {meter(`${name}-${w.label}-m`, w.percent, limitColor(w.percent))}
@@ -1706,7 +1734,7 @@ export const register: Register = on => {
         {ws.map(w => (
           <Box key={`${name}-${w.label}`} flexDirection="column">
             <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
-              <Text>{windowName(w.label)}</Text>
+              <Text>{windowName(w)}</Text>
               <Box flexDirection="row" columnGap={1} flexShrink={0}>
                 {w.resetsAt !== undefined && <Text dimColor>resets in {fmtReset(w.resetsAt, now)}</Text>}
                 <Text bold tabular color={limitColor(w.percent)}>
@@ -1922,7 +1950,7 @@ export const register: Register = on => {
           {stat('out', 'out', fmtTokens(t.output))}
           {hit !== undefined && stat('hit', 'cache', `${Math.round(hit)}%`, hit >= 50 ? 'success' : 'warning')}
           {c.costUsd !== undefined && stat('cost', '≈', fmtUsd(c.costUsd))}
-          {c.premiumRequests !== undefined && stat('prem', 'premium', String(c.premiumRequests))}
+          {c.aiCredits !== undefined && stat('credits', 'AI credits', fmtCredits(c.aiCredits))}
         </Box>
       )
 
@@ -2378,7 +2406,7 @@ export const register: Register = on => {
           {[
             'Claude: this session.',
             isCodexOn ? 'Codex: read from its session files.' : 'Codex: needs the built-in Codex on.',
-            hasReading.copilot ? 'Copilot: premium requests via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
+            hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
           ].join(' ')}
         </Text>
       </Box>

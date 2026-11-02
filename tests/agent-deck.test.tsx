@@ -4,7 +4,9 @@ import {
   applyStrataRecord,
   applyToCard,
   barSvg,
+  claudeLimits,
   copilotLimits,
+  fmtCredits,
   isMeterShown,
   cacheHitPercent,
   clip,
@@ -449,7 +451,7 @@ test('Copilot JSON events fill a card', () => {
     '{"type":"tool.execution_start","data":{"toolCallId":"t1","toolName":"powershell","arguments":{"command":"echo hi"}}}',
     '{"type":"tool.execution_complete","data":{"toolCallId":"t1","success":true}}',
     '{"type":"assistant.message","data":{"model":"gpt-6-luna","content":"done"}}',
-    '{"type":"session.usage_checkpoint","data":{"totalPremiumRequests":1,"accountingSnapshot":{"modelMetrics":{"gpt-6-luna":{"usage":{"inputTokens":15408,"outputTokens":23,"cacheReadTokens":0,"cacheWriteTokens":15405,"reasoningTokens":16}}}}}}',
+    '{"type":"session.usage_checkpoint","data":{"totalNanoAiu":174368250,"totalPremiumRequests":1,"accountingSnapshot":{"modelMetrics":{"gpt-6-luna":{"usage":{"inputTokens":15408,"outputTokens":23,"cacheReadTokens":0,"cacheWriteTokens":15405,"reasoningTokens":16}}}}}}',
     '{"type":"result","sessionId":"67e5","exitCode":0,"usage":{"premiumRequests":1}}',
   ]
   let final = ''
@@ -458,7 +460,7 @@ test('Copilot JSON events fill a card', () => {
   expect(card.activity).toEqual([{ id: 't1', label: 'powershell echo hi', status: 'done' }])
   expect(card.output).toBe('done\n')
   expect(card.tokens).toEqual({ input: 3, output: 23, cacheRead: 0, cacheWrite: 15405, reasoning: 16 })
-  expect(card.premiumRequests).toBe(1)
+  expect(card.aiCredits).toBe(0.17436825)
   expect(card.sessionRef).toBe('67e5')
   expect(final).toBe('done')
 })
@@ -595,7 +597,7 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   await ui.unmount()
 })
 
-test('Copilot premium requests become a meter', () => {
+test('Copilot AI credits become a meter', () => {
   const r = copilotLimits({
     quota_reset_date_utc: '2026-11-01T00:00:00.000Z',
     quota_snapshots: {
@@ -603,10 +605,42 @@ test('Copilot premium requests become a meter', () => {
       premium_interactions: { unlimited: false, entitlement: 1500, remaining: 870, percent_remaining: 58 },
     },
   })
-  expect(r?.windows).toEqual([{ label: 'mo', percent: 42, resetsAt: Date.parse('2026-11-01T00:00:00.000Z') }])
-  expect(r?.plan).toBe('630 of 1500')
+  expect(r?.windows).toEqual([{ label: 'mo', name: 'Monthly AI credits', percent: 42, resetsAt: Date.parse('2026-11-01T00:00:00.000Z') }])
+  expect(r?.plan).toBe('630 of 1500 AI credits')
+  const billed = copilotLimits({
+    token_based_billing: true,
+    quota_snapshots: { premium_interactions: { unlimited: false, entitlement: 1500, remaining: 1287.5, credits_used: 212.5, percent_remaining: 85.8 } },
+  })
+  expect(billed?.plan).toBe('213 of 1500 AI credits')
   expect(copilotLimits({ quota_snapshots: { premium_interactions: { unlimited: true } } })).toBeUndefined()
   expect(copilotLimits({})).toBeUndefined()
+})
+
+test('Copilot run totals arrive as AI credits', () => {
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'Copilot', status: 'done', startedAt: 0, output: '', isThinking: false, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  for (const ev of parseLine('copilot', '{"type":"session.shutdown","data":{"accountingSnapshot":{"totalNanoAiu":5550862450.0}}}')) applyHarnessEvent(card, ev)
+  expect(card.aiCredits).toBe(5.55086245)
+  expect(fmtCredits(5.550862)).toBe('5.6')
+  expect(fmtCredits(0.174)).toBe('0.17')
+  expect(fmtCredits(1341.3)).toBe('1341')
+})
+
+test('every Claude window shows, Enterprise spend limits too', () => {
+  const ws = claudeLimits([
+    { kind: 'spend_limit', percentUsed: 37.5, resetsAt: '2026-12-01T00:00:00Z' },
+    { kind: 'seven_day', percentUsed: 12 },
+    { kind: 'seven_day_opus', percentUsed: 4 },
+    { kind: 'five_hour', percentUsed: 20 },
+    { kind: 'monthly_usage', percentUsed: 9 },
+  ])
+  expect(ws.map(w => [w.label, w.name, w.percent])).toEqual([
+    ['5h', '5-hour limit', 20],
+    ['7d', 'Weekly limit', 12],
+    ['Opus', 'Weekly Opus limit', 4],
+    ['$', 'Spend limit', 37.5],
+    ['monthly usage', 'Monthly usage limit', 9],
+  ])
+  expect(ws[3]?.resetsAt).toBe(Date.parse('2026-12-01T00:00:00Z'))
 })
 
 test('meters show by the choice made', () => {
