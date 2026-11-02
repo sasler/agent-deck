@@ -21,7 +21,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { PRESETS, agentRunSpec, applyHarnessEvent, expandArgs, fromPreset, harnessArgs, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { PRESETS, agentRunSpec, applyHarnessEvent, expandArgs, fromPreset, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -643,14 +643,29 @@ test('every Claude window shows, Enterprise spend limits too', () => {
   expect(ws[3]?.resetsAt).toBe(Date.parse('2026-12-01T00:00:00Z'))
 })
 
-test('Copilot Fusion is a model, its level a flag', () => {
+test('Copilot Fusion is offered, and a fallback shows', () => {
   const copilot = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
-  const ids = withFusion(copilot, [{ id: 'gpt-6-luna' }]).map(m => m.id)
-  expect(ids).toEqual(['fusion-standard', 'fusion-high', 'fusion-max', 'gpt-6-luna'])
+  const ids = withFusion(copilot, [{ id: 'gpt-6-luna' }, { id: 'hydrafusion' }]).map(m => m.id)
+  expect(ids).toEqual(['hydrafusion', 'hydrafusion-max', 'gpt-6-luna'])
   expect(withFusion({ ...copilot, provider: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1' } }, [{ id: 'x' }]).map(m => m.id)).toEqual(['x'])
   expect(withFusion(fromPreset(PRESETS.find(p => p.id === 'opencode')!), [{ id: 'x' }]).map(m => m.id)).toEqual(['x'])
-  expect(harnessArgs(copilot, { prompt: 'fusion', model: 'fusion-high' })).toEqual(['-p', 'fusion', '--output-format', 'json', '--allow-all-tools', '--model', 'fusion', '--fusion-tier', 'high'])
-  expect(harnessArgs(copilot, { prompt: 'hi', model: 'gpt-6-luna' })).toEqual(['-p', 'hi', '--output-format', 'json', '--allow-all-tools', '--model', 'gpt-6-luna'])
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'Copilot', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  const lines = [
+    JSON.stringify({
+      type: 'session.fusion_route_failed',
+      data: {
+        attemptId: 'f1:route',
+        reason: 'transport',
+        errorMessage:
+          'fusion routing transport failed: Fusion plan request failed: status=403 body={"error":"sku_not_eligible","message":"Model fusion is not available for the user\'s Copilot plan."}\n',
+        fallbackModel: 'gpt-5.6-luna',
+      },
+    }),
+    '{"type":"assistant.fusion_phase_started","data":{"pattern":"single","model":"gpt-5.6-luna"}}',
+  ]
+  for (const l of lines) for (const ev of parseLine('copilot', l)) applyHarnessEvent(card, ev)
+  expect(card.model).toBe('gpt-5.6-luna')
+  expect(card.activity).toEqual([{ id: 'f1:route', label: "Fusion not used: Model fusion is not available for the user's Copilot plan. Fell back to gpt-5.6-luna.", status: 'error' }])
 })
 
 test('meters show by the choice made', () => {

@@ -9,8 +9,8 @@ import {
   PROVIDER_TYPES,
   agentRunSpec,
   applyHarnessEvent,
+  expandArgs,
   fromPreset,
-  harnessArgs,
   harnessError,
   modelLabel,
   modelQuery,
@@ -1039,7 +1039,7 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     model,
   }
   const dir = `${root}/${id}`
-  const argv = [h.command, ...harnessArgs(h, { prompt: input.prompt, model, session: input.resume, cwd })]
+  const argv = [h.command, ...expandArgs(h.args, { prompt: input.prompt, model, session: input.resume, cwd })]
   await $.fs.write(`${dir}/prompt.txt`, input.prompt)
   await $.fs.write(`${dir}/meta.json`, JSON.stringify(meta, null, 2))
   await $.fs.write(`${dir}/spec.json`, JSON.stringify({ argv, cwd }, null, 2))
@@ -2329,7 +2329,7 @@ export const register: Register = on => {
             {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
           </Text>
           <Text dimColor wrap="wrap">
-            runs: <Text mono>{`${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', model: d.model }))}`}</Text>
+            runs: <Text mono>{`${d.command} ${showArgs(expandArgs(d.args, { prompt: '<task>', model: d.model }))}`}</Text>
             {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
           </Text>
           {v.error && (

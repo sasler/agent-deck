@@ -192,17 +192,15 @@ export const parseModels = (stdout: string): { models: HarnessModel[] } | { erro
   }
 }
 
-/** Copilot Fusion routes each prompt between models; its effort level is a CLI flag, so each level is a model here. */
-const FUSION_TIERS = ['standard', 'high', 'max'] as const
-const COPILOT_FUSION: HarnessModel[] = FUSION_TIERS.map(t => ({
-  id: `fusion-${t}`,
-  name: `Copilot Fusion ${t[0]!.toUpperCase()}${t.slice(1)}`,
-  note: 'picks models per prompt',
-}))
+/** Copilot Fusion routes each prompt between models. Copilot's ACP server does not list it, but `--model` takes these ids. */
+const COPILOT_FUSION: HarnessModel[] = [
+  { id: 'hydrafusion', name: 'Copilot Fusion Standard', note: 'picks models per prompt' },
+  { id: 'hydrafusion-max', name: 'Copilot Fusion Max', note: 'picks models per prompt' },
+]
 
 /** Copilot's models with Fusion's levels first; GitHub's own models only, not a harness on your own API. */
 export const withFusion = (h: Pick<Harness, 'parser' | 'provider'>, models: HarnessModel[]): HarnessModel[] =>
-  h.parser === 'copilot' && !h.provider?.baseUrl.trim() ? [...COPILOT_FUSION, ...models.filter(m => !m.id.startsWith('fusion-'))] : models
+  h.parser === 'copilot' && !h.provider?.baseUrl.trim() ? [...COPILOT_FUSION, ...models.filter(m => !m.id.startsWith('hydrafusion'))] : models
 
 export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
 
@@ -254,15 +252,6 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
     }
     out.push(word.replace(PLACEHOLDER, (_, n: keyof ArgValues) => v[n] ?? ''))
   }
-  return out
-}
-
-/** A harness's arguments; Copilot's `fusion-high` becomes `--model fusion --fusion-tier high`. */
-export const harnessArgs = (h: Pick<Harness, 'parser' | 'args'>, v: ArgValues): string[] => {
-  const tier = h.parser === 'copilot' ? /^fusion-(standard|high|max)$/.exec(v.model ?? '')?.[1] : undefined
-  const out = expandArgs(h.args, tier ? { ...v, model: 'fusion' } : v)
-  const at = out.findIndex((w, i) => w === 'fusion' && out[i - 1] === '--model')
-  if (tier && at > 0) out.splice(at + 1, 0, '--fusion-tier', tier)
   return out
 }
 
@@ -373,6 +362,14 @@ const copilot = (e: J): HarnessEvent[] => {
       const out: HarnessEvent[] = [{ kind: 'tokens', tokens: { ...t, input: Math.max(0, t.input) } }]
       out.push(...aiCredits(d.totalNanoAiu))
       return out
+    }
+    case 'assistant.fusion_phase_started':
+      return str(d.model) ? [{ kind: 'model', model: d.model as string }] : []
+    case 'session.fusion_route_failed': {
+      // Copilot answers anyway, on a fallback model; say so, or the run looks like Fusion ran.
+      const why = /"message":"([^"]+)"/.exec(str(d.errorMessage) ?? '')?.[1] ?? str(d.reason) ?? 'routing failed'
+      const label = `Fusion not used: ${why}${str(d.fallbackModel) ? ` Fell back to ${d.fallbackModel as string}.` : ''}`
+      return [{ kind: 'act', id: String(d.attemptId ?? 'fusion'), label, status: 'error' }]
     }
     case 'session.shutdown':
       return aiCredits(d.totalNanoAiu ?? obj(d.accountingSnapshot).totalNanoAiu)
