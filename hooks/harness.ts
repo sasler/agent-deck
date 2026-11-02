@@ -192,6 +192,16 @@ export const parseModels = (stdout: string): { models: HarnessModel[] } | { erro
   }
 }
 
+/** Copilot Fusion routes each prompt between models. Copilot's ACP server does not list it, but `--model` takes these ids. */
+const COPILOT_FUSION: HarnessModel[] = [
+  { id: 'hydrafusion', name: 'Copilot Fusion Standard', note: 'picks models per prompt' },
+  { id: 'hydrafusion-max', name: 'Copilot Fusion Max', note: 'picks models per prompt' },
+]
+
+/** Copilot's models with Fusion's levels first; GitHub's own models only, not a harness on your own API. */
+export const withFusion = (h: Pick<Harness, 'parser' | 'provider'>, models: HarnessModel[]): HarnessModel[] =>
+  h.parser === 'copilot' && !h.provider?.baseUrl.trim() ? [...COPILOT_FUSION, ...models.filter(m => !m.id.startsWith('hydrafusion'))] : models
+
 export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
 
 // ---------- arguments ----------
@@ -282,7 +292,7 @@ export type HarnessEvent =
   | { kind: 'tokens'; tokens: Tokens; isAdded?: boolean }
   | { kind: 'cost'; usd: number; isAdded?: boolean }
   | { kind: 'session'; id: string }
-  | { kind: 'premium'; count: number }
+  | { kind: 'credits'; credits: number }
   | { kind: 'error'; text: string }
   | { kind: 'final'; text: string }
 
@@ -308,6 +318,10 @@ const tok = (input: number, output: number, cacheRead: number, cacheWrite: numbe
   cacheWrite,
   reasoning,
 })
+
+/** Copilot bills in AI credits and reports them as nano AI units. */
+const aiCredits = (nanoAiu: unknown): HarnessEvent[] =>
+  typeof nanoAiu === 'number' && Number.isFinite(nanoAiu) ? [{ kind: 'credits', credits: nanoAiu / 1e9 }] : []
 
 const copilot = (e: J): HarnessEvent[] => {
   const d = obj(e.data)
@@ -346,16 +360,25 @@ const copilot = (e: J): HarnessEvent[] => {
         t.reasoning += num(u.reasoningTokens)
       }
       const out: HarnessEvent[] = [{ kind: 'tokens', tokens: { ...t, input: Math.max(0, t.input) } }]
-      if (typeof d.totalPremiumRequests === 'number') out.push({ kind: 'premium', count: d.totalPremiumRequests })
+      out.push(...aiCredits(d.totalNanoAiu))
       return out
     }
+    case 'assistant.fusion_phase_started':
+      return str(d.model) ? [{ kind: 'model', model: d.model as string }] : []
+    case 'session.fusion_route_failed': {
+      // Copilot answers anyway, on a fallback model; say so, or the run looks like Fusion ran.
+      const why = /"message":"([^"]+)"/.exec(str(d.errorMessage) ?? '')?.[1] ?? str(d.reason) ?? 'routing failed'
+      const label = `Fusion not used: ${why}${str(d.fallbackModel) ? ` Fell back to ${d.fallbackModel as string}.` : ''}`
+      return [{ kind: 'act', id: String(d.attemptId ?? 'fusion'), label, status: 'error' }]
+    }
+    case 'session.shutdown':
+      return aiCredits(d.totalNanoAiu ?? obj(d.accountingSnapshot).totalNanoAiu)
     case 'session.error':
       return [{ kind: 'error', text: str(d.message) ?? str(d.errorType) ?? 'Copilot reported an error' }]
     case 'result': {
       const out: HarnessEvent[] = []
       if (str(e.sessionId)) out.push({ kind: 'session', id: e.sessionId as string })
-      const premium = obj(e.usage).premiumRequests
-      if (typeof premium === 'number') out.push({ kind: 'premium', count: premium })
+      out.push(...aiCredits(obj(e.usage).totalNanoAiu))
       return out
     }
   }
@@ -635,8 +658,8 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
     case 'session':
       card.sessionRef = ev.id
       break
-    case 'premium':
-      card.premiumRequests = ev.count
+    case 'credits':
+      card.aiCredits = ev.credits
       break
     case 'error':
       card.error = ev.text
@@ -666,7 +689,7 @@ export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
     "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
     (enabled.length
       ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${modelsHint(h)})`).join('; ')}. `
-      : 'No harness is enabled yet: the person adds them under ⚙ Harnesses in the Agents pane. ') +
+      : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
     'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
   inputSchema: {
     type: 'object',
