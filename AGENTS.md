@@ -14,7 +14,8 @@ agent-deck is a Claude Code plugin (a "mod"). It shows every background agent in
 | `bin/models.mjs` | Asks a harness's CLI or API which models it has |
 | `bin/launch.mjs` | Starts a CLI without a shell; shared by both scripts |
 | `bin/watch.mjs` | Codex session watcher |
-| `tests/agent-deck.test.tsx` | All tests |
+| `tests/agent-deck.test.tsx` | Mod and UI tests |
+| `tests/runner.test.mjs` | Detached runner and model-query tests |
 | `.claude-plugin/plugin.json` | Manifest and version |
 
 ## Commands
@@ -22,6 +23,7 @@ agent-deck is a Claude Code plugin (a "mod"). It shows every background agent in
 ```bash
 claude plugin test .
 claude plugin validate .
+node --test tests/runner.test.mjs
 ```
 
 `tsc -p . --noEmit` works only once the engine has written `.claude-plugin/types/`, which happens when it loads the mod.

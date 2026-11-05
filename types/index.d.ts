@@ -12,6 +12,12 @@ export type HarnessProvider = {
   apiKey?: string
   /** Copilot only: the OpenAI wire format, completions (the default) or responses. */
   wireApi?: 'completions' | 'responses'
+  /** Copilot only: transport for the Responses API. */
+  transport?: 'http' | 'websockets'
+  /** Copilot only: a known base model for tool support and token limits. */
+  modelId?: string
+  /** Copilot only: deployment or fine-tuned model name sent to the API. */
+  wireModel?: string
 }
 
 /** One model a harness can run, as its CLI or API reported it. */
@@ -31,6 +37,10 @@ export type Harness = {
    */
   args: string
   model?: string
+  /** Copilot Auto routing preference; the CLI validates account availability. */
+  autoTier?: string
+  /** Copilot's session-wide soft limit, including subagents; at least 30 credits. */
+  maxAiCredits?: number
   parser: HarnessParser
   /** Set: the CLI runs against this API. Copilot and Claude Code read it from environment variables. */
   provider?: HarnessProvider
@@ -73,6 +83,12 @@ export type Tokens = {
   reasoning: number
 }
 
+export type CopilotModelUsage = {
+  tokens: Tokens
+  aiCredits?: number
+  aiCreditsStatus?: 'complete' | 'partial' | 'unavailable'
+}
+
 export type AgentCard = {
   id: string
   provider: Provider
@@ -103,6 +119,9 @@ export type AgentCard = {
   sessionRef?: string
   /** Copilot's AI credits used (its nano AI units / 10^9). */
   aiCredits?: number
+  aiCreditsStatus?: 'complete' | 'partial' | 'unavailable'
+  /** Reported usage by concrete model, including Fusion phases and subagents. */
+  modelUsage?: Record<string, CopilotModelUsage>
   error?: string
 }
 

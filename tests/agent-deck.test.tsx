@@ -21,7 +21,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { PRESETS, agentRunSpec, applyHarnessEvent, expandArgs, fromPreset, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { PRESETS, agentRunSpec, applyHarnessEvent, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -61,6 +61,17 @@ test("a run's card is finished by its exit file, not by the rollout", async () =
   expect(card.status).toBe('running')
 })
 
+test('agent-deck tools stay visible without changing other tools', async ($, on) => {
+  on('tool.describe', (_$, e) => ({ description: e.description, isDeferred: true }))
+  const provider = { plugin: 'agent-deck', tier: 'user' } as const
+  for (const name of ['codex', 'codex_result', 'agent_run', 'agent_result']) {
+    const result = await $.tool.describe({ tool: `mcp__agent-deck__${name}`, description: name, isDeferred: true, provider })
+    expect(result).toEqual({ description: name, isDeferred: false })
+  }
+  const other = await $.tool.describe({ tool: 'Bash', description: 'other', isDeferred: true, provider })
+  expect(other.isDeferred).toBe(true)
+})
+
 test('converts Codex rate-limit windows to labels', async () => {
   expect(toLimitWindows({ windows: [{ minutes: 300, percent: 12 }, { minutes: 10080, percent: 29 }] })).toEqual([
     { label: '5h', percent: 12, resetsAt: undefined },
@@ -88,7 +99,10 @@ test('estimates Claude cost per model', async () => {
 test('a Claude subagent gets a card in the Agents pane', async ($, on) => {
   mock.clock(on)
   on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-1' }))
-  await $.agent.spawn({ prompt: 'look around', description: 'scan repo', subagentType: 'Explore' })
+  await $.agent.spawn({
+    tool_use_id: 'tool-1', prompt: 'look around', description: 'scan repo', subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
@@ -96,7 +110,7 @@ test('a Claude subagent gets a card in the Agents pane', async ($, on) => {
       surface,
       component: 'Pane',
       requestId: 'agent-deck',
-      props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' },
+      props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
       viewport: { columns: 80, rows: 30 },
     })
     expect(await ui.find({ text: /Explore · scan repo/ })).toBeDefined()
@@ -113,7 +127,7 @@ test('the pane says so when there are no agents', async ($, on) => {
     surface: 'terminal',
     component: 'Pane',
     requestId: 'agent-deck',
-    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' },
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
   })
   expect(await ui.find({ text: /No subagents yet/ })).toBeDefined()
 })
@@ -126,7 +140,7 @@ test('the band above the prompt offers an Agents button', async ($, on) => {
       plugin: 'agent-deck',
       surface,
       component: 'AbovePrompt',
-      props: { hasSurvey: false, isWorking: true, maxRows: 3, bodyColumns: 100, scroll: undefined as never },
+      props: { hasSurvey: false, isWorking: true, maxRows: 3, bodyColumns: 100, scroll: { offset: 0, bodyRows: 3 }, view: {} },
     })
     expect(await ui.find({ key: 'agent-deck-open' })).toBeDefined()
     expect(await ui.find({ text: /no agents running/ })).toBeDefined()
@@ -159,7 +173,7 @@ test('a held cold send goes out from the band with Send anyway', async ($, on) =
     plugin: 'agent-deck',
     surface: 'desktop',
     component: 'AbovePrompt',
-    props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 100, scroll: undefined as never },
+    props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 100, scroll: { offset: 0, bodyRows: 3 }, view: {} },
   })
   expect(await ui.find({ text: /Held: “fix the parser”/ })).toBeDefined()
   await ui.press({ key: 'held-send' })
@@ -169,6 +183,21 @@ test('a held cold send goes out from the band with Send anyway', async ($, on) =
   expect(await ui.find({ text: /✓ Sent “fix the parser” · re-writing 198k tokens/ })).toBeDefined()
   expect(toasts.join(' ')).toMatch(/sent\. Re-writing/)
   await ui.unmount()
+})
+
+test('the cache reads its TTL from the merged settings object', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-ttl' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('env.get', () => ({ value: undefined }))
+  on('settings.read', () => ({ value: { promptCacheTtl: '5m' } }))
+  await $.session.start({ cwd: 'C:\\project', surface: 'desktop', isInteractive: true })
+  const result = await $.command.run({ command: 'cache', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(result.text).toMatch(/5m cache/)
 })
 
 test('a Strata request becomes a live card, then a finished one', async () => {
@@ -318,6 +347,91 @@ test('harness edits are checked', () => {
   expect(slugId('My Agent!')).toBe('my-agent')
 })
 
+test('Copilot routing and limits use current flags, also with old saved templates', () => {
+  const h = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
+  expect(harnessArgs(h, { prompt: 'fix %PATH% and "$x"', model: 'hydrafusion' })).toEqual([
+    '-p', 'fix %PATH% and "$x"', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'hydrafusion', '--experimental', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, model: 'auto', autoTier: 'balance', maxAiCredits: 30 }, { prompt: 'x', autoTier: 'intelligence', maxAiCredits: 60 })).toEqual([
+    '-p', 'x', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'intelligence', '--max-ai-credits', '60', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, args: '-p {prompt}' }, { prompt: 'x', autoTier: 'hydrafusion-max' })).toEqual([
+    '-p', 'x', '--model', 'auto', '--auto-tier', 'hydrafusion-max', '--experimental', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(copilotOptionsError(h, { maxAiCredits: 29 })).toMatch(/at least 30/)
+  expect(copilotOptionsError(h, { maxAiCredits: NaN })).toMatch(/at least 30/)
+  expect(copilotOptionsError(h, { maxAiCredits: Infinity })).toMatch(/at least 30/)
+  expect(copilotOptionsError(h, { autoTier: 'two words' })).toMatch(/without spaces/)
+  expect(copilotOptionsError({ ...h, model: 'gpt-5.4', autoTier: 'balance' })).toMatch(/Pick Auto/)
+  expect(copilotOptionsError({ ...h, parser: 'claude' }, { autoTier: 'balance' })).toMatch(/Copilot harness/)
+  expect(copilotOptionsError({ ...h, provider: { type: 'openai', baseUrl: 'http://localhost/v1' } }, { model: 'auto' })).toMatch(/not your own API/)
+  expect(copilotOptionsError(h, { autoTier: 'future-profile', maxAiCredits: 30.5 })).toBeUndefined()
+  const other = { ...fromPreset(PRESETS.find(p => p.id === 'opencode')!), model: 'hydrafusion' }
+  expect(copilotOptionsError(other)).toBeUndefined()
+  expect(harnessArgs(other, { prompt: 'x' })).toEqual(['run', '--format', 'json', '--model', 'hydrafusion', 'x'])
+})
+
+test('Copilot run overrides replace routing flags without changing option-shaped prompts', () => {
+  const h = { ...fromPreset(PRESETS.find(p => p.id === 'copilot')!), model: 'auto', autoTier: 'balance', maxAiCredits: 30 }
+  expect(harnessArgs(h, { prompt: '--model', model: 'gpt-4' })).toEqual([
+    '--prompt=--model', '--output-format', 'json', '--allow-all-tools', '--model', 'gpt-4', '--max-ai-credits', '30', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, model: 'gpt-4', autoTier: undefined }, { prompt: '--usage-output-file=not-a-flag', autoTier: 'hydrafusion', usageFile: 'C:\\runs\\usage.json' })).toEqual([
+    '--prompt=--usage-output-file=not-a-flag', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'hydrafusion', '--experimental', '--max-ai-credits', '30', '--secret-env-vars=COPILOT_PROVIDER_API_KEY', '--usage-output-file', 'C:\\runs\\usage.json',
+  ])
+  expect(harnessArgs({ ...h, args: '--prompt {prompt}' }, { prompt: '-x', model: 'gpt-4' })).toEqual([
+    '--prompt=-x', '--model', 'gpt-4', '--max-ai-credits', '30', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  const custom = { ...h, args: '-p {prompt} --model gpt-4 --auto-tier=efficiency --max-ai-credits 90 --no-experimental' }
+  expect(harnessArgs(custom, { prompt: 'x', autoTier: 'hydrafusion', maxAiCredits: 30 })).toEqual([
+    '-p', 'x', '--model', 'auto', '--auto-tier', 'hydrafusion', '--max-ai-credits', '30', '--experimental', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(copilotOptionsError(h, { model: 'gpt-4', autoTier: 'balance' })).toMatch(/Pick Auto/)
+  expect(harnessArgs({ ...h, args: '-p {prompt} --usage-output-file=custom.json' }, { prompt: 'x', usageFile: 'ignored.json' }).filter(a => a.startsWith('--usage-output-file'))).toEqual(['--usage-output-file=custom.json'])
+  expect(harnessArgs(custom, { prompt: 'x', model: 'gpt-4' })).toEqual([
+    '-p', 'x', '--model', 'gpt-4', '--max-ai-credits', '30', '--no-experimental', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessCommand(h, { prompt: '--usage-output-file=not-a-flag', usageFile: 'C:\\runs\\usage.json' }).usageFile).toBe('C:\\runs\\usage.json')
+  expect(harnessCommand({ ...h, args: '-p {prompt} --usage-output-file={cwd}/custom.json' }, { prompt: '--usage-output-file', cwd: 'C:\\project', usageFile: 'ignored.json' }).usageFile).toBe('C:\\project/custom.json')
+  expect(harnessCommand({ ...h, args: '-p {prompt} --usage-output-file first.json --usage-output-file=second.json' }, { prompt: 'x', usageFile: 'ignored.json' }).usageFile).toBe('second.json')
+})
+
+test('Copilot BYOK supports deployment mapping and Responses transport without exposing keys in argv', () => {
+  const h = {
+    ...fromPreset(PRESETS.find(p => p.id === 'copilot-api')!),
+    model: 'gpt-5.4',
+    provider: { type: 'azure' as const, baseUrl: 'https://resource.openai.azure.com', apiKey: 'test-key', wireApi: 'responses' as const, transport: 'websockets' as const, modelId: 'gpt-5.4', wireModel: 'my-deployment' },
+  }
+  expect(harnessError(h, [])).toBeUndefined()
+  expect(providerEnv(h, h.model)).toEqual({
+    COPILOT_PROVIDER_BASE_URL: 'https://resource.openai.azure.com',
+    COPILOT_PROVIDER_TYPE: 'azure',
+    COPILOT_PROVIDER_API_KEY: 'test-key',
+    COPILOT_PROVIDER_WIRE_API: 'responses',
+    COPILOT_PROVIDER_TRANSPORT: 'websockets',
+    COPILOT_PROVIDER_MODEL_ID: 'gpt-5.4',
+    COPILOT_PROVIDER_WIRE_MODEL: 'my-deployment',
+    COPILOT_MODEL: 'gpt-5.4',
+  })
+  expect(harnessArgs(h, { prompt: 'x' }).includes('test-key')).toBe(false)
+  expect(harnessArgs(h, { prompt: 'x' }).includes('--secret-env-vars=COPILOT_PROVIDER_API_KEY')).toBe(true)
+  expect(harnessArgs({ ...h, args: '-p {prompt} --secret-env-vars=OTHER_KEY' }, { prompt: 'x' })).toEqual([
+    '-p', 'x', '--secret-env-vars=OTHER_KEY,COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, args: '-p {prompt} --secret-env-vars=COPILOT_PROVIDER_API_KEY --secret-env-vars OTHER_KEY' }, { prompt: 'x' })).toEqual([
+    '-p', 'x', '--secret-env-vars=COPILOT_PROVIDER_API_KEY', '--secret-env-vars', 'OTHER_KEY,COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(providerEnv(h, 'other-model')).toEqual({
+    COPILOT_PROVIDER_BASE_URL: 'https://resource.openai.azure.com',
+    COPILOT_PROVIDER_TYPE: 'azure',
+    COPILOT_PROVIDER_API_KEY: 'test-key',
+    COPILOT_PROVIDER_WIRE_API: 'responses',
+    COPILOT_PROVIDER_TRANSPORT: 'websockets',
+    COPILOT_MODEL: 'other-model',
+  })
+  expect(harnessError({ ...h, provider: { ...h.provider, wireApi: 'completions' } }, [])).toMatch(/WebSockets/)
+})
+
 test('a harness on its own API gets the env its CLI reads, and is checked', () => {
   const byok = fromPreset(PRESETS.find(p => p.id === 'copilot-api')!)
   expect(harnessError(byok, [])).toMatch(/base URL/)
@@ -331,6 +445,10 @@ test('a harness on its own API gets the env its CLI reads, and is checked', () =
     COPILOT_PROVIDER_WIRE_API: 'responses',
     COPILOT_MODEL: 'qwen3-coder',
   })
+  const anthropic = { ...h, provider: { type: 'anthropic' as const, baseUrl: 'https://api.anthropic.com/v1/', apiKey: 'k' } }
+  expect(providerEnv(anthropic, h.model).COPILOT_PROVIDER_BASE_URL).toBe('https://api.anthropic.com')
+  expect(providerEnv({ ...anthropic, provider: { ...anthropic.provider, baseUrl: 'https://example.com/gateway/v1' } }, h.model).COPILOT_PROVIDER_BASE_URL).toBe('https://example.com/gateway')
+  expect(providerEnv({ ...anthropic, provider: { ...anthropic.provider, baseUrl: 'http://v1' } }, h.model).COPILOT_PROVIDER_BASE_URL).toBe('http://v1')
   const claude = { ...fromPreset(PRESETS.find(p => p.id === 'claude-cli')!), provider: { type: 'anthropic' as const, baseUrl: 'https://gw.example.com', apiKey: 'k' } }
   expect(harnessError(claude, [])).toBeUndefined()
   expect(providerEnv(claude)).toEqual({ ANTHROPIC_BASE_URL: 'https://gw.example.com', ANTHROPIC_API_KEY: 'k' })
@@ -352,10 +470,10 @@ test('the edit form sets up a Copilot on its own API', async ($, on) => {
     requestId: 'agent-deck',
     props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
   })
-  // Settings open from a large gear, named Settings for a reader.
+  // Settings has a visible label as well as a gear.
   const gear = (await ui.findAll({ type: 'Button' } as never)).find(b => (b as { key?: string }).key === 'h-open') as { text?: string; props?: { label?: string } } | undefined
-  expect(gear?.text).toBe('⚙')
-  expect(gear?.props?.label).toBe('Settings')
+  expect(gear?.text).toBe('⚙ Settings')
+  expect(gear?.props?.label).toBe('⚙ Settings')
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
   expect(await ui.find({ text: 'Settings' })).toBeDefined()
@@ -367,6 +485,11 @@ test('the edit form sets up a Copilot on its own API', async ($, on) => {
   expect(await ui.find({ text: /base URL/ })).toBeDefined()
   await ui.input({ key: 'h-provider-url', text: 'http://127.0.0.1:11434/v1/', kind: 'change' })
   await ui.input({ key: 'h-provider-key', text: 'sk-test', kind: 'change' })
+  await ui.input({ key: 'h-provider-model-id', text: 'gpt-5.4', kind: 'change' })
+  await ui.input({ key: 'h-provider-wire-model', text: 'my-deployment', kind: 'change' })
+  await ui.select({ key: 'h-provider-wire', value: 'responses' })
+  await ui.redraw()
+  await ui.select({ key: 'h-provider-transport', value: 'websockets' })
   await ui.input({ key: 'h-model', text: 'qwen3-coder', kind: 'change' })
   await ui.redraw()
   expect(await ui.find({ text: /against http:\/\/127\.0\.0\.1:11434/ })).toBeDefined()
@@ -375,9 +498,89 @@ test('the edit form sets up a Copilot on its own API', async ($, on) => {
   expect(await ui.find({ text: /copilot · Copilot JSON · qwen3-coder · API http:\/\/127\.0\.0\.1:11434\/v1$/ })).toBeDefined()
   await ui.press({ key: 'h-edit-copilot-api' } as never)
   await ui.redraw()
+  expect((await ui.find({ key: 'h-provider-model-id' }))?.props.value).toBe('gpt-5.4')
+  expect((await ui.find({ key: 'h-provider-wire-model' }))?.props.value).toBe('my-deployment')
+  expect((await ui.find({ key: 'h-provider-transport' }))?.props.value).toBe('websockets')
   await ui.select({ key: 'h-provider-type', value: '' })
   await ui.redraw()
   expect(await ui.find({ key: 'h-provider-url' } as never)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('failed runner and model-query starts clear temporary credentials', async ($, on) => {
+  mock.clock(on, { now: 10_000 })
+  const harness = {
+    ...fromPreset(PRESETS.find(p => p.id === 'copilot')!),
+    model: 'gpt-4',
+    provider: { type: 'openai' as const, baseUrl: 'https://api.example.com/v1', apiKey: 'fixture-key' },
+  }
+  mock.store(on, { harnesses: [harness], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'secret-session' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  const files = new Map<string, string>()
+  const writes: { path: string; text: string }[] = []
+  let denyClear: 'env' | 'query' | undefined
+  let deniedClears = 0
+  on('fs.write', (_$, e) => {
+    const path = e.path.replace(/\\/g, '/')
+    if (!e.text && (denyClear === 'env' && path.endsWith('/env.json') || denyClear === 'query' && /\/models-[^/]+\.json$/.test(path))) {
+      deniedClears++
+      return { deny: 'access denied' }
+    }
+    files.set(path, e.text)
+    writes.push({ path, text: e.text })
+    return { value: undefined }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path.replace(/\\/g, '/')) }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(e.path.replace(/\\/g, '/'))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: 'node not found', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  const run = async () => {
+    try {
+      return JSON.stringify(await $.tool.call({ tool: 'mcp__agent-deck__agent_run', tool_use_id: 'start-1', harness: 'copilot', prompt: 'test' }))
+    } catch (error) {
+      return String(error)
+    }
+  }
+  expect(await run()).toMatch(/HooksError/)
+  const env = writes.find(write => write.path.endsWith('/env.json') && write.text.includes('fixture-key'))
+  expect(env).toBeDefined()
+  expect(files.get(env!.path)).toBe('')
+
+  denyClear = 'env'
+  expect(await run()).toMatch(/HooksError/)
+  expect(deniedClears).toBe(1)
+  denyClear = undefined
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.press({ key: 'h-edit-copilot' } as never)
+  await ui.redraw()
+  const query = writes.find(write => /\/models-[^/]+\.json$/.test(write.path) && write.text.includes('fixture-key'))
+  expect(query).toBeDefined()
+  expect(files.get(query!.path)).toBe('')
+  expect(await ui.find({ text: /Could not list models: node not found/ })).toBeDefined()
+  denyClear = 'query'
+  await ui.press({ key: 'h-models-list' } as never)
+  await ui.redraw()
+  expect(deniedClears).toBe(2)
+  expect(await ui.find({ text: /Could not list models: Could not clear the temporary credentials.*Remove the file/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -395,6 +598,39 @@ test('each harness has a way to list its models', () => {
   expect(parseModels('{"models":[]}')).toEqual({ error: 'It reported no models.' })
   const spec = agentRunSpec([{ ...of('copilot'), models: [{ id: 'gpt-6-luna' }, { id: 'claude-sonnet-5.5' }] }])
   expect(spec.description).toMatch(/models gpt-6-luna, claude-sonnet-5\.5/)
+})
+
+test('the Copilot edit form saves an Auto profile and validates its credit limit', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agent Deck', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'h-add', value: 'copilot' })
+  await ui.redraw()
+  await ui.select({ key: 'h-auto-tier', value: 'hydrafusion-max' })
+  await ui.redraw()
+  expect(await ui.find({ text: /--model auto --auto-tier hydrafusion-max --experimental/ })).toBeDefined()
+  await ui.input({ key: 'h-max-credits', text: '29', kind: 'change' })
+  await ui.press({ key: 'h-save' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /at least 30/ })).toBeDefined()
+  await ui.input({ key: 'h-max-credits', text: '30', kind: 'change' })
+  await ui.press({ key: 'h-save' } as never)
+  await ui.redraw()
+  await ui.press({ key: 'h-edit-copilot' } as never)
+  await ui.redraw()
+  expect((await ui.find({ key: 'h-auto-tier' }))?.props.value).toBe('hydrafusion-max')
+  expect((await ui.find({ key: 'h-max-credits' }))?.props.value).toBe('30')
+  await ui.unmount()
 })
 
 test('the edit form lists a harness\'s models and picks one', async ($, on) => {
@@ -415,8 +651,9 @@ test('the edit form lists a harness\'s models and picks one', async ($, on) => {
   await ui.select({ key: 'h-add', value: 'claude-cli' })
   await ui.redraw()
   // A fixed list fills in as the form opens: one dropdown, no extra field.
-  const pick = (await ui.find({ key: 'h-model-pick' } as never)) as { props: { options: { value: string }[] } }
-  expect(pick.props.options.map(o => o.value)).toEqual(['', 'opus', 'sonnet', 'haiku', 'claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', '__other__'])
+  const options = (await ui.find({ key: 'h-model-pick' }))?.props.options
+  if (!Array.isArray(options)) throw new Error('Model picker has no options')
+  expect(options.map((o: unknown) => o && typeof o === 'object' && 'value' in o ? o.value : undefined)).toEqual(['', 'opus', 'sonnet', 'haiku', 'claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', '__other__'])
   expect(await ui.find({ key: 'h-model' } as never)).toBeUndefined()
   await ui.select({ key: 'h-model-pick', value: 'claude-sonnet-5-5' })
   await ui.redraw()
@@ -432,7 +669,7 @@ test('the edit form lists a harness\'s models and picks one', async ($, on) => {
   // Editing it again keeps the typed model in Other…'s field.
   await ui.press({ key: 'h-edit-claude-cli' } as never)
   await ui.redraw()
-  expect(((await ui.find({ key: 'h-model' } as never)) as { props: { value: string } }).props.value).toBe('claude-next')
+  expect((await ui.find({ key: 'h-model' }))?.props.value).toBe('claude-next')
   await ui.press({ key: 'h-cancel' } as never)
   await ui.redraw()
   // A query that fails says why, offers Try again, and leaves the field to type in.
@@ -468,6 +705,165 @@ test('Copilot JSON events fill a card', () => {
   expect(card.aiCredits).toBe(0.17436825)
   expect(card.sessionRef).toBe('67e5')
   expect(final).toBe('done')
+})
+
+test('a reloaded Copilot run rebuilds its final per-model usage from events', async ($, on) => {
+  const clock = mock.clock(on, { now: 10_000 })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'reload-session' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  const home = 'test-home'
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? home : undefined }))
+  const root = `/${home}/.claude/agent-deck/harness-runs`
+  const dir = `${root}/run-reload`
+  const missingDir = `${root}/run-missing`
+  const files: Record<string, string> = {
+    [`${dir}/meta.json`]: JSON.stringify({ id: 'run-reload', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Reloaded run', cwd: 'project', sessionId: 'reload-session', startedAt: 9000, model: 'auto' }),
+    [`${dir}/exit.txt`]: '0',
+    [`${dir}/stderr.log`]: '',
+    [`${dir}/events.jsonl`]: [
+      JSON.stringify({ type: 'assistant.message', data: { content: 'Finished.' } }),
+      JSON.stringify({ type: 'session.usage_checkpoint', data: { accountingSnapshot: { totalNanoAiu: 250_000_000, aiCreditsStatus: 'complete', modelMetrics: { 'fixture-model': { totalNanoAiu: 250_000_000, usage: { inputTokens: 11, outputTokens: 3 } } } } } }),
+      '',
+    ].join('\n'),
+    [`${missingDir}/meta.json`]: JSON.stringify({ id: 'run-missing', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Missing subtotal', cwd: 'project', sessionId: 'reload-session', startedAt: 9000, model: 'auto' }),
+    [`${missingDir}/exit.txt`]: '0',
+    [`${missingDir}/stderr.log`]: '',
+    [`${missingDir}/events.jsonl`]: [
+      JSON.stringify({ type: 'assistant.message', data: { content: 'Finished without billing.' } }),
+      JSON.stringify({ type: 'session.usage_checkpoint', data: { accountingSnapshot: { aiCreditsStatus: 'partial', modelMetrics: { 'fixture-model': { usage: { inputTokens: 11, outputTokens: 3 } } } } } }),
+      '',
+    ].join('\n'),
+  }
+  const listed: string[] = []
+  on('fs.list', (_$, e) => {
+    const path = e.path.replace(/\\/g, '/')
+    listed.push(path)
+    return { value: path.endsWith(root) ? ['run-reload', 'run-missing'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) : [] }
+  })
+  on('fs.read', (_$, e) => {
+    const path = e.path.replace(/\\/g, '/')
+    const key = Object.keys(files).find(file => path.endsWith(file))
+    const text = key ? files[key] : undefined
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', () => ({ value: true }))
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  expect(listed.some(path => path.endsWith(root))).toBe(true)
+  await clock.advance(1000)
+  await clock.advance(250)
+  const result = await $.tool.call({ tool: 'mcp__agent-deck__agent_result', tool_use_id: 'result-1', id: 'run-reload' })
+  const text = JSON.stringify(result)
+  expect(text).toMatch(/Finished/)
+  expect(text).toMatch(/0\.25 AI credits/)
+  expect(text).toMatch(/fixture-model in 11 out 3/)
+  const missing = await $.tool.call({ tool: 'mcp__agent-deck__agent_result', tool_use_id: 'result-2', id: 'run-missing' })
+  expect(JSON.stringify(missing)).toMatch(/AI credits not reported/)
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 't-h-run-run-missing' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: 'AI credits not reported' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('Copilot per-call, checkpoint and shutdown accounting includes every model exactly once', () => {
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'auto', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  const fold = (type: string, data: object, extra: object = {}) => {
+    for (const event of parseLine('copilot', JSON.stringify({ type, data, ...extra }))) applyHarnessEvent(card, event)
+  }
+  fold('assistant.usage', { model: 'draft-model', inputTokens: 100, outputTokens: 10, cacheReadTokens: 70, copilotUsage: { totalNanoAiu: 500_000_000 }, cost: 2 })
+  fold('assistant.usage', { model: 'critic-model', inputTokens: 50, outputTokens: 5, cacheWriteTokens: 40, copilotUsage: { totalNanoAiu: 250_000_000 }, cost: 1 }, { agentId: 'critic' })
+  expect(card.tokens).toEqual({ input: 40, output: 15, cacheRead: 70, cacheWrite: 40, reasoning: 0 })
+  expect(card.aiCredits).toBe(0.75)
+  expect(card.costUsd).toBeUndefined()
+  const metrics = {
+    'draft-model': { totalNanoAiu: 500_000_000, usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 70, cacheWriteTokens: 0 } },
+    'critic-model': { totalNanoAiu: 250_000_000, usage: { inputTokens: 50, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 40 } },
+  }
+  fold('session.usage_checkpoint', { totalNanoAiu: 750_000_000, accountingSnapshot: { modelMetrics: metrics, aiCreditsStatus: 'complete', totalPremiumRequestCost: 3 } })
+  fold('session.shutdown', { modelMetrics: metrics, totalNanoAiu: 750_000_000, totalPremiumRequests: 3 })
+  expect(card.tokens).toEqual({ input: 40, output: 15, cacheRead: 70, cacheWrite: 40, reasoning: 0 })
+  expect(card.aiCredits).toBe(0.75)
+  expect(card.modelUsage?.['critic-model']?.aiCredits).toBe(0.25)
+  fold('assistant.usage', { model: 'draft-model', inputTokens: 10, outputTokens: 2, copilotUsage: { totalNanoAiu: 100_000_000 } })
+  expect(card.tokens.output).toBe(17)
+  expect(card.aiCredits).toBe(0.85)
+  fold('assistant.usage', { model: 'draft-model', inputTokens: 900, outputTokens: 900, copilotUsage: { totalNanoAiu: 1e9 } }, { checkpoint: true })
+  expect(card.tokens.output).toBe(17)
+  expect(card.aiCredits).toBe(0.85)
+})
+
+test('missing Copilot billing is unavailable or partial, not zero USD or free BYOK', () => {
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'byok', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  const fold = (type: string, data: object) => {
+    for (const event of parseLine('copilot', JSON.stringify({ type, data }))) applyHarnessEvent(card, event)
+  }
+  fold('assistant.usage', { model: 'byok', inputTokens: 10, outputTokens: 5, isByok: true, cost: 0 })
+  expect(card.aiCredits).toBeUndefined()
+  expect(card.aiCreditsStatus).toBe('unavailable')
+  expect(card.costUsd).toBeUndefined()
+  fold('assistant.usage', { model: 'byok', inputTokens: 10, outputTokens: 5, copilotUsage: { totalNanoAiu: 200_000_000 } })
+  expect(card.aiCredits).toBe(0.2)
+  expect(card.aiCreditsStatus).toBe('partial')
+  expect(card.modelUsage?.byok?.aiCreditsStatus).toBe('partial')
+  fold('session.usage_checkpoint', { totalNanoAiu: 0, accountingSnapshot: { totalNanoAiu: 0, aiCreditsStatus: 'unavailable', modelMetrics: { byok: { totalNanoAiu: 0, usage: { inputTokens: 20, outputTokens: 10 } } } } })
+  expect(card.aiCredits).toBeUndefined()
+  expect(card.modelUsage?.byok?.aiCredits).toBeUndefined()
+  expect(card.tokens.output).toBe(10)
+  fold('session.usage_checkpoint', { totalNanoAiu: 0, accountingSnapshot: { totalNanoAiu: 0, aiCreditsStatus: 'complete' } })
+  expect(card.aiCredits).toBe(0)
+  expect(card.aiCreditsStatus).toBe('complete')
+  expect(parseLine('copilot', '{"type":"result","exitCode":1}').some(e => e.kind === 'error')).toBe(true)
+  const missing = parseLine('copilot', '{"type":"agent-deck.usage_error","data":{"message":"file missing"}}')
+  expect(missing).toEqual([
+    { kind: 'copilot-usage', creditsStatus: 'unavailable', isAdded: true },
+    { kind: 'act', id: 'copilot-usage', label: 'Copilot usage unavailable: file missing', status: 'error' },
+  ])
+  for (const event of missing) applyHarnessEvent(card, event)
+  expect(card.aiCredits).toBe(0)
+  expect(card.aiCreditsStatus).toBe('partial')
+})
+
+test('a later Copilot subtotal without a billing status is still shown', () => {
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'auto', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  for (const event of parseLine('copilot', JSON.stringify({ type: 'assistant.usage', data: { model: 'm', inputTokens: 10, outputTokens: 1 } }))) applyHarnessEvent(card, event)
+  expect(card.aiCreditsStatus).toBe('unavailable')
+  for (const event of parseLine('copilot', JSON.stringify({
+    type: 'session.usage_checkpoint',
+    data: { totalNanoAiu: 250_000_000, accountingSnapshot: { modelMetrics: { m: { totalNanoAiu: 250_000_000, usage: { inputTokens: 10, outputTokens: 1 } } } } },
+  }))) applyHarnessEvent(card, event)
+  expect(card.aiCredits).toBe(0.25)
+  expect(card.aiCreditsStatus).toBe('partial')
+  expect(card.modelUsage?.m?.aiCreditsStatus).toBe('partial')
+})
+
+test('Fusion phase activities show progress and degradation without delivering drafts or counting usage twice', () => {
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'auto', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  const phase = { fusionId: 'f1', phaseId: 'p1', role: 'draft', model: 'draft-model' }
+  const start = parseLine('copilot', JSON.stringify({ type: 'assistant.fusion_phase_started', data: phase }))
+  for (const event of start) applyHarnessEvent(card, event)
+  expect(card.activity[0]?.status).toBe('running')
+  const completed = parseLine('copilot', JSON.stringify({ type: 'assistant.fusion_phase_completed', data: { ...phase, content: 'discard this draft', usage: { inputTokens: 500, outputTokens: 100 }, status: 'succeeded' } }))
+  for (const event of completed) applyHarnessEvent(card, event)
+  expect(card.activity[0]?.status).toBe('done')
+  expect(card.output).toBe('')
+  expect(card.tokens.output).toBe(0)
+  expect(completed.some(e => e.kind === 'final')).toBe(false)
+  for (const event of parseLine('copilot', JSON.stringify({ type: 'assistant.fusion_phase_failed', data: { ...phase, phaseId: 'p2', role: 'critic', reason: 'timeout' } }))) applyHarnessEvent(card, event)
+  expect(card.activity[1]?.status).toBe('error')
+  expect(card.activity[1]?.label).toMatch(/critic.*timeout/)
+  expect(card.error).toBeUndefined()
+  for (const event of parseLine('copilot', '{"type":"session.auto_tier_switch_failed","data":{"requestedAutoTier":"hydrafusion","effectiveAutoTier":"balance","reason":"unsupported"}}')) applyHarnessEvent(card, event)
+  expect(card.activity[2]?.label).toMatch(/hydrafusion not used.*balance/)
 })
 
 test('OpenCode and Claude stream events parse', () => {
@@ -604,6 +1000,7 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
 
 test('Copilot AI credits become a meter', () => {
   const r = copilotLimits({
+    token_based_billing: true,
     quota_reset_date_utc: '2026-11-01T00:00:00.000Z',
     quota_snapshots: {
       chat: { unlimited: true, entitlement: 0, remaining: 0, percent_remaining: 100 },
@@ -617,6 +1014,10 @@ test('Copilot AI credits become a meter', () => {
     quota_snapshots: { premium_interactions: { unlimited: false, entitlement: 1500, remaining: 1287.5, credits_used: 212.5, percent_remaining: 85.8 } },
   })
   expect(billed?.plan).toBe('213 of 1500 AI credits')
+  expect(copilotLimits({ token_based_billing: true, quota_snapshots: { premium_interactions: { entitlement: 1500, remaining: 1000, credits_used: 0 } } })?.plan).toBe('0.00 of 1500 AI credits')
+  const legacy = copilotLimits({ token_based_billing: false, quota_snapshots: { premium_interactions: { entitlement: 300, remaining: 200 } } })
+  expect(legacy).toBeUndefined()
+  expect(parseLine('copilot', '{"type":"result","usage":{"premiumRequests":10}}')).toEqual([])
   expect(copilotLimits({ quota_snapshots: { premium_interactions: { unlimited: true } } })).toBeUndefined()
   expect(copilotLimits({})).toBeUndefined()
 })
@@ -628,6 +1029,10 @@ test('Copilot run totals arrive as AI credits', () => {
   expect(fmtCredits(5.550862)).toBe('5.6')
   expect(fmtCredits(0.174)).toBe('0.17')
   expect(fmtCredits(1341.3)).toBe('1341')
+  expect(fmtCredits(0.001234567)).toBe('0.001234567')
+  expect(fmtCredits(0.000000001)).toBe('0.000000001')
+  expect(fmtCredits(0.0000000001)).toBe('<0.000000001')
+  expect(fmtCredits(0)).toBe('0.00')
 })
 
 test('every Claude window shows, Enterprise spend limits too', () => {
@@ -651,7 +1056,7 @@ test('every Claude window shows, Enterprise spend limits too', () => {
 test('Copilot Fusion is offered, and a fallback shows', () => {
   const copilot = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
   const ids = withFusion(copilot, [{ id: 'gpt-6-luna' }, { id: 'hydrafusion' }]).map(m => m.id)
-  expect(ids).toEqual(['hydrafusion', 'hydrafusion-max', 'gpt-6-luna'])
+  expect(ids).toEqual(['auto', 'hydrafusion', 'hydrafusion-max', 'gpt-6-luna'])
   expect(withFusion({ ...copilot, provider: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1' } }, [{ id: 'x' }]).map(m => m.id)).toEqual(['x'])
   expect(withFusion(fromPreset(PRESETS.find(p => p.id === 'opencode')!), [{ id: 'x' }]).map(m => m.id)).toEqual(['x'])
   const card = { id: 'c', provider: 'harness', title: 't', model: 'Copilot', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
