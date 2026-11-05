@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
+import type { Activity, AgentCard, CacheState, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
   PARSERS,
@@ -9,7 +9,9 @@ import {
   PROVIDER_TYPES,
   agentRunSpec,
   applyHarnessEvent,
-  expandArgs,
+  copilotOptionsError,
+  harnessArgs,
+  harnessCommand,
   fromPreset,
   harnessError,
   modelLabel,
@@ -19,26 +21,26 @@ import {
   providerEnv,
   providerTypesFor,
   type ModelQuery,
+  type CopilotRunOptions,
   slugId,
   withFusion,
 } from './harness'
 import {
   DEFAULT_WINDOW_MS,
-  cacheAfterTurn,
-  cacheBeforeStep,
-  cacheSessionEnd,
-  cacheSessionStart,
   cacheView,
-  discardHeld,
+  coldUsd,
   fmtDuration,
   fmtTok,
   fmtUsd,
   freshCache,
+  isCold,
+  isGatewayUrl,
+  parseDuration,
+  pingEvery,
   priceOf,
-  registerCache,
-  sendHeld,
-  startKeepWarm,
-  stopKeepWarm,
+  ttlFor,
+  warmUsd,
+  writeRate,
 } from './cache'
 
 const PLUGIN = 'agent-deck'
@@ -54,7 +56,6 @@ const agents = atom({ plugin: 'agent-deck', key: 'agents' } as const, [] as Agen
 const limits = atom({ plugin: 'agent-deck', key: 'limits' } as const, { codex: [], claude: [] } as Limits)
 const expanded = atom({ plugin: 'agent-deck', key: 'expanded' } as const, [] as string[])
 const tick = atom({ plugin: 'agent-deck', key: 'tick' } as const, 0)
-// The same value ./cache keeps; read here for drawing.
 const cacheAtom = atom({ plugin: 'agent-deck', key: 'cache' } as const, freshCache())
 const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, [] as Harness[])
 const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { mode: 'cards' } as HarnessView)
@@ -173,8 +174,13 @@ export const claudeLimits = (rateLimits: readonly { kind: string; percentUsed: n
 }
 
 /** AI credits from Copilot's nano AI units (`totalNanoAiu`), rounded for display. */
-export const fmtCredits = (credits: number): string =>
-  credits >= 100 ? String(Math.round(credits)) : credits >= 1 ? credits.toFixed(1) : credits.toFixed(2)
+export const fmtCredits = (credits: number): string => {
+  if (credits > 0 && credits < 0.01) {
+    if (credits < 1e-9) return '<0.000000001'
+    return credits.toFixed(9).replace(/0+$/, '').replace(/\.$/, '')
+  }
+  return credits >= 100 ? String(Math.round(credits)) : credits >= 1 ? credits.toFixed(1) : credits.toFixed(2)
+}
 
 /**
  * Copilot's monthly AI credits from `gh api copilot_internal/user`: percent used, the
@@ -183,9 +189,10 @@ export const fmtCredits = (credits: number): string =>
 export const copilotLimits = (d: unknown): { windows: LimitWindow[]; plan: string } | undefined => {
   const o = (d && typeof d === 'object' ? d : {}) as Record<string, unknown>
   const q = ((o.quota_snapshots ?? {}) as Record<string, Record<string, unknown>>).premium_interactions
+  if (o.token_based_billing === false || (o.token_based_billing !== true && typeof q?.credits_used !== 'number')) return undefined
   if (!q || q.unlimited === true || typeof q.entitlement !== 'number' || q.entitlement <= 0) return undefined
   const used =
-    typeof q.credits_used === 'number' && q.credits_used > 0
+    typeof q.credits_used === 'number' && q.credits_used >= 0
       ? q.credits_used
       : q.entitlement - (typeof q.remaining === 'number' ? q.remaining : q.entitlement)
   const percent = typeof q.percent_remaining === 'number' ? 100 - q.percent_remaining : (used / q.entitlement) * 100
@@ -298,7 +305,6 @@ let sessionId = ''
 
 const CODEX_TOOL_SPEC: ToolSpec = {
   name: 'codex',
-  isDeferred: false,
   description:
     'Start a task with OpenAI Codex CLI (codex exec) in the background and return immediately with a run id. ' +
     'Codex runs as its own process, so it survives session drops; its live output, model, tokens and rate limits show in the Agents pane. ' +
@@ -323,7 +329,6 @@ const CODEX_TOOL_SPEC: ToolSpec = {
 
 const CODEX_RESULT_SPEC: ToolSpec = {
   name: 'codex_result',
-  isDeferred: false,
   description:
     "Read a background Codex run's report (when finished) or its progress so far. Without `id`, lists this session's Codex runs.",
   inputSchema: {
@@ -877,7 +882,7 @@ async function saveHarnesses($: $T, list: Harness[]) {
 async function loadHarnesses($: $T) {
   const stored = await $.store.get(KEY_HARNESSES)
   if (Array.isArray(stored)) {
-    harnessList = stored as Harness[]
+    harnessList = (stored as Harness[]).map(h => h.models ? { ...h, models: withFusion(h, h.models) } : h)
     await update($, harnessesAtom, () => harnessList)
     await registerAgentTools($)
     void detectHarnesses($, harnessList)
@@ -917,7 +922,9 @@ const harnessFooter = (run: HarnessRun, card: AgentCard | undefined) => {
     `[${run.name} run ${run.id} · harness ${run.harness} · model ${card?.model ?? run.model ?? 'default'}` +
     (card?.sessionRef ? ` · session ${card.sessionRef}` : '') +
     (t && t.input + t.output > 0 ? ` · in ${fmtTokens(t.input + t.cacheRead + t.cacheWrite)} out ${fmtTokens(t.output)}` : '') +
-    (card?.aiCredits ? ` · ${fmtCredits(card.aiCredits)} AI credits` : '') +
+    (card?.aiCredits !== undefined ? ` · ${fmtCredits(card.aiCredits)} AI credits${card.aiCreditsStatus === 'partial' ? ' (reported subtotal)' : ''}` : '') +
+    (card?.aiCredits === undefined && card?.aiCreditsStatus !== undefined ? ' · AI credits not reported' : '') +
+    (card?.modelUsage ? ` · usage by model: ${Object.entries(card.modelUsage).map(([model, u]) => `${model} in ${fmtTokens(u.tokens.input + u.tokens.cacheRead + u.tokens.cacheWrite)} out ${fmtTokens(u.tokens.output)}${u.aiCredits !== undefined ? ` ${fmtCredits(u.aiCredits)} credits${u.aiCreditsStatus === 'partial' ? ' (subtotal)' : ''}` : ''}`).join('; ')}` : '') +
     ']'
   )
 }
@@ -1019,13 +1026,21 @@ const loadHarnessRuns = async ($: $T) => {
   await persist($)
 }
 
+const clearTempSecretFile = async ($: $T, file: string) => {
+  try {
+    if (await $.fs.exists(file)) await $.fs.write(file, '')
+  } catch {
+    throw new Error(`Could not clear the temporary credentials in ${file}. Remove the file before trying again.`)
+  }
+}
+
 const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promise<HarnessRun> => {
   const root = await harnessRunsRoot($)
   if (!root) throw new Error('no home directory (USERPROFILE/HOME) to keep runs in')
   if (!sessionId) sessionId = await $.session.id()
   const id = await newRunId($)
   const cwd = input.cwd ?? (await $.session.cwd())
-  const model = input.model ?? h.model
+  const model = h.parser === 'copilot' && input.autoTier && !input.model ? 'auto' : (input.model ?? h.model)
   const meta: HarnessRunMeta = {
     id,
     harness: h.id,
@@ -1039,15 +1054,24 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     model,
   }
   const dir = `${root}/${id}`
-  const argv = [h.command, ...expandArgs(h.args, { prompt: input.prompt, model, session: input.resume, cwd })]
+  const command = harnessCommand(h, { ...input, session: input.resume, cwd, usageFile: `${dir}/usage.json` })
+  const argv = [h.command, ...command.args]
   await $.fs.write(`${dir}/prompt.txt`, input.prompt)
   await $.fs.write(`${dir}/meta.json`, JSON.stringify(meta, null, 2))
-  await $.fs.write(`${dir}/spec.json`, JSON.stringify({ argv, cwd }, null, 2))
+  const isolateProvider = h.parser === 'copilot' && !!h.provider?.baseUrl.trim()
+  await $.fs.write(`${dir}/spec.json`, JSON.stringify({ argv, cwd, parser: h.parser, usageFile: command.usageFile, isolateProvider }, null, 2))
   // The runner reads and deletes env.json before the CLI starts, so a key does not stay in the run's folder.
   const env = providerEnv(h, model)
-  if (Object.keys(env).length) await $.fs.write(`${dir}/env.json`, JSON.stringify(env))
-  const started = await $.process.run(['node', `${$.plugin.root}/bin/run.mjs`, dir], { timeoutMs: 20_000 })
-  if (started.exitCode !== 0) throw new Error(started.stderr.trim() || `node exited ${started.exitCode} (agent_run needs Node.js on PATH)`)
+  const envFile = `${dir}/env.json`
+  const hasEnv = Object.keys(env).length > 0
+  try {
+    if (hasEnv) await $.fs.write(envFile, JSON.stringify(env))
+    const started = await $.process.run(['node', `${$.plugin.root}/bin/run.mjs`, dir], { timeoutMs: 20_000 })
+    if (started.exitCode !== 0) throw new Error(started.stderr.trim() || `node exited ${started.exitCode} (agent_run needs Node.js on PATH)`)
+  } catch (error) {
+    if (hasEnv) await clearTempSecretFile($, envFile)
+    throw error
+  }
   const run: HarnessRun = { ...meta, dir, offset: 0, partial: '', final: '', isFinished: false }
   hruns.set(id, run)
   await addCard($, newHarnessCard(meta))
@@ -1060,15 +1084,23 @@ const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: 
   const root = await harnessRunsRoot($)
   if (!root) return { error: 'no home directory (USERPROFILE/HOME)' }
   const file = `${root}/models-${await newRunId($)}.json`
-  await $.fs.write(file, JSON.stringify({ ...q, env: { ...providerEnv(h, h.model), ...q.env } }))
-  const r = await $.process
-    .run(['node', `${$.plugin.root}/bin/models.mjs`, file], { timeoutMs: 60_000 })
-    .catch(err => ({ exitCode: 1, stdout: '', stderr: String((err as Error)?.message ?? err) }))
-  const found = parseModels(r.stdout || r.stderr)
-  return 'models' in found ? { models: withFusion(h, found.models) } : found
+  const isolateProvider = h.parser === 'copilot' && !!h.provider?.baseUrl.trim()
+  try {
+    let r
+    try {
+      await $.fs.write(file, JSON.stringify({ ...q, isolateProvider, env: { ...providerEnv(h, h.model), ...q.env } }))
+      r = await $.process.run(['node', `${$.plugin.root}/bin/models.mjs`, file], { timeoutMs: 60_000 })
+    } finally {
+      await clearTempSecretFile($, file)
+    }
+    const found = parseModels(r.stdout || r.stderr)
+    return 'models' in found ? { models: withFusion(h, found.models) } : found
+  } catch (error) {
+    return { error: String((error as Error)?.message ?? error) }
+  }
 }
 
-type AgentRunInput = { harness: string; prompt: string; title?: string; model?: string; cwd?: string; resume?: string }
+type AgentRunInput = CopilotRunOptions & { harness: string; prompt: string; title?: string; cwd?: string; resume?: string }
 
 // ---------- Copilot's AI credits, and which meters show ----------
 
@@ -1304,12 +1336,462 @@ const pollStrata = async ($: $T) => {
   }
 }
 
+// ---------- the engine side ----------
+
+// The hook loader follows engine calls only within this module.
+type On = Parameters<Register>[0]
+type Timer = { cancel: () => void }
+const HOUR = 60 * 60_000
+const MIN_PING_MS = 60_000
+const MAX_RETRIES = 3
+const BIG_TOKENS = 50_000
+const PING_PROMPT = 'Reply with the single word: warm'
+const KEY_DEADLINE = 'keepwarm-deadline'
+const KEY_GUARD = 'cache-guard'
+
+async function resolveTtl($: $T): Promise<number> {
+  const metered = await Promise.all([
+    $.env.get('ANTHROPIC_API_KEY'),
+    $.env.get('ANTHROPIC_AUTH_TOKEN'),
+    $.env.get('CLAUDE_CODE_USE_BEDROCK'),
+    $.env.get('CLAUDE_CODE_USE_VERTEX'),
+    $.env.get('CLAUDE_CODE_USE_FOUNDRY'),
+  ])
+  // The desktop app sets the base URL to Anthropic's own API; only another host is a gateway.
+  metered.push(isGatewayUrl(await $.env.get('ANTHROPIC_BASE_URL')) ? 'gateway' : undefined)
+  const usage = await $.session.usage().catch(() => undefined)
+  // Past a plan's limit the session draws on usage credits, which drop it to five minutes.
+  const isOverPlan = usage?.rateLimits.some(r => r.percentUsed >= 100) ?? false
+  return ttlFor({
+    force5m: await $.env.get('FORCE_PROMPT_CACHING_5M'),
+    envTtl: await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'),
+    settingTtl: (await $.settings.read().catch(() => undefined))?.promptCacheTtl,
+    enable1h: await $.env.get('ENABLE_PROMPT_CACHING_1H'),
+    isMetered: metered.some(Boolean) || isOverPlan,
+  })
+}
+
+// Prompts no person sent: refusing one would lose it, so the guard only logs the price.
+const UNATTENDED = new Set(['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'coordinator', 'observer', 'observer-activity'])
+
+
+let s: CacheState = freshCache()
+let pending: Timer | undefined
+let isInFlight = false
+let gen = 0
+let cacheScheduleTick = 0
+let retryReason = ''
+let isColdWritePending = false
+
+function save($: $T) {
+  return update($, cacheAtom, () => ({ ...s, coldWrites: [...s.coldWrites] }))
+}
+
+const deadlineKey = () => `${KEY_DEADLINE}:${s.sid}`
+
+async function ensureSid($: $T) {
+  if (!s.sid) s.sid = await $.session.id()
+}
+
+/** Cancels the timer; the cacheScheduleTick tells a timer that already fired that the schedule changed. */
+const disarm = () => {
+  pending?.cancel()
+  pending = undefined
+  cacheScheduleTick++
+}
+
+const markReset = () => {
+  s.isReset = true
+  s.transcript = 0
+  s.ackedAt = 0
+  gen++
+}
+
+async function stopKeepWarm($: $T, why?: string) {
+  s.deadline = 0
+  s.every = 0
+  s.stopped = why
+  s.retries = 0
+  gen++
+  disarm()
+  if (s.sid) await $.store.delete(deadlineKey())
+  await save($)
+}
+
+async function arm($: $T): Promise<void> {
+  disarm()
+  s.retries = 0
+  if (!s.deadline) {
+    await save($)
+    return
+  }
+  const now = await $.clock.now()
+  // A timer set while the clock was read is replaced, never left beside this one.
+  disarm()
+  s.retries = 0
+  if (now >= s.deadline) return stopKeepWarm($)
+  if (s.lastRequestAt && !s.isReset && !isCold(s, now)) {
+    const untilCold = s.lastRequestAt + s.ttlMs - now
+    if (s.isWaitingForTurn) pending = $.clock.after(Math.min(s.deadline - now, untilCold), () => void arm($))
+    else {
+      const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + pingEvery(s) - now))
+      pending = $.clock.after(delay, () => void ping($))
+    }
+  } else {
+    // Nothing warm to ping: wake at the deadline to close the window.
+    pending = $.clock.after(s.deadline - now, () => void arm($))
+  }
+  await save($)
+}
+
+const afterRetries = (n: number) => (n ? ` after ${n} ${n === 1 ? 'retry' : 'retries'}` : '')
+
+async function ping($: $T): Promise<void> {
+  pending = undefined
+  if (!s.deadline) return
+  const t = cacheScheduleTick
+  const now = await $.clock.now()
+  if (cacheScheduleTick !== t) return pending || isInFlight ? undefined : arm($)
+  if (isInFlight) return
+  if (now >= s.deadline || isCold(s, now) || s.isReset || s.isWaitingForTurn || !s.lastRequestAt) return arm($)
+  // A request since this timer was set moved the cache clock.
+  if (now - s.lastRequestAt < pingEvery(s) - 1000) return arm($)
+  if (s.retries && now >= s.lastRequestAt + s.ttlMs - MIN_PING_MS) return stopKeepWarm($, retryReason + afterRetries(s.retries))
+  const sentGen = gen
+  const sentAt = s.lastRequestAt
+  isInFlight = true
+  const sent = await $.model.fork({ prompt: PING_PROMPT }).then(
+    reply => ({ reply }),
+    (err: unknown) => ({ err }),
+  )
+  const at = await $.clock.now()
+  isInFlight = false
+  // A stop, /clear, compaction or a real request replaced what this ping was for.
+  if (sentGen !== gen || s.lastRequestAt !== sentAt) return pending ? undefined : arm($)
+  if ('err' in sent) return stopKeepWarm($, `the ping failed: ${sent.err instanceof Error ? sent.err.message : String(sent.err)}`)
+  const reply = sent.reply
+  if (!reply) return stopKeepWarm($, 'the engine did not send the ping')
+  if (reply.isAnswered === false) {
+    if (reply.reason === 'nothing-to-fork') {
+      s.isWaitingForTurn = true
+      return arm($)
+    }
+    const status = 'status' in reply ? reply.status : null
+    const reason =
+      reply.reason === 'api-error'
+        ? `the API call failed${status === null || status === undefined ? '' : ` (${status})`}`
+        : reply.reason === 'aborted'
+          ? 'the ping was interrupted'
+          : 'the ping returned no text'
+    // A busy API is usually brief: retry while a ping can still land before the cache lapses.
+    if (reply.reason === 'api-error' && (status == null || status === 429 || status >= 500)) {
+      const wait = MIN_PING_MS * 2 ** s.retries
+      if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + s.ttlMs - MIN_PING_MS)) {
+        s.retries++
+        retryReason = reason
+        disarm()
+        pending = $.clock.after(wait, () => void ping($))
+        await save($)
+        return
+      }
+    }
+    return stopKeepWarm($, reason + afterRetries(s.retries))
+  }
+  const u = reply.usage
+  const p = priceOf(s.model)
+  // A warm ping reads the prefix and writes only its own message.
+  const isWarm = u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
+  const usd = p
+    ? (u.cache_read_input_tokens * p.cacheRead +
+        u.cache_creation_input_tokens * writeRate(p, s.ttlMs) +
+        u.input_tokens * p.input +
+        u.output_tokens * p.output) /
+      1e6
+    : undefined
+  s.lastPing = { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, usd, isWarm }
+  s.pings++
+  s.pingUsd += usd ?? 0
+  if (!isWarm) {
+    return stopKeepWarm($, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}): the cache was already gone`)
+  }
+  s.lastRequestAt = now
+  await arm($)
+}
+
+/** Arms (or re-arms) a keep-warm window of `ms` from now. */
+async function startKeepWarm($: $T, ms: number, every = 0) {
+  await ensureSid($)
+  const now = await $.clock.now()
+  s.deadline = now + ms
+  s.every = every
+  s.stopped = undefined
+  await $.store.set(deadlineKey(), s.deadline)
+  await arm($)
+}
+
+async function setGuard($: $T, guard: CacheState['guard']) {
+  s.guard = guard
+  await $.store.set(KEY_GUARD, guard)
+  await save($)
+}
+
+/** The band's Send anyway: submits the held cold send, which the guard lets through as a plugin's prompt. */
+async function sendHeld($: $T) {
+  const held = s.held
+  if (!held) return
+  s.held = undefined
+  s.ackedAt = 0
+  // The band says so at once: a cold re-write can take a while before any reply shows.
+  s.sending = { text: held.text, at: await $.clock.now(), tokens: s.ctx }
+  isColdWritePending = true
+  await save($)
+  $.ui.toast(`agent-deck: sent. Re-writing ${fmtTok(s.ctx)} tokens of cache first, so the reply can take a minute.`)
+  const r = await $.prompt
+    .submit({ text: held.text, asUser: true })
+    .catch((err: unknown) => ({ drop: String((err as Error)?.message ?? err) }))
+  if (r?.drop !== undefined) {
+    isColdWritePending = false
+    s.held = held
+    s.sending = undefined
+    await save($)
+    $.ui.toast(`agent-deck: the held prompt was not sent: ${r.drop}`)
+  }
+}
+
+async function discardHeld($: $T) {
+  s.held = undefined
+  s.ackedAt = 0
+  await save($)
+}
+
+const guardText = (now: number) => {
+  const p = priceOf(s.model)
+  const rate = p ? `$${writeRate(p, s.ttlMs)}/MTok` : 'the cache-write rate'
+  const warm = warmUsd(s)
+  return (
+    `the prompt cache went cold ${fmtDuration(now - s.lastRequestAt - s.ttlMs)} ago. Sending this re-writes up to ` +
+    `${s.ctx.toLocaleString('en-US')} tokens at ${rate} = ${fmtUsd(coldUsd(s))}` +
+    (warm === undefined ? '' : ` (a warm turn would have cost ${fmtUsd(warm)})`)
+  )
+}
+
+/** The `/cache` card. */
+const cacheCard = (now: number): string => {
+  const v = cacheView(s, now)
+  const lines = [
+    `model       ${s.model ?? 'not seen yet'} · ${s.ttlMs >= HOUR ? '1h' : '5m'} cache`,
+    `state       ${v.label}`,
+    `context     ${s.ctx.toLocaleString('en-US')} tokens`,
+    `cold cost   ${fmtUsd(v.coldUsd)} to re-write it (warm turn ${fmtUsd(v.warmUsd)})`,
+    `keep-warm   ${v.keepwarm ? `on, ${fmtDuration(v.keepwarm.leftMs)} left, ${v.keepwarm.next}` : s.stopped ? `stopped: ${s.stopped}` : 'off (/keepwarm 2h to arm it)'}`,
+    `pings       ${s.pings}${s.pings ? `, ${fmtUsd(s.pingUsd)}` : ''}${s.lastPing ? `; last read ${fmtTok(s.lastPing.read)} for ${fmtUsd(s.lastPing.usd)}` : ''}`,
+    `guard       ${s.guard === 'refuse' ? 'refuse a cold send once' : s.guard === 'warn' ? 'warn only' : 'off'} (/cache guard refuse|warn|off)`,
+    `cold writes ${s.coldWrites.length} this session, ${fmtUsd(v.paid)}`,
+  ]
+  return lines.join('\n')
+}
+
+/** session.start's part, run after the engine's start. */
+async function cacheSessionStart($: $T) {
+  const sid = await $.session.id()
+  const prev = await read($, cacheAtom)
+  // A reload keeps the session's figures; a new session starts fresh.
+  s = prev.sid === sid ? { ...freshCache(sid), ...prev, coldWrites: [...prev.coldWrites] } : freshCache(sid)
+  gen++
+  s.model ??= await $.session.model()
+  s.ttlMs = await resolveTtl($).catch(() => s.ttlMs)
+  const usage = await $.session.usage().catch(() => undefined)
+  if (usage?.context.tokens) s.ctx = usage.context.tokens
+  const now = await $.clock.now()
+  const saved = await $.store.get(deadlineKey())
+  s.deadline = typeof saved === 'number' && saved > now ? saved : 0
+  if (!s.deadline && saved !== undefined) await $.store.delete(deadlineKey())
+  const guard = await $.store.get(KEY_GUARD)
+  s.guard = guard === 'warn' || guard === 'off' ? guard : 'refuse'
+  await $.command.register({
+    name: 'keepwarm',
+    description: 'Keep the prompt cache warm: a window such as 90m or 2h (bare: 2h), off, or status (agent-deck)',
+    argumentHint: '[2h | 90m | off | status]',
+    immediate: true,
+  })
+  await $.command.register({
+    name: 'cache',
+    description: 'Prompt cache state, cold re-write price and keep-warm; guard refuse|warn|off (agent-deck)',
+    argumentHint: '[status | guard refuse | guard warn | guard off]',
+    immediate: true,
+  })
+  await arm($)
+}
+
+const cacheSessionEnd = () => disarm()
+
+/** A main-thread request is going out: it refreshes the cache clock. */
+async function cacheBeforeStep($: $T, e: { messageCount: number; model?: string }) {
+  await ensureSid($)
+  // A request over fewer than half the last one's messages follows a compaction.
+  if (e.messageCount * 2 < s.transcript) markReset()
+  s.transcript = e.messageCount
+  s.lastRequestAt = await $.clock.now()
+  if (e.model) s.model = e.model
+  void save($)
+}
+
+type TurnUsage = { model?: string; input_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
+
+/** A main-thread turn ended: re-reads the context, scores a cold write, re-arms keep-warm. */
+async function cacheAfterTurn($: $T, e: { usage?: TurnUsage | null; isAborted?: boolean; durationMs: number }) {
+  const now = await $.clock.now()
+  if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
+  const wasReset = s.isReset
+  s.isReset = false
+  // Crossing a plan's limit mid-session changes the TTL of the next writes.
+  s.ttlMs = await resolveTtl($).catch(() => s.ttlMs)
+  s.isWaitingForTurn = false
+  s.ackedAt = 0
+  s.held = undefined
+  s.sending = undefined
+  const u = e.usage
+  if (u) {
+    if (u.model) s.model = u.model
+    const prev = s.ctx
+    const live = (await $.session.usage().catch(() => undefined))?.context.tokens
+    s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+    const written = wasReset ? 0 : u.cache_creation_input_tokens
+    if ((prev > 20_000 && written >= 0.5 * prev) || (isColdWritePending && written > 0)) {
+      const p = priceOf(s.model)
+      const usd = p ? (written * writeRate(p, s.ttlMs)) / 1e6 : undefined
+      s.coldWrites = [...s.coldWrites, { at: now, tokens: written, usd }].slice(-20)
+      $.ui.log(`agent-deck: cold cache write of ${fmtTok(written)} tokens paid (${fmtUsd(usd)}). /keepwarm 2h keeps it warm through a break.`)
+    }
+  }
+  isColdWritePending = false
+  await arm($)
+}
+
+const registerCache = (on: On) => {
+  // /clear, a resume or a fork: the resume fields say how old the cache is.
+  on('classic.SessionStart', async ($, e, next) => {
+    const r = await next(e)
+    gen++
+    if (e.source === 'clear') {
+      const keepGuard = s.guard
+      disarm()
+      if (s.sid) await $.store.delete(deadlineKey())
+      s = { ...freshCache(), guard: keepGuard }
+      await save($)
+      return r
+    }
+    if (e.source === 'resume' || e.source === 'fork') {
+      if (typeof e.context_tokens === 'number' && e.context_tokens > 0) s.ctx = e.context_tokens
+      if (typeof e.seconds_since_last_response === 'number') s.lastRequestAt = (await $.clock.now()) - e.seconds_since_last_response * 1000
+      if (typeof e.model === 'string') s.model = e.model
+      s.isReset = false
+    }
+    await arm($)
+    return r
+  })
+
+  // A model switch forfeits the cache: the next request writes it afresh, and is never a "cold send".
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    const r = await next(e)
+    s.model = e.to_model
+    s.ttlMs = e.cache_ttl === '5m' ? 5 * 60_000 : HOUR
+    if (e.context_tokens) s.ctx = e.context_tokens
+    markReset()
+    await arm($)
+    return r
+  })
+
+  on('command.run', { command: 'keepwarm' }, async ($, e) => {
+    await ensureSid($)
+    const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
+    const now = await $.clock.now()
+    if (words[0] === 'off') {
+      await stopKeepWarm($)
+      return { text: 'keep-warm is off' }
+    }
+    if (words[0] === 'status') return { text: cacheCard(now) }
+    const ms = words.length ? parseDuration(words[0]!) : DEFAULT_WINDOW_MS
+    if (!ms) return { text: 'keepwarm takes a window such as 2h or 90m, or off, or status' }
+    let every = 0
+    if (words[1] === 'every') {
+      const period = parseDuration(words[2] ?? '')
+      if (!period || period < MIN_PING_MS || period >= s.ttlMs) return { text: `every takes a period from 1m to under the cache's ${fmtDuration(s.ttlMs)}` }
+      every = period
+    }
+    await startKeepWarm($, ms, every)
+    const cold = isCold(s, now) ? ' The cache is cold now, so the first ping comes after the next turn.' : ''
+    return { text: `keep-warm on for ${fmtDuration(ms)}: a ping ${fmtDuration(pingEvery(s))} after each idle stretch keeps the cache read, not re-written.${cold}` }
+  })
+
+  on('command.run', { command: 'cache' }, async ($, e) => {
+    await ensureSid($)
+    const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
+    if (words[0] === 'guard') {
+      const g = words[1]
+      if (g !== 'refuse' && g !== 'warn' && g !== 'off') return { text: '/cache guard takes refuse, warn or off' }
+      await setGuard($, g)
+      return {
+        text:
+          g === 'refuse'
+            ? 'cold guard: refuse once. A cold send is dropped with its price; sending it again goes through.'
+            : g === 'warn'
+              ? 'cold guard: warn. A cold send goes through with its price logged.'
+              : 'cold guard: off.',
+      }
+    }
+    return { text: cacheCard(await $.clock.now()) }
+  })
+
+  // The guard: only the first character of the prompt is read, for a slash.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind === 'plugin' || s.guard === 'off') return next(e)
+    if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
+    const now = await $.clock.now()
+    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
+    const isUnattended = UNATTENDED.has(e.origin.kind)
+    if (s.guard === 'warn' || isUnattended) {
+      $.ui.log(`agent-deck: ${guardText(now)}. Sending anyway${isUnattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}.`)
+      isColdWritePending = true
+      return next(e)
+    }
+    if (s.ackedAt === s.lastRequestAt) {
+      s.ackedAt = 0
+      s.held = undefined
+      isColdWritePending = true
+      await save($)
+      return next(e)
+    }
+    s.ackedAt = s.lastRequestAt
+    // Attachments can't be sent again by a plugin, so a prompt with any is only refused.
+    s.held = e.attachments?.length ? undefined : { text: e.text, usd: coldUsd(s) }
+    await save($)
+    const again = s.held ? 'Press Send anyway above the prompt, or send it again,' : 'Send it again'
+    return { drop: `agent-deck: ${guardText(now)}. ${again} to pay it, or /clear and start from a note. /keepwarm keeps it warm through your next break.` }
+  })
+
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (!e.agentId) {
+      markReset()
+      s.ctx = 0
+      await arm($)
+    }
+    return r
+  })
+}
+
 // ---------- the module ----------
 
 export const register: Register = on => {
   // ---- the main conversation's prompt cache ----
 
   registerCache(on)
+
+  on('tool.describe', async (_$, e, next) => {
+    const result = await next(e)
+    return [TOOL, RESULT_TOOL, AGENT_TOOL, AGENT_RESULT_TOOL].includes(e.tool) ? { ...result, isDeferred: false } : result
+  })
 
   // ---- session ----
 
@@ -1702,7 +2184,7 @@ export const register: Register = on => {
         </Box>
         {meter(`${name}-${w.label}-m`, w.percent, limitColor(w.percent))}
         <Box width={5} flexShrink={0} justifyContent="flex-end">
-          <Text bold tabular color={limitColor(w.percent)}>
+          <Text bold color={limitColor(w.percent)}>
             {`${Math.round(w.percent)}%`}
           </Text>
         </Box>
@@ -1739,7 +2221,7 @@ export const register: Register = on => {
               <Text>{windowName(w)}</Text>
               <Box flexDirection="row" columnGap={1} flexShrink={0}>
                 {w.resetsAt !== undefined && <Text dimColor>resets in {fmtReset(w.resetsAt, now)}</Text>}
-                <Text bold tabular color={limitColor(w.percent)}>
+                <Text bold color={limitColor(w.percent)}>
                   {`${Math.round(w.percent)}%`}
                 </Text>
               </Box>
@@ -1916,7 +2398,7 @@ export const register: Register = on => {
             )}
           </Box>
           <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor tabular>
+            <Text dimColor>
               {elapsed}
             </Text>
             {!isRunning && <Button key={`t-${c.id}`} label={isOpen ? '▾' : '▸'} plain onPress={() => toggle(c.id)} />}
@@ -1953,6 +2435,8 @@ export const register: Register = on => {
           {hit !== undefined && stat('hit', 'cache', `${Math.round(hit)}%`, hit >= 50 ? 'success' : 'warning')}
           {c.costUsd !== undefined && stat('cost', '≈', fmtUsd(c.costUsd))}
           {c.aiCredits !== undefined && stat('credits', 'AI credits', fmtCredits(c.aiCredits))}
+          {c.aiCredits !== undefined && c.aiCreditsStatus === 'partial' && <Text dimColor>reported subtotal</Text>}
+          {c.aiCredits === undefined && c.aiCreditsStatus !== undefined && <Text dimColor>AI credits not reported</Text>}
         </Box>
       )
 
@@ -1967,12 +2451,16 @@ export const register: Register = on => {
           </Text>
           {modelRow}
           {statsRow}
+          {c.modelUsage && Object.entries(c.modelUsage).map(([model, u]) => (
+            <Text key={`usage-${model}`} dimColor wrap="wrap">
+              {`${model}: in ${fmtTokens(u.tokens.input + u.tokens.cacheRead + u.tokens.cacheWrite)} out ${fmtTokens(u.tokens.output)}${u.aiCredits !== undefined ? ` · ${fmtCredits(u.aiCredits)} AI credits${u.aiCreditsStatus === 'partial' ? ' (subtotal)' : ''}` : ' · credits not reported'}`}
+            </Text>
+          ))}
           {acts.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
               {acts.map(a => (
                 <Text
                   key={`${c.id}-${a.id}`}
-                  mono
                   wrap="truncate-end"
                   color={a.status === 'error' ? 'error' : undefined}
                   dimColor={a.status === 'done'}
@@ -2109,13 +2597,12 @@ export const register: Register = on => {
       </Box>
     )
 
-    const field = (key: string, label: string, value: string, set: (d: Harness, v: string) => Harness, rows?: number) =>
+    const field = (key: string, label: string, value: string, set: (d: Harness, v: string) => Harness) =>
       Input && (
         <Input
           key={key}
           label={label}
           value={value}
-          rows={rows}
           submitLabel="keep"
           onInput={v => void patchDraft(d => set(d, v))}
           onSubmit={v => void patchDraft(d => set(d, v))}
@@ -2146,7 +2633,7 @@ export const register: Register = on => {
           />
           {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
           {p && field('h-provider-key', 'API key', p.apiKey ?? '', (x, s) => setP(x, { apiKey: s }))}
-          {p && p.type === 'openai' && d.parser === 'copilot' && (
+          {p && p.type !== 'anthropic' && d.parser === 'copilot' && (
             <Select
               key="h-provider-wire"
               label="Wire format"
@@ -2157,6 +2644,23 @@ export const register: Register = on => {
               value={p.wireApi ?? 'completions'}
               onSelect={s => void patchDraft(x => setP(x, { wireApi: s as HarnessProvider['wireApi'] }))}
             />
+          )}
+          {p && d.parser === 'copilot' && (
+            <Box flexDirection="column" gap={1}>
+              {p.type === 'anthropic' && <Text dimColor wrap="wrap">Use the API root or its /v1 URL; Copilot adds /v1 to requests.</Text>}
+              {field('h-provider-model-id', 'Base model id (optional)', p.modelId ?? '', (x, s) => setP(x, { modelId: s }))}
+              {field('h-provider-wire-model', 'Deployment / wire model (optional)', p.wireModel ?? '', (x, s) => setP(x, { wireModel: s }))}
+              {p.type !== 'anthropic' && p.wireApi === 'responses' && (
+                <Select
+                  key="h-provider-transport"
+                  label="Responses transport"
+                  options={[{ value: 'http', label: 'HTTP' }, { value: 'websockets', label: 'WebSockets' }]}
+                  value={p.transport ?? 'http'}
+                  onSelect={s => void patchDraft(x => setP(x, { transport: s as HarnessProvider['transport'] }))}
+                />
+              )}
+              <Text dimColor wrap="wrap">Leave these empty to use the selected model for both. For Azure or a fine-tune, give a known base model and the deployment name your API expects.</Text>
+            </Box>
           )}
           {p && (
             <Text dimColor wrap="wrap">
@@ -2231,7 +2735,7 @@ export const register: Register = on => {
                       ? cur
                       : s === OTHER_MODEL
                         ? { ...cur, isTypingModel: true }
-                        : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined } },
+                        : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
                   )
                 }
               />
@@ -2282,11 +2786,16 @@ export const register: Register = on => {
           args: d.args.trim(),
           color: d.color.trim() || '#14B8A6',
           model: d.model?.trim() || undefined,
+          autoTier: d.parser === 'copilot' && !d.provider ? d.autoTier?.trim() || undefined : undefined,
+          maxAiCredits: d.parser === 'copilot' ? d.maxAiCredits : undefined,
           provider: d.provider && {
             type: d.provider.type,
             baseUrl: d.provider.baseUrl.trim().replace(/\/+$/, ''),
             apiKey: d.provider.apiKey?.trim() || undefined,
-            wireApi: d.provider.type === 'openai' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
+            wireApi: d.provider.type !== 'anthropic' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
+            transport: d.provider.type !== 'anthropic' && d.parser === 'copilot' && d.provider.wireApi === 'responses' ? d.provider.transport : undefined,
+            modelId: d.parser === 'copilot' ? d.provider.modelId?.trim() || undefined : undefined,
+            wireModel: d.parser === 'copilot' ? d.provider.wireModel?.trim() || undefined : undefined,
           },
         }
         const error = harnessError(clean, others)
@@ -2312,7 +2821,7 @@ export const register: Register = on => {
           }))}
           {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
           {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
-          {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }), 2)}
+          {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }))}
           {Select && (
             <Select
               key="h-parser"
@@ -2324,12 +2833,35 @@ export const register: Register = on => {
           )}
           {providerSection(d)}
           {modelSection(v)}
+          {d.parser === 'copilot' && (
+            <Box key="h-copilot" flexDirection="column" gap={1}>
+              {!d.provider && Select && (
+                <Select
+                  key="h-auto-tier"
+                  label="Auto routing profile"
+                  options={[
+                    { value: '', label: "CLI's default" },
+                    { value: 'efficiency', label: 'Efficiency' },
+                    { value: 'balance', label: 'Balance' },
+                    { value: 'intelligence', label: 'Intelligence' },
+                    { value: 'hydrafusion', label: 'Copilot Fusion Standard (preview)' },
+                    { value: 'hydrafusion-max', label: 'Copilot Fusion Max (preview)' },
+                    ...(d.autoTier && !['efficiency', 'balance', 'intelligence', 'hydrafusion', 'hydrafusion-max'].includes(d.autoTier) ? [{ value: d.autoTier, label: d.autoTier }] : []),
+                  ]}
+                  value={d.autoTier ?? ''}
+                  onSelect={s => void patchDraft(x => ({ ...x, autoTier: s || undefined, model: s ? 'auto' : x.model }))}
+                />
+              )}
+              {field('h-max-credits', 'AI credit limit (optional, minimum 30)', d.maxAiCredits === undefined ? '' : String(d.maxAiCredits), (x, s) => ({ ...x, maxAiCredits: s.trim() ? Number(s) : undefined }))}
+              <Text dimColor wrap="wrap">Fusion availability depends on your CLI and account. Limits include subagents and may be exceeded by the final response; BYOK provider charges are separate.</Text>
+            </Box>
+          )}
           {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
           <Text dimColor wrap="wrap">
             {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
           </Text>
           <Text dimColor wrap="wrap">
-            runs: <Text mono>{`${d.command} ${showArgs(expandArgs(d.args, { prompt: '<task>', model: d.model }))}`}</Text>
+            runs: <Text>{copilotOptionsError(d) ?? `${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', usageFile: '<run usage file>' }))}`}</Text>
             {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
           </Text>
           {v.error && (
@@ -2478,9 +3010,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={0}>
         <Box flexDirection="row" justifyContent="flex-end">
-          <Button key="h-open" label="Settings" plain dimColor onPress={() => void setView({ mode: 'list' })}>
-            <Text size="title">⚙</Text>
-          </Button>
+          <Button key="h-open" label="⚙ Settings" plain dimColor onPress={() => void setView({ mode: 'list' })} />
         </Box>
         <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
           {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}

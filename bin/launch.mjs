@@ -4,6 +4,15 @@ import path from 'node:path'
 
 const isWindows = process.platform === 'win32'
 
+/** An explicitly configured Copilot harness must not inherit another provider's credentials or key command. */
+export const launchEnv = (extra = {}, isolateProvider = false) => {
+  const env = { ...process.env }
+  if (isolateProvider) {
+    for (const key of Object.keys(env)) if (key.toUpperCase().startsWith('COPILOT_PROVIDER_')) delete env[key]
+  }
+  return { ...env, ...extra }
+}
+
 /** Finds a command on PATH the way a shell would, extensions included on Windows. */
 const which = name => {
   if (/[\\/]/.test(name)) return fs.existsSync(name) ? name : undefined

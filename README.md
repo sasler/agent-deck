@@ -18,7 +18,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
   - the tools it is running
   - the latest output
   - tokens in and out, cache-hit rate and an API-equivalent cost
-  - the AI credits a Copilot run used
+  - the AI credits a Copilot run used, with a breakdown by concrete model, including Fusion and subagent work; missing billing is shown as not reported, and incomplete billing as a subtotal
 
   Finished cards collapse into a list.
 
@@ -31,7 +31,7 @@ Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the 
 - **Switch** each harness on or off.
 - **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in one **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. The list comes from:
   - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their price category (low, medium or high);
-    it also offers **Copilot Fusion** Standard and Max (`hydrafusion`, `hydrafusion-max`), which let Copilot pick the models for each prompt. Where your plan does not include Fusion, Copilot answers on another model and the card says so;
+    it also offers **Auto** and **Copilot Fusion** Standard and Max. Fusion selections, including ones saved by earlier versions of agent-deck, run as `--model auto --auto-tier hydrafusion` or `hydrafusion-max`, with `--experimental`. The CLI checks whether your account supports that profile. A rejected profile or a routing fallback is shown on the card rather than hidden;
   - OpenCode: `opencode models`;
   - Codex (custom harness): Codex's own model cache;
   - Claude Code: its aliases and current model ids;
@@ -49,6 +49,10 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 `agent_result` reads a run on demand.
 
+**Copilot routing and spending.** In a Copilot harness's edit form, **Auto routing profile** selects Efficiency, Balance, Intelligence, or a Fusion preview profile and switches the model to Auto. Leave it at the CLI's default to keep the CLI's own choice. **AI credit limit** sets `--max-ai-credits` (minimum 30), a session-wide soft limit that includes subagents and hidden model work. A response can exceed it before the next call is blocked. Claude can override these settings through `agent_run`'s `autoTier` and `maxAiCredits` inputs. Auto and Fusion are GitHub routing features, not BYOK features.
+
+Fusion's draft, critique, and revision phases show as separate activities with the model doing the work when the CLI reports them. Intermediate phase drafts are not delivered as the final report. The CLI's JSON stream may omit usage events, so agent-deck also asks for `--usage-output-file` and reads its final per-model totals before marking the run finished. Checkpoints and final totals replace running totals, so phases and subagents are not counted twice. Per-model usage is included in the completion report as well as the card. If you set a custom usage file in Arguments, don't share it between concurrent runs.
+
 **Codex** has three modes, chosen with Codex's **Edit** button in ⚙ settings:
 
 - **Built in.** The `codex` and `codex_result` tools, with model, effort, sandbox and resume. It also gives a live card for every Codex run, including ones started in a terminal or the Codex app, and the Codex usage meters.
@@ -60,10 +64,18 @@ On first start, the built-in Codex is on if `codex` is on your PATH. Its On/Off 
 **Your own API (BYOK).** Copilot and Claude Code harnesses can send their model calls to an API you choose instead of their own service, the way Copilot's *bring your own key* works: the CLI's agent still runs on your machine, with its tools and file edits, and only the model calls go to your endpoint. Add the **Copilot (own API)** preset, or open any Copilot or Claude Code harness's **Edit** form, and set **Model API**:
 
 - **OpenAI-compatible**: OpenAI, OpenRouter, or a local Ollama, vLLM or LM Studio (`http://127.0.0.1:11434/v1`), with Chat Completions or Responses wire format;
-- **Azure OpenAI**;
+- **Azure OpenAI**, with Chat Completions or Responses wire format;
 - **Anthropic**, or an Anthropic-compatible gateway (the only kind Claude Code takes).
 
 Then give the **API base URL** and **API key**, and set the default model to the id the API expects. The model has to support tool calls and streaming. agent-deck passes these to the CLI as environment variables (`COPILOT_PROVIDER_*` and `COPILOT_MODEL`, or `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`). The key is kept in agent-deck's settings as plain text. A run gets it through a file in its folder that the runner deletes before the CLI starts, so it isn't left in run files or shown in the command.
+
+If startup fails and the temporary credentials file cannot be cleared, the error gives its path so you can remove it.
+
+For Copilot's Anthropic provider, the API root and a URL ending in `/v1` both work; Copilot adds `/v1` to its requests.
+
+For Copilot, **Base model id** and **Deployment / wire model** are optional. Use them when an Azure deployment or fine-tuned model has a different name from its base model: for example, default model `gpt-5.4`, base model `gpt-5.4`, deployment `my-gpt-deployment`. They set `COPILOT_PROVIDER_MODEL_ID` and `COPILOT_PROVIDER_WIRE_MODEL`, so the CLI can use the base model's tool support and token limits while sending your deployment name to the API. A different per-run model override uses that model for both instead of the saved mapping. With Responses, you can also select **WebSockets** transport. Leave these fields empty for the usual HTTP path and selected model.
+
+When a Copilot harness has its own Model API settings, its runs ignore inherited `COPILOT_PROVIDER_*` variables, including credentials and key-refresh commands, so they cannot mix with that endpoint. Without those settings, the CLI's existing environment and configuration still apply. Copilot's `--secret-env-vars` marks `COPILOT_PROVIDER_API_KEY` as secret, whether set in the harness or inherited: Copilot redacts it from output and removes it from shell and MCP environments. This does not change your global CLI settings.
 
 Runs start without a shell, so nothing in a prompt is expanded or re-quoted. On Windows, an npm `.cmd` shim starts as the Node script it wraps; any other `.cmd`/`.bat` is refused, so point the command at the program itself.
 
@@ -129,6 +141,8 @@ Then restart Claude Code, or run `/reload-plugins`. At the prompt, `/plugin` →
 
 - **Cache state is an estimate**, tracked from your requests on the cache's time-to-live (1 hour by default; 5 minutes is picked up on a model switch). Nothing asks the server.
 - **Dollar figures are API-equivalent prices.** On a subscription they are a yardstick, not your bill.
+- **Copilot costs are reported in AI credits**, not converted to dollars. Older request-based billing fields are ignored. BYOK charges are billed by your provider; the CLI may not report them, and agent-deck does not guess them from an unknown model or treat missing billing as a free run.
+- **Current Copilot flags need a recent CLI.** Use `copilot update` if it rejects an Auto profile, WebSockets, or an AI credit limit. Fusion is a preview and can still be unavailable for your account or organization; agent-deck does not bypass those checks.
 - **Keep-warm pings use tokens.** Each one is a short cache read, a small fraction of what a cold re-write costs.
 - **Run files live under `~/.claude/agent-deck/`.** Each run keeps its prompt, events and report there.
 - **Strata cards are optional.** agent-deck also shows requests to a local model server at `127.0.0.1:8080` when one is running. Without it, nothing happens.
@@ -142,6 +156,7 @@ The prompt-cache status, keep-warm and cold-send guard follow the idea of [**cac
 ```bash
 claude plugin validate .
 claude plugin test .
+node --test tests/runner.test.mjs
 ```
 
 The engine writes the API types into `.claude-plugin/types/` when it loads the mod. After that, `tsc -p . --noEmit` type-checks it.

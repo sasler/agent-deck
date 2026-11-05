@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, Harness, HarnessModel, HarnessParser, HarnessProvider, Tokens } from '../types'
+import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -119,7 +119,7 @@ const PROVIDER_SUPPORT: Partial<Record<HarnessParser, readonly HarnessProvider['
 export const providerTypesFor = (parser: HarnessParser): readonly HarnessProvider['type'][] => PROVIDER_SUPPORT[parser] ?? []
 
 /** The environment that points a harness's CLI at its provider; empty without one. */
-export const providerEnv = (h: Pick<Harness, 'parser' | 'provider'>, model?: string): Record<string, string> => {
+export const providerEnv = (h: Pick<Harness, 'parser' | 'provider' | 'model'>, model?: string): Record<string, string> => {
   const p = h.provider
   if (!p?.baseUrl.trim()) return {}
   const env: Record<string, string> = {}
@@ -127,10 +127,21 @@ export const providerEnv = (h: Pick<Harness, 'parser' | 'provider'>, model?: str
     if (v?.trim()) env[k] = v.trim()
   }
   if (h.parser === 'copilot') {
-    put('COPILOT_PROVIDER_BASE_URL', p.baseUrl)
+    // Copilot's Anthropic client appends /v1 itself.
+    const baseUrl = p.type === 'anthropic'
+      ? p.baseUrl.trim().replace(/\/+$/, '').replace(/^(https?:\/\/[^/?#]+(?:\/[^/?#]+)*)\/v1$/, '$1')
+      : p.baseUrl
+    put('COPILOT_PROVIDER_BASE_URL', baseUrl)
     put('COPILOT_PROVIDER_TYPE', p.type)
     put('COPILOT_PROVIDER_API_KEY', p.apiKey)
-    if (p.type === 'openai' && p.wireApi === 'responses') put('COPILOT_PROVIDER_WIRE_API', 'responses')
+    if (p.type !== 'anthropic') {
+      put('COPILOT_PROVIDER_WIRE_API', p.wireApi)
+      if (p.wireApi === 'responses') put('COPILOT_PROVIDER_TRANSPORT', p.transport)
+    }
+    if (!model || !h.model || model === h.model) {
+      put('COPILOT_PROVIDER_MODEL_ID', p.modelId)
+      put('COPILOT_PROVIDER_WIRE_MODEL', p.wireModel)
+    }
     put('COPILOT_MODEL', model)
   } else if (h.parser === 'claude') {
     put('ANTHROPIC_BASE_URL', p.baseUrl)
@@ -192,15 +203,17 @@ export const parseModels = (stdout: string): { models: HarnessModel[] } | { erro
   }
 }
 
-/** Copilot Fusion routes each prompt between models. Copilot's ACP server does not list it, but `--model` takes these ids. */
+/** Fusion selections also remain compatible with harnesses saved with the old virtual model ids. */
 const COPILOT_FUSION: HarnessModel[] = [
   { id: 'hydrafusion', name: 'Copilot Fusion Standard', note: 'picks models per prompt' },
   { id: 'hydrafusion-max', name: 'Copilot Fusion Max', note: 'picks models per prompt' },
 ]
 
-/** Copilot's models with Fusion's levels first; GitHub's own models only, not a harness on your own API. */
+/** Auto and Fusion first; GitHub's own models only, not a harness on your own API. */
 export const withFusion = (h: Pick<Harness, 'parser' | 'provider'>, models: HarnessModel[]): HarnessModel[] =>
-  h.parser === 'copilot' && !h.provider?.baseUrl.trim() ? [...COPILOT_FUSION, ...models.filter(m => !m.id.startsWith('hydrafusion'))] : models
+  h.parser === 'copilot' && !h.provider?.baseUrl.trim()
+    ? [{ id: 'auto', name: 'Auto', note: 'picks a model per prompt' }, ...COPILOT_FUSION, ...models.filter(m => m.id !== 'auto' && !COPILOT_FUSION.some(f => f.id === m.id))]
+    : models
 
 export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
 
@@ -255,6 +268,115 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
   return out
 }
 
+export type CopilotRunOptions = { model?: string; autoTier?: string; maxAiCredits?: number }
+
+const isFusionModel = (model: string | undefined) => COPILOT_FUSION.some(f => f.id === model)
+
+const copilotRouting = (h: Harness, v: CopilotRunOptions) => {
+  const model = v.autoTier && !v.model ? 'auto' : (v.model ?? h.model)
+  const tier = v.autoTier ?? (isFusionModel(model) ? model : v.model && v.model !== 'auto' ? undefined : h.autoTier)
+  return { model, tier }
+}
+
+export const copilotOptionsError = (h: Harness, v: CopilotRunOptions = {}): string | undefined => {
+  const limit = v.maxAiCredits ?? h.maxAiCredits
+  if (h.parser !== 'copilot') {
+    return h.autoTier !== undefined || v.autoTier !== undefined || limit !== undefined
+      ? 'Auto routing and AI credit limits need a Copilot harness.'
+      : undefined
+  }
+  const { model, tier } = copilotRouting(h, v)
+  if (tier !== undefined && (!tier.trim() || /\s/.test(tier))) return 'Give an Auto routing profile id without spaces.'
+  if (h.provider && (tier || model === 'auto' || isFusionModel(model))) return 'Auto and Fusion use GitHub models, not your own API.'
+  if (tier && model && model !== 'auto' && !isFusionModel(model)) return 'Pick Auto to use an Auto routing profile.'
+  if (limit !== undefined && (!Number.isFinite(limit) || limit < 30)) return 'The AI credit limit must be at least 30.'
+  return undefined
+}
+
+const setArg = (args: string[], flag: string, value: string) => {
+  let first = -1
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== flag && !args[i]?.startsWith(`${flag}=`)) continue
+    const count = args[i] === flag && args[i + 1] && !args[i + 1]?.startsWith('-') ? 2 : 1
+    args.splice(i, count)
+    if (first < 0) first = i
+    i--
+  }
+  args.splice(first < 0 ? args.length : first, 0, flag, value)
+}
+
+const removeArg = (args: string[], flag: string) => {
+  for (let i = args.length - 1; i >= 0; i--) {
+    if (args[i] !== flag && !args[i]?.startsWith(`${flag}=`)) continue
+    const count = args[i] === flag && args[i + 1] && !args[i + 1]?.startsWith('-') ? 2 : 1
+    args.splice(i, count)
+  }
+}
+
+const protectCopilotKey = (args: string[]) => {
+  const key = 'COPILOT_PROVIDER_API_KEY'
+  let found = false
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== '--secret-env-vars' && !args[i]?.startsWith('--secret-env-vars=')) continue
+    found = true
+    if ((args[i] === '--secret-env-vars' ? args[i + 1] : args[i]?.slice('--secret-env-vars='.length))?.split(',').includes(key)) continue
+    if (args[i] === '--secret-env-vars') {
+      if (args[i + 1] && !args[i + 1]?.startsWith('-')) args[i + 1] = `${args[i + 1]},${key}`
+      else args.splice(i + 1, 0, key)
+    } else args[i] = `${args[i]},${key}`
+  }
+  if (!found) args.push(`--secret-env-vars=${key}`)
+}
+
+type HarnessArgValues = ArgValues & CopilotRunOptions & { usageFile?: string }
+
+/** Shared by the preview and runner, including old saved templates. No shell is involved. */
+export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[]; usageFile?: string } => {
+  const error = copilotOptionsError(h, v)
+  if (error) throw new Error(error)
+  const { model, tier } = copilotRouting(h, v)
+  if (h.parser !== 'copilot') return { args: expandArgs(h.args, { ...v, model }) }
+  const values = { prompt: v.prompt, model: tier ? 'auto' : model, session: v.session, cwd: v.cwd }
+  const markers = { prompt: '\0agent-deck-prompt\0', model: '\0agent-deck-model\0', session: '\0agent-deck-session\0', cwd: '\0agent-deck-cwd\0' }
+  const expand = (arg: string) =>
+    (Object.keys(markers) as (keyof typeof markers)[]).reduce((word, name) => word.split(markers[name]).join(values[name] ?? ''), arg)
+  const args = expandArgs(h.args, {
+    prompt: values.prompt ? markers.prompt : values.prompt,
+    model: values.model ? markers.model : undefined,
+    session: values.session ? markers.session : undefined,
+    cwd: values.cwd ? markers.cwd : undefined,
+  })
+  for (let i = 0; i < args.length - 1; i++) {
+    const prompt = args[i + 1]
+    if ((args[i] === '-p' || args[i] === '--prompt') && prompt?.includes(markers.prompt) && expand(prompt).startsWith('-')) {
+      args.splice(i, 2, `--prompt=${prompt}`)
+    }
+  }
+  if (tier) {
+    setArg(args, '--model', 'auto')
+    setArg(args, '--auto-tier', tier)
+    if (tier.startsWith('hydrafusion')) {
+      for (let i = args.length - 1; i >= 0; i--) if (args[i] === '--no-experimental') args.splice(i, 1)
+      if (!args.includes('--experimental')) args.push('--experimental')
+    }
+  } else if (v.model) {
+    setArg(args, '--model', v.model)
+    if (v.model !== 'auto') removeArg(args, '--auto-tier')
+  }
+  const limit = v.maxAiCredits ?? h.maxAiCredits
+  if (limit !== undefined) setArg(args, '--max-ai-credits', String(limit))
+  protectCopilotKey(args)
+  if (v.usageFile && !args.some(a => a === '--usage-output-file' || a.startsWith('--usage-output-file='))) args.push('--usage-output-file', v.usageFile)
+  let usageIndex = -1
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--usage-output-file' || args[i]?.startsWith('--usage-output-file=')) usageIndex = i
+  }
+  const usageArg = usageIndex < 0 ? undefined : args[usageIndex] === '--usage-output-file' ? args[usageIndex + 1] : args[usageIndex]?.slice('--usage-output-file='.length)
+  return { args: args.map(expand), usageFile: usageArg ? expand(usageArg) : undefined }
+}
+
+export const harnessArgs = (h: Harness, v: HarnessArgValues): string[] => harnessCommand(h, v).args
+
 // ---------- checking an edit ----------
 
 export const slugId = (name: string): string =>
@@ -272,12 +394,15 @@ export const harnessError = (h: Harness, others: readonly Harness[]): string | u
   if (!h.command.trim()) return 'Name the command to run, for example copilot.'
   if (/\s/.test(h.command.trim())) return 'The command is one word; put its arguments under Arguments.'
   if (!h.args.includes('{prompt}')) return 'The arguments need {prompt} where the task goes.'
+  const optionsError = copilotOptionsError(h)
+  if (optionsError) return optionsError
   if (h.provider) {
     const types = providerTypesFor(h.parser)
     if (!types.length) return 'Only Copilot and Claude Code output can run against your own API; switch the API off or pick that output.'
     if (!types.includes(h.provider.type)) return `This CLI takes an ${types.join(' or ')} API, not ${h.provider.type}.`
     if (!/^https?:\/\/\S+$/.test(h.provider.baseUrl.trim())) return "Give the API's base URL, starting with http:// or https://."
     if (h.parser === 'copilot' && !h.model?.trim()) return 'Set the default model to the id your API expects; Copilot needs one with its own API.'
+    if (h.provider.transport === 'websockets' && (h.provider.type === 'anthropic' || h.provider.wireApi !== 'responses')) return 'WebSockets needs the Responses wire format.'
   }
   return undefined
 }
@@ -293,6 +418,7 @@ export type HarnessEvent =
   | { kind: 'cost'; usd: number; isAdded?: boolean }
   | { kind: 'session'; id: string }
   | { kind: 'credits'; credits: number }
+  | { kind: 'copilot-usage'; models?: Record<string, CopilotModelUsage>; credits?: number; creditsStatus?: CopilotModelUsage['aiCreditsStatus']; isAdded?: boolean }
   | { kind: 'error'; text: string }
   | { kind: 'final'; text: string }
 
@@ -319,15 +445,54 @@ const tok = (input: number, output: number, cacheRead: number, cacheWrite: numbe
   reasoning,
 })
 
-/** Copilot bills in AI credits and reports them as nano AI units. */
-const aiCredits = (nanoAiu: unknown): HarnessEvent[] =>
-  typeof nanoAiu === 'number' && Number.isFinite(nanoAiu) ? [{ kind: 'credits', credits: nanoAiu / 1e9 }] : []
+const reportedNumber = (v: unknown): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined
+
+const creditsStatus = (v: unknown): CopilotModelUsage['aiCreditsStatus'] =>
+  v === 'complete' || v === 'partial' || v === 'unavailable' ? v : undefined
+
+const copilotTokens = (u: J): Tokens =>
+  tok(num(u.inputTokens) - num(u.cacheReadTokens) - num(u.cacheWriteTokens), num(u.outputTokens), num(u.cacheReadTokens), num(u.cacheWriteTokens), num(u.reasoningTokens))
+
+/** Checkpoints and shutdowns are cumulative. Never add them to per-call usage. */
+const copilotTotals = (d: J): HarnessEvent[] => {
+  const snapshot = obj(d.accountingSnapshot)
+  const nano = reportedNumber(snapshot.totalNanoAiu ?? d.totalNanoAiu)
+  const status = creditsStatus(snapshot.aiCreditsStatus ?? d.aiCreditsStatus) ?? (nano === undefined ? undefined : 'partial')
+  const metrics = snapshot.modelMetrics ?? d.modelMetrics
+  const models: Record<string, CopilotModelUsage> | undefined = metrics && typeof metrics === 'object' ? {} : undefined
+  if (models) for (const [id, value] of Object.entries(obj(metrics))) {
+    const m = obj(value)
+    const nano = reportedNumber(m.totalNanoAiu)
+    const modelStatus = creditsStatus(m.aiCreditsStatus) ?? status
+    models[id] = { tokens: copilotTokens(obj(m.usage)), aiCredits: modelStatus === 'unavailable' ? undefined : nano === undefined ? undefined : nano / 1e9, aiCreditsStatus: modelStatus }
+  }
+  return models || nano !== undefined || status
+    ? [{ kind: 'copilot-usage', models, credits: status === 'unavailable' ? undefined : nano === undefined ? undefined : nano / 1e9, creditsStatus: status }]
+    : []
+}
 
 const copilot = (e: J): HarnessEvent[] => {
   const d = obj(e.data)
   switch (e.type) {
-    case 'session.auto_mode_resolved':
-      return str(d.chosenModel) ? [{ kind: 'model', model: d.chosenModel as string }] : []
+    case 'session.auto_mode_resolved': {
+      const out: HarnessEvent[] = str(d.chosenModel) ? [{ kind: 'model', model: d.chosenModel as string }] : []
+      if (d.fallback === true) out.push({ kind: 'act', id: 'auto-fallback', label: `Auto fallback: ${str(d.fallbackReason) ?? 'routing failed'} · ${str(d.chosenModel) ?? 'default model'}`, status: 'error' })
+      return out
+    }
+    case 'session.auto_tier_switch_failed':
+      return [{ kind: 'act', id: 'auto-tier', label: `Auto profile ${str(d.requestedAutoTier) ?? 'default'} not used: ${str(d.reason) ?? 'unavailable'}${str(d.effectiveAutoTier) ? ` · using ${d.effectiveAutoTier as string}` : ''}`, status: 'error' }]
+    case 'session.start':
+    case 'session.resume':
+      return str(d.sessionId) ? [{ kind: 'session', id: d.sessionId as string }] : []
+    case 'assistant.usage': {
+      const model = str(d.model)
+      if (!model) return []
+      const nano = reportedNumber(obj(d.copilotUsage).totalNanoAiu)
+      const status = creditsStatus(d.aiCreditsStatus) ?? (nano === undefined ? 'unavailable' : 'complete')
+      const credits = status === 'unavailable' || nano === undefined ? undefined : nano / 1e9
+      return [{ kind: 'copilot-usage', models: { [model]: { tokens: copilotTokens(d), aiCredits: credits, aiCreditsStatus: status } }, credits, creditsStatus: status, isAdded: true }]
+    }
     case 'model.call_start':
       return str(d.model) && d.model !== 'auto' ? [{ kind: 'model', model: d.model as string }] : []
     case 'assistant.message': {
@@ -348,23 +513,27 @@ const copilot = (e: J): HarnessEvent[] => {
     }
     case 'tool.execution_complete':
       return [{ kind: 'act', id: String(d.toolCallId ?? ''), status: d.success === false ? 'error' : 'done' }]
-    case 'session.usage_checkpoint': {
-      const metrics = obj(obj(d.accountingSnapshot).modelMetrics)
-      const t = tok(0, 0, 0, 0)
-      for (const m of Object.values(metrics)) {
-        const u = obj(obj(m).usage)
-        t.cacheRead += num(u.cacheReadTokens)
-        t.cacheWrite += num(u.cacheWriteTokens)
-        t.input += num(u.inputTokens) - num(u.cacheReadTokens) - num(u.cacheWriteTokens)
-        t.output += num(u.outputTokens)
-        t.reasoning += num(u.reasoningTokens)
-      }
-      const out: HarnessEvent[] = [{ kind: 'tokens', tokens: { ...t, input: Math.max(0, t.input) } }]
-      out.push(...aiCredits(d.totalNanoAiu))
+    case 'session.usage_checkpoint':
+      return copilotTotals(d)
+    case 'agent-deck.usage_error':
+      return [
+        { kind: 'copilot-usage', creditsStatus: 'unavailable', isAdded: true },
+        { kind: 'act', id: 'copilot-usage', label: `Copilot usage unavailable: ${str(d.message) ?? 'could not read usage file'}`, status: 'error' },
+      ]
+    case 'assistant.fusion_phase_started':
+    case 'assistant.fusion_phase_completed':
+    case 'assistant.fusion_phase_failed': {
+      const out: HarnessEvent[] = []
+      if (str(d.model)) out.push({ kind: 'model', model: d.model as string })
+      if (str(d.phaseId)) out.push({
+        kind: 'act',
+        id: `fusion:${String(d.fusionId ?? '')}:${d.phaseId as string}`,
+        label: `Fusion ${str(d.role) ?? str(d.phaseKind) ?? 'phase'} · ${str(d.model) ?? 'model'}${e.type === 'assistant.fusion_phase_failed' ? `: ${str(d.errorMessage) ?? str(d.reason) ?? 'phase failed'}` : ''}`,
+        status: e.type === 'assistant.fusion_phase_started' ? 'running' : e.type === 'assistant.fusion_phase_failed' || d.status === 'failed' || d.status === 'cancelled' ? 'error' : 'done',
+      })
+      // Phase usage is also included in assistant.usage and session totals.
       return out
     }
-    case 'assistant.fusion_phase_started':
-      return str(d.model) ? [{ kind: 'model', model: d.model as string }] : []
     case 'session.fusion_route_failed': {
       // Copilot answers anyway, on a fallback model; say so, or the run looks like Fusion ran.
       const why = /"message":"([^"]+)"/.exec(str(d.errorMessage) ?? '')?.[1] ?? str(d.reason) ?? 'routing failed'
@@ -372,13 +541,14 @@ const copilot = (e: J): HarnessEvent[] => {
       return [{ kind: 'act', id: String(d.attemptId ?? 'fusion'), label, status: 'error' }]
     }
     case 'session.shutdown':
-      return aiCredits(d.totalNanoAiu ?? obj(d.accountingSnapshot).totalNanoAiu)
+      return [...copilotTotals(d), ...(d.shutdownType === 'error' ? [{ kind: 'error' as const, text: str(d.errorReason) ?? 'Copilot shut down with an error' }] : [])]
     case 'session.error':
       return [{ kind: 'error', text: str(d.message) ?? str(d.errorType) ?? 'Copilot reported an error' }]
     case 'result': {
       const out: HarnessEvent[] = []
       if (str(e.sessionId)) out.push({ kind: 'session', id: e.sessionId as string })
-      out.push(...aiCredits(obj(e.usage).totalNanoAiu))
+      out.push(...copilotTotals(obj(e.usage)))
+      if (typeof e.exitCode === 'number' && e.exitCode !== 0) out.push({ kind: 'error', text: `Copilot exited ${e.exitCode}` })
       return out
     }
   }
@@ -605,7 +775,7 @@ export const parseLine = (parser: HarnessParser, line: string): HarnessEvent[] =
   } catch {
     return []
   }
-  return PARSE[parser](e)
+  return parser === 'copilot' && e.checkpoint === true ? [] : PARSE[parser](e)
 }
 
 // ---------- the card ----------
@@ -661,6 +831,29 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
     case 'credits':
       card.aiCredits = ev.credits
       break
+    case 'copilot-usage': {
+      const mergeStatus = (a: CopilotModelUsage['aiCreditsStatus'], b: CopilotModelUsage['aiCreditsStatus']) =>
+        !a ? b : !b || a === b ? a : 'partial'
+      if (ev.models) {
+        if (!ev.isAdded) card.modelUsage = ev.models
+        else {
+          card.modelUsage ??= {}
+          for (const [id, usage] of Object.entries(ev.models)) {
+            const old = card.modelUsage[id]
+            card.modelUsage[id] = {
+              tokens: old ? sumTokens(old.tokens, usage.tokens) : usage.tokens,
+              aiCredits: old?.aiCredits === undefined && usage.aiCredits === undefined ? undefined : (old?.aiCredits ?? 0) + (usage.aiCredits ?? 0),
+              aiCreditsStatus: mergeStatus(old?.aiCreditsStatus, usage.aiCreditsStatus),
+            }
+          }
+        }
+        card.tokens = Object.values(card.modelUsage).reduce((t, m) => sumTokens(t, m.tokens), tok(0, 0, 0, 0))
+      }
+      if (ev.credits !== undefined) card.aiCredits = ev.isAdded ? (card.aiCredits ?? 0) + ev.credits : ev.credits
+      if (ev.creditsStatus) card.aiCreditsStatus = ev.isAdded ? mergeStatus(card.aiCreditsStatus, ev.creditsStatus) : ev.creditsStatus
+      if (card.aiCreditsStatus === 'unavailable') card.aiCredits = undefined
+      break
+    }
     case 'error':
       card.error = ev.text
       break
@@ -668,6 +861,10 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
       break
   }
 }
+
+const sumTokens = (a: Tokens, b: Tokens): Tokens => ({
+  input: a.input + b.input, output: a.output + b.output, cacheRead: a.cacheRead + b.cacheRead, cacheWrite: a.cacheWrite + b.cacheWrite, reasoning: a.reasoning + b.reasoning,
+})
 
 // ---------- the tools ----------
 
@@ -682,13 +879,12 @@ const modelsHint = (h: Harness) => {
 
 export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
   name: 'agent_run',
-  isDeferred: false,
   description:
     'Start a task with another coding agent CLI (a harness set up in the Agents pane) in the background; returns at once with a run id. ' +
     'The run is its own process and survives session drops; its live output, model and tokens show in the Agents pane. ' +
     "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
     (enabled.length
-      ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${modelsHint(h)})`).join('; ')}. `
+      ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${modelsHint(h)})`).join('; ')}. `
       : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
     'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
   inputSchema: {
@@ -700,6 +896,8 @@ export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
       prompt: { type: 'string', description: 'The task.' },
       title: { type: 'string', description: 'A few words shown on the card.' },
       model: { type: 'string', description: "Model override; the harness's default when unset." },
+      autoTier: { type: 'string', description: 'Copilot Auto routing profile, such as efficiency, balance, intelligence, hydrafusion or hydrafusion-max. Requires Auto and account support; not BYOK.' },
+      maxAiCredits: { type: 'number', minimum: 30, description: 'Copilot session-wide soft AI credit limit, including subagents. Overrides the harness limit; at least 30.' },
       cwd: { type: 'string', description: 'Working directory; defaults to the session cwd.' },
       resume: { type: 'string', description: "The harness's session id to continue." },
     },
@@ -710,7 +908,6 @@ export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
 
 export const AGENT_RESULT_SPEC: ToolSpec = {
   name: 'agent_result',
-  isDeferred: false,
   description: "Read a background agent_run's report (when finished) or its progress so far. Without `id`, lists this session's runs.",
   inputSchema: {
     type: 'object',

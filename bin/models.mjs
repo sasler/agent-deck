@@ -15,7 +15,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { launchArgv } from './launch.mjs'
+import { launchArgv, launchEnv } from './launch.mjs'
 
 const TIMEOUT_MS = 45_000
 
@@ -27,25 +27,31 @@ const fail = error => done({ error })
 
 const file = process.argv[2]
 if (!file) fail('usage: node models.mjs <spec.json>')
-let text = ''
+let text
+let readError
 try {
   text = fs.readFileSync(file, 'utf8')
-} catch {}
+} catch {
+  readError = true
+}
 try {
   fs.rmSync(file, { force: true })
-} catch {}
+} catch {
+  fail('Could not delete the temporary model query file. Remove it from the run folder before trying again.')
+}
+if (readError) fail('Could not read the temporary model query file.')
 let spec
 try {
   spec = JSON.parse(text)
-} catch (e) {
-  fail(`could not read ${file}: ${e?.message ?? e}`)
+} catch {
+  fail('The temporary model query file is not valid JSON.')
 }
 setTimeout(() => fail(`no answer within ${TIMEOUT_MS / 1000}s`), TIMEOUT_MS).unref()
 
 const start = args => {
   const argv = launchArgv(spec.command, args)
   return spawn(argv[0], argv.slice(1), {
-    env: { ...process.env, ...(spec.env ?? {}) },
+    env: launchEnv(spec.env, spec.isolateProvider),
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
     shell: false,
@@ -135,7 +141,10 @@ const fromApi = async () => {
   }
   const r = await fetch(url, { headers, signal: AbortSignal.timeout(TIMEOUT_MS - 5_000) })
   const text = await r.text()
-  if (!r.ok) throw new Error(`${url} answered ${r.status}: ${text.slice(0, 200)}`)
+  if (!r.ok) {
+    const detail = p.apiKey ? text.split(p.apiKey).join('[redacted]') : text
+    throw new Error(`${url} answered ${r.status}: ${detail.slice(0, 200)}`)
+  }
   const j = JSON.parse(text)
   const list = Array.isArray(j) ? j : (j.data ?? j.models ?? [])
   return list
