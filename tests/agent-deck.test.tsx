@@ -11,17 +11,19 @@ import {
   cacheHitPercent,
   clip,
   codexArgs,
+  codexBinaryLabel,
   costOf,
   keepWarmValue,
   newCodexCard,
   newStrataCard,
   parseCodexConfig,
   shortCommand,
+  staleFor,
   strataTitle,
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { PRESETS, agentRunSpec, applyHarnessEvent, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { PRESETS, agentRunSpec, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -1117,4 +1119,76 @@ test('the meter choice is set in the Harnesses view', async ($, on) => {
   expect(buttons.find(b => b.key === 'm-claude')?.text).toBe('Claude ·')
   expect(buttons.find(b => b.key === 'm-copilot')?.text).toBe('Copilot ✓')
   await ui.unmount()
+})
+
+test('picks the newest Codex CLI, or the one set by hand', async () => {
+  expect(compareVersions('0.170.0', '0.99.9')).toBeGreaterThan(0)
+  expect(compareVersions('0.160.1', '0.166.0')).toBeLessThan(0)
+  expect(compareVersions('1.0.0-alpha.1', '1.0.0')).toBeLessThan(0)
+  const find = {
+    candidates: [
+      { path: 'C:/Programs/OpenAI/Codex/bin/codex.exe', version: '0.160.1', models: ['gpt-6.1-sol'] },
+      { path: 'C:/npm/codex.cmd', version: '0.170.0', models: ['gpt-6.2-sol', 'gpt-6.1-sol'] },
+      { path: 'C:/broken/codex.exe', error: 'spawn EPERM' },
+    ],
+    latest: '0.171.0',
+  }
+  expect(pickCodex(find)?.path).toBe('C:/npm/codex.cmd')
+  expect(pickCodex({ ...find, override: 'C:/Programs/OpenAI/Codex/bin/codex.exe' })?.version).toBe('0.160.1')
+  expect(pickCodex({ ...find, override: 'C:/broken/codex.exe' })).toBeUndefined()
+  expect(codexUpdateNote(pickCodex(find), '0.171.0')).toContain('npm i -g @openai/codex@latest')
+  expect(codexUpdateNote(pickCodex(find), '0.170.0')).toBeUndefined()
+  expect(codexBinaryLabel('C:/npm/codex.cmd', '0.170.0')).toBe('codex-cli 0.170.0 · C:/npm/codex.cmd')
+})
+
+test('refuses a model the chosen Codex does not know, before starting', async () => {
+  const old = { path: 'C:/old/codex.exe', version: '0.160.1', models: ['gpt-6.1-sol'] }
+  const find = { candidates: [old], latest: '0.170.0' }
+  const problem = codexModelProblem('gpt-6.2-sol', find, old)
+  expect(problem).toContain('Codex 0.160.1 (C:/old/codex.exe) does not know the model "gpt-6.2-sol"')
+  expect(problem).toContain('Codex 0.170.0 is out')
+  expect(codexModelProblem('gpt-6.1-sol', find, old)).toBeUndefined()
+  // No list, or a custom provider: nothing to check against.
+  expect(codexModelProblem('gpt-6.2-sol', find, { ...old, models: [] })).toBeUndefined()
+  expect(codexModelProblem('llama3', find, old, 'ollama')).toBeUndefined()
+})
+
+test('a failed Codex run reports the real error, not just its exit code', async () => {
+  const body = JSON.stringify({ type: 'error', status: 400, error: { type: 'invalid_request_error', message: "The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account.", code: 'model_not_found' } })
+  const events = [
+    JSON.stringify({ type: 'thread.started', thread_id: 't1' }),
+    JSON.stringify({ type: 'turn.started' }),
+    JSON.stringify({ type: 'error', message: body }),
+    JSON.stringify({ type: 'turn.failed', error: { message: body } }),
+  ].join('\n')
+  const stderr = '2026-11-19T06:28:50.840939Z ERROR rmcp::transport::worker: worker quit with fatal: HTTP 403\n'
+  expect(codexFailure(events, stderr, 1)).toBe(
+    "The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account. (model_not_found) [HTTP 400]",
+  )
+  expect(codexErrorText('plain text')).toBe('plain text')
+  expect(codexFailure('', '2026-11-19T06:28:50Z ERROR codex_core: helper_unknown_error: setup refresh had errors\n', 1)).toBe(
+    'codex_core: helper_unknown_error: setup refresh had errors',
+  )
+  expect(codexFailure('', stderr, 1)).toBe('codex exited 1 with no error output')
+})
+
+test('a long Codex tool call shows as running, and a quiet card says it may be stuck', async () => {
+  const card = newCodexCard('codex-thread-x', 'Codex', 0, { threadId: 'x', isExternal: true })
+  const f = 'x'
+  applyToCard(card, { t: 'task', f, ts: 1000, state: 'running' })
+  applyToCard(card, { t: 'act', f, ts: 1001, id: 'call_1', label: 'cua_repl.js Checking apps', status: 'running' })
+  expect(card.isThinking).toBe(false)
+  applyToCard(card, { t: 'act', f, ts: 1002, id: 'call_1', label: 'cua_repl.js', status: 'error' })
+  // The call's output line closes it, but does not hide that it failed.
+  applyToCard(card, { t: 'act', f, ts: 1003, id: 'call_1', status: 'done' })
+  expect(card.activity.find(a => a.id === 'call_1')?.status).toBe('error')
+  // An output line for a call never shown adds nothing.
+  applyToCard(card, { t: 'act', f, ts: 1004, id: 'call_unknown', status: 'done' })
+  expect(card.activity.length).toBe(1)
+  applyToCard(card, { t: 'act', f, ts: 1005, id: 'call_2', label: 'exec text(ALL_TOOLS)', status: 'running' })
+  applyToCard(card, { t: 'beat', f, ts: 2000 })
+  expect(staleFor(card, 2000 + 60_000)).toBeUndefined()
+  expect(staleFor(card, 2000 + 16 * 60_000)).toBe(16 * 60_000)
+  card.status = 'done'
+  expect(staleFor(card, 2000 + 16 * 60_000)).toBeUndefined()
 })
