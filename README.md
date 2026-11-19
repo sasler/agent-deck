@@ -61,6 +61,20 @@ Fusion's draft, critique, and revision phases show as separate activities with t
 
 On first start, the built-in Codex is on if `codex` is on your PATH. Its On/Off button switches it any time.
 
+**Which Codex CLI runs use.** You may have more than one Codex installed: the npm one (`npm i -g @openai/codex`), the standalone installer's, WinGet's. agent-deck looks at all of them and starts the newest, not just the first one on your PATH. An old Codex doesn't know the newest models. It also checks npm for the latest published version and tells you when yours is older. agent-deck looks again every ten minutes at most, so this doesn't slow down runs. Codex's **Edit** page shows which Codex runs start with, every other one it found, and these controls:
+
+- **Codex path** starts a Codex of your choice instead. You can also set the `CODEX_PATH` environment variable, which wins over this field.
+- **Look again** checks for installs right away.
+- **Update Codex (npm)** runs `npm i -g @openai/codex@latest`.
+
+Each run's card shows the Codex version and path it started with, and so does its report.
+
+**Before a run starts**, agent-deck checks the model against the chosen Codex's own model list (`codex debug models`). If Codex doesn't know the model, the run doesn't start, and you see which Codex has the model, or that an update is out. This check is skipped when your `config.toml` sets another `model_provider`.
+
+**Long steps show while they run.** A card lists Codex's tool calls as they start, including code-mode cells and `wait` calls that can run for minutes, so you see the step it is on, not just "thinking…". If Codex writes nothing for two minutes, the card says so. That usually means Codex is stuck on the step still shown as running.
+
+**When a run fails**, its report and `codex_result` show Codex's actual error, for example `model_not_found`, a usage limit or a sandbox error, not just `codex exited 1`.
+
 **Your own API (BYOK).** Copilot and Claude Code harnesses can send their model calls to an API you choose instead of their own service, the way Copilot's *bring your own key* works: the CLI's agent still runs on your machine, with its tools and file edits, and only the model calls go to your endpoint. Add the **Copilot (own API)** preset, or open any Copilot or Claude Code harness's **Edit** form, and set **Model API**:
 
 - **OpenAI-compatible**: OpenAI, OpenRouter, or a local Ollama, vLLM or LM Studio (`http://127.0.0.1:11434/v1`), with Chat Completions or Responses wire format;

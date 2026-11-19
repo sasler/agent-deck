@@ -122,7 +122,25 @@ export type AgentCard = {
   aiCreditsStatus?: 'complete' | 'partial' | 'unavailable'
   /** Reported usage by concrete model, including Fusion phases and subagents. */
   modelUsage?: Record<string, CopilotModelUsage>
+  /** The CLI a run started with, e.g. "codex-cli 0.170.0 · C:\\...\\codex.cmd". */
+  binary?: string
+  /** Epoch ms of the last rollout line a Codex card got. */
+  lastEventAt?: number
   error?: string
+}
+
+/** The Codex CLIs agent-deck found and the one runs start with. */
+export type CodexBin = {
+  candidates?: { path: string; version?: string; models?: string[]; error?: string }[]
+  chosen?: { path: string; version?: string; models?: string[] }
+  latest?: string
+  override?: string
+  /** The override came from CODEX_PATH, not the settings. */
+  isEnvOverride?: boolean
+  updateError?: string
+  at?: number
+  isChecking?: boolean
+  isUpdating?: boolean
 }
 
 export type LimitWindow = {
@@ -211,6 +229,8 @@ declare module 'claude-code' {
       found: Record<string, boolean>
       /** Whether the built-in Codex (codex tools, live view, usage meters) is on. */
       codexEnabled: boolean
+      /** The Codex CLIs found and the one runs start with. */
+      codexBin: CodexBin
       meters: MeterChoice
     }
   }

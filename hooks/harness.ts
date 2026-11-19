@@ -755,9 +755,9 @@ const codex = (e: J): HarnessEvent[] => {
       return [{ kind: 'tokens', tokens: tok(num(u.input_tokens) - cached - written, num(u.output_tokens), cached, written, num(u.reasoning_output_tokens)), isAdded: true }]
     }
     case 'turn.failed':
-      return [{ kind: 'error', text: str(obj(e.error).message) ?? 'Codex turn failed' }]
+      return [{ kind: 'error', text: codexErrorText(str(obj(e.error).message) ?? 'Codex turn failed') }]
     case 'error':
-      return [{ kind: 'error', text: str(e.message) ?? 'Codex reported an error' }]
+      return [{ kind: 'error', text: codexErrorText(str(e.message) ?? 'Codex reported an error') }]
   }
   return []
 }
@@ -914,4 +914,99 @@ export const AGENT_RESULT_SPEC: ToolSpec = {
     properties: { id: { type: 'string', description: 'The run id agent_run returned.' } },
     additionalProperties: false,
   },
+}
+
+// ---------- which Codex CLI to start ----------
+
+/** One Codex CLI bin/codex-find.mjs found: its path, version and model list. */
+export type CodexCandidate = { path: string; version?: string; models?: string[]; error?: string }
+export type CodexFind = { override?: string; candidates: CodexCandidate[]; latest?: string; updated?: boolean; updateError?: string; error?: string }
+
+/** Compares two dotted versions (0.170.0 vs 0.99.1) number by number; a pre-release sorts below its release. */
+export const compareVersions = (a: string, b: string): number => {
+  const [ma, pa] = a.split('-', 2)
+  const [mb, pb] = b.split('-', 2)
+  const na = ma!.split('.').map(n => Number.parseInt(n, 10) || 0)
+  const nb = mb!.split('.').map(n => Number.parseInt(n, 10) || 0)
+  for (let i = 0; i < Math.max(na.length, nb.length); i++) {
+    const d = (na[i] ?? 0) - (nb[i] ?? 0)
+    if (d) return d
+  }
+  if (pa && !pb) return -1
+  if (pb && !pa) return 1
+  return (pa ?? '').localeCompare(pb ?? '')
+}
+
+/** The Codex to start: the override when set, else the newest that answered `--version`. */
+export const pickCodex = (f: CodexFind): CodexCandidate | undefined => {
+  const ok = f.candidates.filter(c => c.version && !c.error)
+  if (f.override) return ok.find(c => c.path === f.override)
+  return ok.reduce<CodexCandidate | undefined>((best, c) => (!best || compareVersions(c.version!, best.version!) > 0 ? c : best), undefined)
+}
+
+export const CODEX_UPDATE_COMMAND = 'npm i -g @openai/codex@latest'
+
+/** A warning when a newer Codex is published than the one agent-deck starts. */
+export const codexUpdateNote = (chosen: CodexCandidate | undefined, latest: string | undefined): string | undefined =>
+  chosen?.version && latest && compareVersions(latest, chosen.version) > 0
+    ? `Codex ${latest} is out; agent-deck starts ${chosen.version}. Update with: ${CODEX_UPDATE_COMMAND}`
+    : undefined
+
+/**
+ * Why `model` can't run on the chosen Codex, or undefined when it can (or can't be told:
+ * no model list, or a custom model_provider whose models Codex doesn't list).
+ */
+export const codexModelProblem = (model: string | undefined, f: CodexFind, chosen: CodexCandidate | undefined, provider?: string): string | undefined => {
+  if (!model || !chosen?.models?.length || (provider && provider !== 'openai')) return undefined
+  if (chosen.models.includes(model)) return undefined
+  const other = f.candidates.find(c => c !== chosen && c.models?.includes(model))
+  return [
+    `Codex ${chosen.version} (${chosen.path}) does not know the model "${model}".`,
+    other ? `Codex ${other.version} at ${other.path} does.` : '',
+    f.latest && compareVersions(f.latest, chosen.version!) > 0 ? `Codex ${f.latest} is out: update with ${CODEX_UPDATE_COMMAND}.` : '',
+    `Models it knows: ${chosen.models.join(', ')}.`,
+  ]
+    .filter(Boolean)
+    .join(' ')
+}
+
+// ---------- why a Codex run failed ----------
+
+/** A Codex error message, unwrapped when it is the API's JSON error body: "message (code)". */
+export const codexErrorText = (message: string): string => {
+  try {
+    const j = JSON.parse(message) as J
+    const e = obj(j.error)
+    const text = str(e.message) ?? str(j.message)
+    const code = str(e.code) ?? str(e.type)
+    if (text) return `${text}${code ? ` (${code})` : ''}${typeof j.status === 'number' ? ` [HTTP ${j.status}]` : ''}`
+  } catch {}
+  return message
+}
+
+/**
+ * The real reason a `codex exec --json` run failed: its turn.failed / error events first,
+ * then stderr's last error lines (timestamped log lines included, MCP transport noise not).
+ */
+export const codexFailure = (events: string, stderr: string, code: number | undefined): string => {
+  const fromEvents: string[] = []
+  for (const line of events.split('\n')) {
+    if (!line.startsWith('{')) continue
+    try {
+      const e = JSON.parse(line) as J
+      const msg = e.type === 'turn.failed' ? str(obj(e.error).message) : e.type === 'error' ? str(e.message) : undefined
+      if (msg) {
+        const text = codexErrorText(msg)
+        if (fromEvents.at(-1) !== text) fromEvents.push(text)
+      }
+    } catch {}
+  }
+  if (fromEvents.length) return fromEvents.slice(-2).join(' · ').slice(0, 800)
+  const lines = stderr
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('Reading additional input') && !/rmcp::transport/.test(l))
+    .filter(l => !/^\d{4}-\d\d-\d\dT\S+\s+(INFO|DEBUG|TRACE|WARN)\b/.test(l))
+    .map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s+ERROR\s+/, ''))
+  return lines.slice(-4).join(' ').slice(0, 800) || `codex exited ${code ?? '?'} with no error output`
 }

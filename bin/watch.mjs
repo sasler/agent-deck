@@ -129,6 +129,23 @@ const itemEvent = (f, ts, item, done) => {
   }
 }
 
+/** A short label for a custom_tool_call / function_call: what the cell or tool is doing. */
+const callLabel = p => {
+  const first = s => String(s ?? '').split('\n').map(l => l.trim()).find(l => l && !l.startsWith('//')) ?? ''
+  if (p.type === 'custom_tool_call') {
+    const line = first(p.input).replace(/\s+/g, ' ')
+    return `${p.name ?? 'tool'} ${line.length > 90 ? line.slice(0, 90) + '…' : line}`.trim()
+  }
+  let args = {}
+  try {
+    args = JSON.parse(p.arguments ?? '{}') ?? {}
+  } catch {}
+  if (p.name === 'wait') return `wait for cell ${args.cell_id ?? ''}`.trim()
+  const ns = String(p.namespace ?? '').replace(/^mcp__/, '')
+  const what = args.title ?? first(args.code ?? args.cmd ?? args.command ?? '')
+  return `${ns ? ns + '.' : ''}${p.name ?? 'tool'}${what ? ' ' + clip(String(what).replace(/\s+/g, ' '), 90) : ''}`
+}
+
 const limitsOf = rl => {
   if (!rl) return undefined
   const ws = []
@@ -178,6 +195,19 @@ const handleLine = (state, line) => {
   }
   if (!state.matched) return
 
+  if (o.type === 'response_item') {
+    // Code mode and namespaced tools: one call can run for minutes (a JS cell driving many tools,
+    // a `wait` on a cell), so show it while it runs; its *_output line marks it done.
+    if (p.type === 'custom_tool_call' || p.type === 'function_call') {
+      const label = callLabel(p)
+      if (label && p.call_id) emit({ f, ts, t: 'act', id: p.call_id, label, status: 'running' })
+    } else if ((p.type === 'custom_tool_call_output' || p.type === 'function_call_output') && p.call_id) {
+      emit({ f, ts, t: 'act', id: p.call_id, status: 'done' })
+    } else {
+      emit({ f, ts, t: 'beat' })
+    }
+    return
+  }
   if (o.type === 'turn_context') {
     emit({ f, ts, t: 'ctx', model: p.model, effort: p.effort ?? p.reasoning_effort })
   } else if (o.type === 'event_msg') {

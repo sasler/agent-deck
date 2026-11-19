@@ -1,14 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CacheState, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
+import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
+  CODEX_UPDATE_COMMAND,
   PARSERS,
   PRESETS,
   PROVIDER_TYPES,
   agentRunSpec,
   applyHarnessEvent,
+  codexFailure,
+  codexModelProblem,
+  codexUpdateNote,
   copilotOptionsError,
   harnessArgs,
   harnessCommand,
@@ -22,7 +26,10 @@ import {
   providerTypesFor,
   type ModelQuery,
   type CopilotRunOptions,
+  pickCodex,
   slugId,
+  type CodexCandidate,
+  type CodexFind,
   withFusion,
 } from './harness'
 import {
@@ -61,6 +68,7 @@ const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, 
 const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { mode: 'cards' } as HarnessView)
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
+const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
 const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot'] }
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
 const COPILOT_ACCENT = '#8957E5'
@@ -247,11 +255,12 @@ const summarizeInput = (tool: string, input: Record<string, unknown>): string =>
 
 // ---------- Codex config + rollout files ----------
 
-export const parseCodexConfig = (toml: string): { model?: string; effort?: string } => {
+export const parseCodexConfig = (toml: string): { model?: string; effort?: string; provider?: string } => {
   const top = toml.split(/^\s*\[/m)[0] ?? ''
   return {
     model: top.match(/^\s*model\s*=\s*"([^"]+)"/m)?.[1],
     effort: top.match(/^\s*model_reasoning_effort\s*=\s*"([^"]+)"/m)?.[1],
+    provider: top.match(/^\s*model_provider\s*=\s*"([^"]+)"/m)?.[1],
   }
 }
 
@@ -288,6 +297,9 @@ type RunMeta = {
   effort?: string
   sandbox?: string
   resume?: string
+  /** The Codex CLI the run started with. */
+  codexPath?: string
+  codexVersion?: string
 }
 
 type Run = RunMeta & { dir: string; threadId?: string; isFinished: boolean; isDelivered?: boolean }
@@ -300,7 +312,7 @@ let ticker: { cancel: () => void } | undefined
 let poller: { cancel: () => void } | undefined
 let runPoller: { cancel: () => void } | undefined
 let cacheTicker: { cancel: () => void } | undefined
-let codexDefaults: { model?: string; effort?: string } = {}
+let codexDefaults: { model?: string; effort?: string; provider?: string } = {}
 let sessionId = ''
 
 const CODEX_TOOL_SPEC: ToolSpec = {
@@ -435,7 +447,9 @@ export type WatchEvent =
   | { t: 'prompt'; f: string; ts: number; text: string }
   | { t: 'msg'; f: string; ts: number; text: string; phase?: string }
   | { t: 'reason'; f: string; ts: number; text: string }
-  | { t: 'act'; f: string; ts: number; id: string; label: string; status: Activity['status'] }
+  | { t: 'act'; f: string; ts: number; id: string; label?: string; status: Activity['status'] }
+  /** Any other rollout line: Codex is still writing. */
+  | { t: 'beat'; f: string; ts: number }
   | { t: 'tok'; f: string; ts: number; tokens?: Omit<Tokens, never>; limits?: WatchLimits }
   | { t: 'task'; f: string; ts: number; state: 'running' | 'done' | 'aborted' }
   | { t: 'err'; f: string; ts: number; text: string }
@@ -479,8 +493,17 @@ const adoptThread = ($: $T, runId: string, thread: string) => {
 }
 
 /** Folds one watcher event about a Codex thread into its card. */
+/** How long a running Codex card has gone without a rollout line, once that passes two minutes. */
+export const STALE_MS = 2 * 60_000
+export const staleFor = (c: AgentCard, now: number): number | undefined => {
+  if (c.status !== 'running' || c.provider !== 'codex' || !c.lastEventAt) return undefined
+  const quiet = now - c.lastEventAt
+  return quiet >= STALE_MS ? quiet : undefined
+}
+
 export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string }>) => {
   const isRunCard = card.runId !== undefined
+  card.lastEventAt = Math.max(card.lastEventAt ?? 0, ev.ts)
   switch (ev.t) {
     case 'meta':
       if (card.isExternal) card.startedAt = ev.ts
@@ -500,11 +523,15 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
       appendOutput(card, `${ev.text.split('\n').map(l => `∴ ${l}`).join('\n')}\n`)
       break
     case 'act': {
-      card.isThinking = ev.status !== 'running'
       const has = card.activity.some(a => a.id === ev.id)
+      // A label-less event only closes an activity already shown (a tool call's output).
+      if (!has && !ev.label) break
       card.activity = has
-        ? card.activity.map(a => (a.id === ev.id ? { ...a, label: ev.label, status: ev.status } : a))
-        : [...card.activity, { id: ev.id, label: ev.label, status: ev.status }].slice(-30)
+        ? card.activity.map(a =>
+            a.id !== ev.id ? a : { ...a, label: ev.label ?? a.label, status: !ev.label && a.status === 'error' ? 'error' : ev.status },
+          )
+        : [...card.activity, { id: ev.id, label: ev.label!, status: ev.status }].slice(-30)
+      card.isThinking = !card.activity.some(a => a.status === 'running')
       break
     }
     case 'tok':
@@ -603,43 +630,74 @@ export const codexArgs = (run: RunMeta, lastFile: string): string[] => {
   return args
 }
 
-const quoteCmd = (a: string) => (/[\s"&|<>^]/.test(a) ? `"${a.replace(/"/g, '""')}"` : a)
-const quoteSh = (a: string) => `'${a.replace(/'/g, `'\\''`)}'`
+/** "codex-cli 0.170.0 · C:\…\codex.cmd": which Codex a run started with. */
+export const codexBinaryLabel = (path?: string, version?: string) => (path ? `codex-cli ${version ?? '?'} · ${path}` : undefined)
 
-/** Writes the run's folder and starts Codex as a process of its own, detached from this session. */
+/**
+ * Writes the run's folder and starts Codex through bin/run.mjs: a process of its own,
+ * detached from this session, started without a shell, with the prompt on its stdin.
+ */
 const launchRun = async ($: $T, meta: RunMeta, prompt: string, dir: string) => {
+  const last = (await isWindows($)) ? `${winPath(dir)}\\last.txt` : `${dir}/last.txt`
   await $.fs.write(`${dir}/prompt.txt`, prompt)
   await $.fs.write(`${dir}/meta.json`, JSON.stringify(meta, null, 2))
-  if (await isWindows($)) {
-    const d = winPath(dir)
-    const args = codexArgs(meta, `${d}\\last.txt`).map(quoteCmd).join(' ')
-    const runner = [
-      '@echo off',
-      `cd /d ${quoteCmd(winPath(meta.cwd))}`,
-      `codex ${args} < "${d}\\prompt.txt" > "${d}\\events.jsonl" 2> "${d}\\stderr.log"`,
-      `>"${d}\\exit.txt" echo %ERRORLEVEL%`,
-      '',
-    ].join('\r\n')
-    await $.fs.write(`${dir}/runner.cmd`, runner)
-    const started = await $.process.run([
-      'powershell.exe',
-      '-NoProfile',
-      '-NonInteractive',
-      '-Command',
-      `Start-Process -FilePath cmd.exe -ArgumentList '/d /c "${d}\\runner.cmd"' -WindowStyle Hidden`,
-    ])
-    if (started.exitCode !== 0) throw new Error(started.stderr.trim() || `Start-Process exited ${started.exitCode}`)
-  } else {
-    const args = codexArgs(meta, `${dir}/last.txt`).map(quoteSh).join(' ')
-    const runner = [
-      `cd ${quoteSh(meta.cwd)} || exit 1`,
-      `codex ${args} < ${quoteSh(`${dir}/prompt.txt`)} > ${quoteSh(`${dir}/events.jsonl`)} 2> ${quoteSh(`${dir}/stderr.log`)}`,
-      `echo $? > ${quoteSh(`${dir}/exit.txt`)}`,
-      '',
-    ].join('\n')
-    await $.fs.write(`${dir}/runner.sh`, runner)
-    const started = await $.process.run(['sh', '-c', `nohup sh ${quoteSh(`${dir}/runner.sh`)} >/dev/null 2>&1 &`])
-    if (started.exitCode !== 0) throw new Error(started.stderr.trim() || `sh exited ${started.exitCode}`)
+  const argv = [meta.codexPath ?? 'codex', ...codexArgs(meta, last)]
+  await $.fs.write(`${dir}/spec.json`, JSON.stringify({ argv, cwd: meta.cwd, stdin: prompt }, null, 2))
+  const started = await $.process.run(['node', `${$.plugin.root}/bin/run.mjs`, dir], { timeoutMs: 20_000 })
+  if (started.exitCode !== 0) throw new Error(started.stderr.trim() || `node exited ${started.exitCode} (the codex tool needs Node.js on PATH)`)
+}
+
+// ---------- which Codex CLI: the newest installed, or the one set by hand ----------
+
+const KEY_CODEX_PATH = 'codex-path'
+const CODEX_FIND_TTL_MS = 10 * 60_000
+type CodexFound = { at: number; find: CodexFind; chosen?: CodexCandidate }
+let codexFound: CodexFound | undefined
+let codexFinding: Promise<CodexFound> | undefined
+let codexNoteShown = ''
+
+/** The Codex path set by hand: CODEX_PATH, else the one saved in the Codex settings. */
+const codexOverride = async ($: $T): Promise<string | undefined> => {
+  const env = (await $.env.get('CODEX_PATH'))?.trim()
+  if (env) return env
+  const stored = await $.store.get(KEY_CODEX_PATH)
+  return typeof stored === 'string' && stored.trim() ? stored.trim() : undefined
+}
+
+/**
+ * Finds every Codex CLI (bin/codex-find.mjs) and picks the newest, or the override.
+ * Kept for ten minutes; `force` looks again, `update` first runs npm's update.
+ */
+const findCodex = async ($: $T, opts: { force?: boolean; update?: boolean } = {}): Promise<CodexFound> => {
+  const now = await $.clock.now()
+  if (!opts.force && !opts.update && codexFound && now - codexFound.at < CODEX_FIND_TTL_MS) return codexFound
+  if (codexFinding && !opts.update) return codexFinding
+  await update($, codexBinAtom, cur => ({ ...cur, isChecking: true, isUpdating: !!opts.update }))
+  const finding = (async () => {
+    const root = await runsRoot($)
+    if (!root) throw new Error('no home directory (USERPROFILE/HOME)')
+    const file = `${root}/codex-find.json`
+    const override = await codexOverride($)
+    const args = ['node', `${$.plugin.root}/bin/codex-find.mjs`, file]
+    if (override) args.push('--override', override)
+    if (opts.update) args.push('--update')
+    await $.fs.write(file, '')
+    await $.process.run(args, { timeoutMs: opts.update ? 360_000 : 60_000 }).catch(() => undefined)
+    let find: CodexFind = { candidates: [], error: 'the Codex finder wrote nothing (it needs Node.js on PATH)' }
+    try {
+      find = JSON.parse((await readText($, file)) ?? '') as CodexFind
+    } catch {}
+    codexFound = { at: await $.clock.now(), find, chosen: pickCodex(find) }
+    const isEnvOverride = !!(await $.env.get('CODEX_PATH'))?.trim()
+    await update($, codexBinAtom, () => ({ ...find, chosen: codexFound!.chosen, at: codexFound!.at, override, isEnvOverride }))
+    return codexFound
+  })()
+  codexFinding = finding
+  try {
+    return await finding
+  } finally {
+    if (codexFinding === finding) codexFinding = undefined
+    await update($, codexBinAtom, cur => ({ ...cur, isChecking: false, isUpdating: false }))
   }
 }
 
@@ -652,13 +710,8 @@ const outcomeOf = async ($: $T, run: Run): Promise<RunOutcome> => {
   const report = ((await readText($, `${run.dir}/last.txt`)) ?? '').trim()
   if (code === 0 && report) return { status: 'done', report, code }
   const stderr = (await readText($, `${run.dir}/stderr.log`)) ?? ''
-  const error =
-    stderr
-      .split('\n')
-      .filter(l => l.trim() && !/^\d{4}-\d\d-\d\dT/.test(l) && !l.startsWith('Reading additional input'))
-      .slice(-4)
-      .join(' ')
-      .slice(0, 600) || `codex exited ${Number.isNaN(code) ? '?' : code}`
+  const events = (await readText($, `${run.dir}/events.jsonl`)) ?? ''
+  const error = codexFailure(events, stderr, Number.isNaN(code) ? undefined : code)
   return { status: 'error', report, code, error }
 }
 
@@ -668,6 +721,7 @@ const footerOf = (run: Run, card: AgentCard | undefined) => {
     `[codex run ${run.id} · model ${card?.model ?? run.model ?? 'default'}${card?.effort ? ` (${card.effort})` : ''}` +
     `${run.threadId ? ` · thread ${run.threadId}` : ''}` +
     (t ? ` · in ${fmtTokens(t.input + t.cacheRead)} out ${fmtTokens(t.output)}` : '') +
+    (run.codexPath ? ` · ${codexBinaryLabel(run.codexPath, run.codexVersion)}` : '') +
     ']'
   )
 }
@@ -776,7 +830,14 @@ const loadRuns = async ($: $T, root: string) => {
     runs.set(run.id, run)
     const cardId = `codex-run-${run.id}`
     if (!cards.has(cardId)) {
-      cards.set(cardId, newCodexCard(cardId, run.title, run.startedAt, { runId: run.id, model: run.model ?? codexDefaults.model ?? 'codex' }))
+      cards.set(
+        cardId,
+        newCodexCard(cardId, run.title, run.startedAt, {
+          runId: run.id,
+          model: run.model ?? codexDefaults.model ?? 'codex',
+          binary: codexBinaryLabel(run.codexPath, run.codexVersion),
+        }),
+      )
     }
   }
   startRunPoller($)
@@ -1055,7 +1116,9 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
   }
   const dir = `${root}/${id}`
   const command = harnessCommand(h, { ...input, session: input.resume, cwd, usageFile: `${dir}/usage.json` })
-  const argv = [h.command, ...command.args]
+  // A Codex harness left at the bare `codex` command starts the newest Codex found, like the codex tool.
+  const program = h.preset === 'codex-cli' && h.command === 'codex' ? ((await findCodex($).catch(() => undefined))?.chosen?.path ?? h.command) : h.command
+  const argv = [program, ...command.args]
   await $.fs.write(`${dir}/prompt.txt`, input.prompt)
   await $.fs.write(`${dir}/meta.json`, JSON.stringify(meta, null, 2))
   const isolateProvider = h.parser === 'copilot' && !!h.provider?.baseUrl.trim()
@@ -1963,6 +2026,29 @@ export const register: Register = on => {
     if (!root) return { deny: 'agent-deck: no home directory (USERPROFILE/HOME) to keep Codex runs in.' }
     if (!sessionId) sessionId = await $.session.id()
 
+    const found = await findCodex($)
+    let chosen = found.chosen
+    if (!chosen) {
+      const why = found.find.override
+        ? `the Codex set by hand (${found.find.override}) did not answer --version: ${found.find.candidates[0]?.error ?? 'unknown error'}`
+        : `no Codex CLI found${found.find.error ? ` (${found.find.error})` : ''}. Install it with: ${CODEX_UPDATE_COMMAND}`
+      return { deny: `agent-deck: ${why}` }
+    }
+    const model = input.model ?? codexDefaults.model
+    let problem = codexModelProblem(model, found.find, chosen, codexDefaults.provider)
+    if (problem) {
+      // The list may be ten minutes old: look again once before refusing.
+      const fresh = await findCodex($, { force: true })
+      chosen = fresh.chosen ?? chosen
+      problem = codexModelProblem(model, fresh.find, chosen, codexDefaults.provider)
+      if (problem) return { deny: `agent-deck: not started. ${problem}` }
+    }
+    const note = codexUpdateNote(chosen, (codexFound ?? found).find.latest)
+    if (note && codexNoteShown !== note) {
+      codexNoteShown = note
+      $.ui.toast(`agent-deck: ${note}`)
+    }
+
     const id = await newRunId($)
     const meta: RunMeta = {
       id,
@@ -1974,6 +2060,8 @@ export const register: Register = on => {
       effort: input.effort,
       sandbox: input.sandbox,
       resume: input.resume,
+      codexPath: chosen.path,
+      codexVersion: chosen.version,
     }
     const run: Run = { ...meta, dir: `${root}/${id}`, threadId: input.resume, isFinished: false }
 
@@ -1985,13 +2073,15 @@ export const register: Register = on => {
         runId: id,
         model: input.model ?? codexDefaults.model ?? 'codex',
         effort: input.effort ?? codexDefaults.effort,
+        binary: codexBinaryLabel(chosen.path, chosen.version),
       }),
     )
     startRunPoller($)
 
     return {
       result:
-        `Codex run ${id} started in the background (model ${input.model ?? codexDefaults.model ?? 'default'}). ` +
+        `Codex run ${id} started in the background (model ${input.model ?? codexDefaults.model ?? 'default'}, ${codexBinaryLabel(chosen.path, chosen.version)}). ` +
+        (note ? `Note: ${note}. ` : '') +
         `Its report will arrive as a new message when it finishes; don't wait or poll for it. ` +
         `Continue with other work, or end your turn if there is nothing else to do. codex_result with id "${id}" shows its progress.`,
     }
@@ -2149,6 +2239,7 @@ export const register: Register = on => {
     const view = await read($, viewAtom)
     const hs = await read($, harnessesAtom)
     const found = await read($, foundAtom)
+    const codexBin = await read($, codexBinAtom)
     const isCodexOn = await read($, codexAtom)
     const meters = await read($, metersAtom)
     const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
@@ -2414,6 +2505,7 @@ export const register: Register = on => {
         )
       }
 
+      const stale = staleFor(c, now)
       const t = c.tokens
       const hit = cacheHitPercent(t)
       const modelRow = (
@@ -2450,6 +2542,11 @@ export const register: Register = on => {
             {fullTitle}
           </Text>
           {modelRow}
+          {c.binary && (
+            <Text dimColor wrap="truncate-end">
+              {c.binary}
+            </Text>
+          )}
           {statsRow}
           {c.modelUsage && Object.entries(c.modelUsage).map(([model, u]) => (
             <Text key={`usage-${model}`} dimColor wrap="wrap">
@@ -2479,7 +2576,13 @@ export const register: Register = on => {
               ))}
             </Box>
           )}
-          {isRunning && c.isThinking && (
+          {isRunning && stale && (
+            <Text color="warning" wrap="wrap">
+              ⚠ Nothing new from Codex for {fmtElapsed(stale)}. It may be stuck
+              {c.activity.some(a => a.status === 'running') ? ' on the step still running above' : ''}.
+            </Text>
+          )}
+          {isRunning && !stale && c.isThinking && (
             <Text dimColor italic>
               {spinner} thinking…
             </Text>
@@ -2967,6 +3070,71 @@ export const register: Register = on => {
       if (preset) return openEdit(fromPreset(preset, hs.map(x => x.id)))
     }
 
+    /** Which Codex CLI runs start with: the newest found, or a path set here or in CODEX_PATH. */
+    const codexBinSection = () => {
+      const b = codexBin
+      const note = codexUpdateNote(b.chosen, b.latest)
+      const others = (b.candidates ?? []).filter(c => c.path !== b.chosen?.path)
+      return (
+        <Box flexDirection="column">
+          <Text bold>Codex CLI</Text>
+          {b.at === undefined && !b.isChecking && <Text dimColor>Not checked yet. Look for Codex to see which one runs start with.</Text>}
+          {b.chosen && (
+            <Text wrap="wrap">
+              Runs start with codex-cli {b.chosen.version} · {b.chosen.path}
+              {b.override ? ' (set by hand)' : ' (the newest found)'}
+            </Text>
+          )}
+          {b.at !== undefined && !b.chosen && (
+            <Text color="error" wrap="wrap">
+              {b.override
+                ? `The Codex set by hand (${b.override}) does not run: ${b.candidates?.[0]?.error ?? 'unknown error'}`
+                : `No Codex CLI found. Install it with: ${CODEX_UPDATE_COMMAND}`}
+            </Text>
+          )}
+          {note && (
+            <Text color="warning" wrap="wrap">
+              {note}
+            </Text>
+          )}
+          {b.latest && !note && b.chosen && <Text dimColor>That is the newest published version.</Text>}
+          {b.updateError && (
+            <Text color="error" wrap="wrap">
+              The update failed: {b.updateError}
+            </Text>
+          )}
+          {others.map(c => (
+            <Text key={`cx-c-${c.path}`} dimColor wrap="truncate-end">
+              also: {c.version ? `codex-cli ${c.version}` : c.error} · {c.path}
+            </Text>
+          ))}
+          {Input && (
+            <Input
+              key="cx-path"
+              label="Codex path (blank: the newest found; CODEX_PATH wins)"
+              value={b.override && !b.isEnvOverride ? b.override : ''}
+              submitLabel="save"
+              onSubmit={v =>
+                void (async () => {
+                  await $.store.set(KEY_CODEX_PATH, v.trim())
+                  await findCodex($, { force: true })
+                })()
+              }
+            />
+          )}
+          <Box flexDirection="row" gap={1}>
+            <Button key="cx-find" label={b.isChecking && !b.isUpdating ? 'Looking…' : 'Look again'} onPress={() => void findCodex($, { force: true })} />
+            <Button
+              key="cx-update"
+              label={b.isUpdating ? 'Updating…' : 'Update Codex (npm)'}
+              variant={note ? 'primary' : undefined}
+              onPress={() => void findCodex($, { update: true })}
+            />
+          </Box>
+        </Box>
+      )
+    }
+
     const codexView = () => (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center">
@@ -2996,10 +3164,14 @@ export const register: Register = on => {
           Custom harness: Codex runs through agent_run like the other harnesses, with a command and arguments you edit.
           Only its own runs get cards, and there are no usage meters.
         </Text>
+        {codexBinSection()}
       </Box>
     )
 
-    if (view.mode === 'codex') return codexView()
+    if (view.mode === 'codex') {
+      if (codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
+      return codexView()
+    }
     if (view.mode === 'list') return listView()
     if (view.mode === 'edit') return editView(view)
 
