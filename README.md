@@ -1,6 +1,6 @@
 # agent-deck
 
-A Claude Code mod that puts every background agent in one live **Agents** pane: OpenAI Codex runs, Claude subagents, GitHub Copilot, OpenCode and any other coding-agent CLI you add. The pane also shows your Claude and Codex usage limits and the state of the main conversation's prompt cache, and it can keep that cache warm while you're away.
+A Claude Code mod that puts every background agent in one live **Agents** pane: OpenAI Codex runs, Claude subagents, GitHub Copilot, OpenCode, Google Antigravity and any other coding-agent CLI you add. The pane also shows your Claude and Codex usage limits and the state of the main conversation's prompt cache, and it can keep that cache warm while you're away.
 
 ## What it shows
 
@@ -22,17 +22,18 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
   Finished cards collapse into a list.
 
-## Harnesses: Copilot, OpenCode, Gemini, Cursor and more
+## Harnesses: Copilot, OpenCode, Antigravity, Gemini, Cursor and more
 
 Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the prompt), then click the **⚙** gear at the top right to open its settings. The pane's title shows the version that is running.
 
-- **Add** a harness from a preset (Copilot, OpenCode, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
+- **Add** a harness from a preset (Copilot, OpenCode, Antigravity, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
 - **Edit** a harness's command, arguments, default model, color and output format.
 - **Switch** each harness on or off.
 - **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in one **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. The list comes from:
   - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their price category (low, medium or high);
     it also offers **Auto** and **Copilot Fusion** Standard and Max. Fusion selections, including ones saved by earlier versions of agent-deck, run as `--model auto --auto-tier hydrafusion` or `hydrafusion-max`, with `--experimental`. The CLI checks whether your account supports that profile. A rejected profile or a routing fallback is shown on the card rather than hidden;
   - OpenCode: `opencode models`;
+  - Antigravity: `agy models`, which lists the Gemini, Claude and other models your plan has, one id per effort level (for example `gemini-4-neon-high`);
   - Codex (custom harness): Codex's own model cache;
   - Claude Code: its aliases and current model ids;
   - a harness on your own API: the API's `/models` endpoint.
@@ -75,6 +76,8 @@ Each run's card shows the Codex version and path it started with, and so does it
 
 **When a run fails**, its report and `codex_result` show Codex's actual error, for example `model_not_found`, a usage limit or a sandbox error, not just `codex exited 1`.
 
+**Antigravity** runs Google's Antigravity CLI (`agy`) headless with `--output-format stream-json`. Its card shows each tool step as it runs (a command shows as `$ …`), the reply as it streams, and the tokens of every step, cache reads included. Claude can continue an earlier conversation by passing its id as `agent_run`'s `resume` (agy's `--conversation`). A failed run reports agy's own error, for example an unknown model. Antigravity gives no price, so its cards show tokens without a cost.
+
 **Your own API (BYOK).** Copilot and Claude Code harnesses can send their model calls to an API you choose instead of their own service, the way Copilot's *bring your own key* works: the CLI's agent still runs on your machine, with its tools and file edits, and only the model calls go to your endpoint. Add the **Copilot (own API)** preset, or open any Copilot or Claude Code harness's **Edit** form, and set **Model API**:
 
 - **OpenAI-compatible**: OpenAI, OpenRouter, or a local Ollama, vLLM or LM Studio (`http://127.0.0.1:11434/v1`), with Chat Completions or Responses wire format;
@@ -102,11 +105,26 @@ The arguments are a template. `{prompt}`, `{model}`, `{session}` and `{cwd}` are
 | Copilot (own API) | the same, with a Model API set | Copilot JSON events |
 | OpenCode | `opencode run --format json …` | OpenCode JSON events, including cost |
 | Gemini | `gemini -p {prompt} --output-format stream-json --yolo …` | Gemini stream-json |
+| Antigravity | `agy --output-format stream-json --dangerously-skip-permissions … -p {prompt}` | Antigravity stream-json, including tokens |
 | Cursor | `cursor-agent -p {prompt} --output-format stream-json --force …` | Cursor stream-json |
 | Claude Code | `claude -p {prompt} --output-format stream-json --verbose …` | Claude stream-json |
 | Custom | anything | plain text |
 
-> **Permissions.** The presets run the agents headless with their "allow all tools" flag (`--allow-all-tools`, `--yolo`, `--force`). That lets a background agent edit files and run commands without asking. Narrow the flags in the edit form if you want less, for example Copilot's `--allow-tool` and `--deny-tool`.
+> **Permissions.** The presets run the agents headless with their "allow all tools" flag (`--allow-all-tools`, `--yolo`, `--force`, `--dangerously-skip-permissions`). That lets a background agent edit files and run commands without asking. Narrow the flags in the edit form if you want less, for example Copilot's `--allow-tool` and `--deny-tool`, or Antigravity's `--mode accept-edits` (edits only) or `--mode plan` (read-only) in place of `--dangerously-skip-permissions`.
+
+## Task routing: who does which kind of task
+
+Pick an agent and model for each kind of task, and Claude hands that work to them. For example, implementation goes to Codex, code review to Copilot on Claude Opus, research to Antigravity on Gemini, and UI design to a Claude subagent.
+
+Set it up under ⚙ Settings → **Task routing**:
+
+- The table starts with **implement**, **review**, **research**, **image** and **ui**. Add your own with **Add a task**, for example `tests` or `docs`, and **Remove** the ones you don't need.
+- For each task, pick the **Agent**: any harness, the built-in **Codex**, or a **Claude subagent**. Then pick its **Model**, or leave it at the agent's default. The model list comes from the harness's own model list. Where it has none yet, type the id.
+- The **On/Off** button next to **Task routing** switches routing on or off. `/agent-deck routing on`, `off` and `status` do the same from the prompt.
+
+When routing is on, Claude gets a short note with your picks along with your next message. The note says which agent gets each kind of task, and that Claude keeps quick questions and small edits itself. The note goes out again after a compaction or `/clear`, and again whenever you change a pick. When you switch routing off, Claude is told so with your next message. Claude starts a routed harness with `agent_run` and the task's name (`task: "review"`), and agent-deck fills in the harness and model. An explicit harness or model that Claude passes still wins.
+
+A task routed to an agent that is switched off or missing shows a warning in the table. If Claude tries it, the run doesn't start, and Claude is told to ask you before using another agent.
 
 ## Install
 
@@ -126,7 +144,7 @@ In the desktop app, click **+** next to the prompt box, then **Plugins**, **Add 
 
 **Requirements**
 - **Node.js on your PATH.** It runs the Codex watcher and the background runner.
-- **The agent CLIs you want to use**, installed and signed in: `codex`, `copilot`, `opencode`, and so on.
+- **The agent CLIs you want to use**, installed and signed in: `codex`, `copilot`, `opencode`, `agy`, and so on. Sign in to Antigravity once by running `agy` in a terminal.
 - **The GitHub CLI (`gh`), signed in,** for the Copilot usage meter.
 
 ## Update
@@ -148,6 +166,7 @@ Then restart Claude Code, or run `/reload-plugins`. At the prompt, `/plugin` →
 | Command | What it does |
 | --- | --- |
 | `/agent-deck` | Opens the Agents pane |
+| `/agent-deck routing [on \| off \| status]` | Switches task routing on or off, or lists who does each task |
 | `/keepwarm [2h \| 90m \| off \| status]` | Keeps the prompt cache warm for a window (bare: 2h) |
 | `/cache [status \| guard refuse \| guard warn \| guard off]` | Shows the cache state and sets the cold-send guard |
 
@@ -164,6 +183,8 @@ Then restart Claude Code, or run `/reload-plugins`. At the prompt, `/plugin` →
 ## Credits
 
 The prompt-cache status, keep-warm and cold-send guard follow the idea of [**cache-tax** by karanb192](https://github.com/karanb192/cache-tax). Thanks for the inspiration.
+
+The Antigravity harness builds on what [**antigravity-for-claude-code** by yuting0624](https://github.com/yuting0624/antigravity-for-claude-code) (MIT) worked out about running `agy` headless: the prompt as `-p`'s value at the end, stdin detached, `--dangerously-skip-permissions` for unattended runs, and `--conversation` to resume. Thanks!
 
 ## Development
 

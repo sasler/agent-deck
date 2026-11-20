@@ -7,7 +7,8 @@
 //
 //   acp     the CLI's Agent Client Protocol server (copilot --acp --stdio): session/new
 //           answers with availableModels
-//   lines   a command that prints one model per line (opencode models)
+//   lines   a command that prints one model per line (opencode models), optionally
+//           followed by a tab and its display name (agy models)
 //   codex   Codex's own cache, ~/.codex/models_cache.json
 //   api     the provider's /models endpoint (OpenAI-compatible, Azure or Anthropic)
 import { spawn } from 'node:child_process'
@@ -110,9 +111,14 @@ const fromLines = () =>
     child.stdout.on('data', d => (out += d))
     child.stderr.on('data', d => (errText += d))
     child.on('close', code => {
-      const ids = out.split(/\r?\n/).map(l => l.trim()).filter(l => l && !/\s/.test(l))
-      if (code !== 0 && !ids.length) return reject(new Error(errText.trim().split('\n').pop() || `${spec.command} exited ${code}`))
-      resolve(ids.map(id => ({ id })))
+      // "id" or "id<TAB>Display name"; anything else with spaces (a banner) is not a model.
+      const models = out
+        .split(/\r?\n/)
+        .map(l => /^(\S+)(?:\t+(.*\S))?$/.exec(l.trim()))
+        .filter(Boolean)
+        .map(([, id, name]) => (name && name !== id ? { id, name } : { id }))
+      if (code !== 0 && !models.length) return reject(new Error(errText.trim().split('\n').pop() || `${spec.command} exited ${code}`))
+      resolve(models)
     })
   })
 

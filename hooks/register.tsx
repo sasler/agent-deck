@@ -1,10 +1,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Tokens } from '../types'
+import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
   CODEX_UPDATE_COMMAND,
+  DEFAULT_ROUTING,
+  DEFAULT_TASKS,
+  loadRouting,
+  resolveRun,
+  routeProblem,
+  routedTasks,
+  routingContext,
+  routingNote,
+  taskHint,
+  taskSlug,
   PARSERS,
   PRESETS,
   PROVIDER_TYPES,
@@ -71,6 +81,7 @@ const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, f
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
 const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot'] }
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
+const routingAtom = atom({ plugin: 'agent-deck', key: 'routing' } as const, DEFAULT_ROUTING)
 const COPILOT_ACCENT = '#8957E5'
 
 type $T = EngineInterface
@@ -924,7 +935,7 @@ const detectHarnesses = async ($: $T, list: readonly Harness[]) => {
 }
 
 const registerAgentTools = async ($: $T) => {
-  for (const spec of [agentRunSpec(harnessList.filter(h => h.isEnabled)), AGENT_RESULT_SPEC]) {
+  for (const spec of [agentRunSpec(harnessList.filter(h => h.isEnabled), routedTasks(routing, harnessList, codexOn)), AGENT_RESULT_SPEC]) {
     await $.tool.register(spec).catch(err =>
       $.ui.toast(`agent-deck: ${spec.name} tool not registered: ${String((err as Error)?.message ?? err)}`),
     )
@@ -1163,7 +1174,29 @@ const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: 
   }
 }
 
-type AgentRunInput = CopilotRunOptions & { harness: string; prompt: string; title?: string; cwd?: string; resume?: string }
+type AgentRunInput = CopilotRunOptions & { harness: string; task?: string; prompt: string; title?: string; cwd?: string; resume?: string }
+
+// ---------- task routing: who does which kind of task ----------
+
+const KEY_ROUTING = 'routing'
+let routing: Routing = DEFAULT_ROUTING
+/** The routing note the main thread has now; cleared by a compaction or /clear, so it is sent again. */
+let routingSent: string | undefined
+
+async function loadRoutingSetting($: $T) {
+  routing = loadRouting(await $.store.get(KEY_ROUTING))
+  await update($, routingAtom, () => routing)
+}
+
+async function saveRouting($: $T, next: Routing) {
+  routing = next
+  await $.store.set(KEY_ROUTING, next)
+  await update($, routingAtom, () => next)
+  await registerAgentTools($)
+}
+
+/** The note the main thread should have now. */
+const currentRoutingNote = () => routingNote(routedTasks(routing, harnessList, codexOn))
 
 // ---------- Copilot's AI credits, and which meters show ----------
 
@@ -1240,6 +1273,7 @@ async function setCodexEnabled($: $T, on: boolean) {
   codexOn = on
   await $.store.set(KEY_CODEX, on)
   await update($, codexAtom, () => on)
+  await registerAgentTools($)
   if (on) {
     await registerCodexTools($)
     await startCodexWatcher($)
@@ -1736,6 +1770,7 @@ const registerCache = (on: On) => {
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
     gen++
+    if (e.source === 'clear' || e.source === 'compact') routingSent = undefined
     if (e.source === 'clear') {
       const keepGuard = s.guard
       disarm()
@@ -1807,23 +1842,32 @@ const registerCache = (on: On) => {
   })
 
   // The guard: only the first character of the prompt is read, for a slash.
+  // A prompt that goes through also carries the task-routing note when the model doesn't have it yet.
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'plugin' || s.guard === 'off') return next(e)
-    if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
+    const want = currentRoutingNote()
+    const extra = routingContext(want, routingSent)
+    const pass = async () => {
+      if (!extra) return next(e)
+      const r = await next({ ...e, context: [...(e.context ?? []), extra] })
+      if (!r.drop) routingSent = want
+      return r
+    }
+    if (e.origin.kind === 'plugin' || s.guard === 'off') return pass()
+    if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return pass()
     const now = await $.clock.now()
-    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
+    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return pass()
     const isUnattended = UNATTENDED.has(e.origin.kind)
     if (s.guard === 'warn' || isUnattended) {
       $.ui.log(`agent-deck: ${guardText(now)}. Sending anyway${isUnattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}.`)
       isColdWritePending = true
-      return next(e)
+      return pass()
     }
     if (s.ackedAt === s.lastRequestAt) {
       s.ackedAt = 0
       s.held = undefined
       isColdWritePending = true
       await save($)
-      return next(e)
+      return pass()
     }
     s.ackedAt = s.lastRequestAt
     // Attachments can't be sent again by a plugin, so a prompt with any is only refused.
@@ -1836,12 +1880,31 @@ const registerCache = (on: On) => {
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     if (!e.agentId) {
+      routingSent = undefined
       markReset()
       s.ctx = 0
       await arm($)
     }
     return r
   })
+}
+
+/** `/agent-deck routing on|off|status`. */
+async function routingCommand($: $T, word: string | undefined): Promise<string> {
+  if (word === 'on' || word === 'off') await saveRouting($, { ...routing, isOn: word === 'on' })
+  else if (word && word !== 'status') return '/agent-deck routing takes on, off or status.'
+  const routes = routedTasks({ ...routing, isOn: true }, harnessList, codexOn)
+  const lines = routing.routes.map(r => {
+    const problem = routeProblem(r, harnessList, codexOn)
+    const to = !r.target ? 'not set' : r.target === 'codex' ? 'Codex (built in)' : r.target === 'claude' ? 'Claude subagent' : (harnessList.find(h => h.id === r.target)?.name ?? r.target)
+    return `  ${r.task}: ${to}${r.model ? ` · ${r.model}` : ''}${problem ? ` (can't run: ${problem})` : ''}`
+  })
+  const head = routing.isOn
+    ? routes.length
+      ? 'Task routing is on. Claude hears these picks with your next message:'
+      : 'Task routing is on, but no task has an agent yet. Set them under ⚙ Settings → Task routing.'
+    : 'Task routing is off. Claude places work as usual.'
+  return [head, ...lines].join('\n')
 }
 
 // ---------- the module ----------
@@ -1862,6 +1925,8 @@ export const register: Register = on => {
     // Registered before next(e) so the tools are listed from the first turn.
     await loadCodexEnabled($).catch(() => undefined)
     if (codexOn) await registerCodexTools($)
+    await loadRoutingSetting($).catch(() => undefined)
+    routingSent = undefined
     await loadHarnesses($).catch(err => $.ui.toast(`agent-deck: harnesses not loaded: ${String((err as Error)?.message ?? err)}`))
     const started = await next(e)
     sessionId = await $.session.id()
@@ -1871,7 +1936,11 @@ export const register: Register = on => {
       cards.set(c.id, isStale ? { ...c, status: 'aborted' } : c)
       if (c.threadId) threadToCard.set(c.threadId, c.id)
     }
-    await $.command.register({ name: 'agent-deck', description: 'Open the Agents pane (Codex, Claude subagents and other harnesses)' })
+    await $.command.register({
+      name: 'agent-deck',
+      description: 'Open the Agents pane; routing on|off|status switches task routing (agent-deck)',
+      argumentHint: '[routing on | routing off | routing status]',
+    })
     const home = await codexHome($)
     if (home) {
       const toml = await readText($, `${home}/config.toml`)
@@ -1909,10 +1978,13 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'agent-deck' }, async $ => {
+  on('command.run', { command: 'agent-deck' }, async ($, e) => {
+    const words = String(e.args ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+    if (words[0] === 'routing') return { text: await routingCommand($, words[1]) }
     await $.ui.open({ id: PANE, title: await paneTitle($) })
     return { text: 'Agent Deck pane opened.' }
   }).catch(() => ({ text: 'agent-deck: could not open the pane.' }))
+
 
   on('turn.complete', async ($, e, next) => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
@@ -2113,7 +2185,10 @@ export const register: Register = on => {
   // ---- other harnesses ----
 
   on('tool.call', { tool: 'mcp__agent-deck__agent_run' }, async ($, e) => {
-    const input = e as unknown as AgentRunInput
+    const asked = e as unknown as AgentRunInput
+    const resolved = resolveRun(asked, routing, harnessList, codexOn)
+    if ('error' in resolved) return { deny: `agent-deck: ${resolved.error}` }
+    const input: AgentRunInput = { ...asked, harness: resolved.harness, model: resolved.model, title: asked.title ?? (asked.task && !asked.harness ? `${taskSlug(asked.task)}: ${asked.prompt.replace(/\s+/g, ' ').slice(0, 50)}` : undefined) }
     const h = harnessList.find(x => x.id === input.harness)
     if (!h) {
       const ids = harnessList.filter(x => x.isEnabled).map(x => x.id)
@@ -2242,6 +2317,7 @@ export const register: Register = on => {
     const codexBin = await read($, codexBinAtom)
     const isCodexOn = await read($, codexAtom)
     const meters = await read($, metersAtom)
+    const routingState = await read($, routingAtom)
     const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
     // Surfaces that draw SVG get thick bars; the terminal keeps its text meters.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
@@ -2696,6 +2772,7 @@ export const register: Register = on => {
             Adding and editing harnesses needs the desktop app or the terminal.
           </Text>
         )}
+        {routingSection()}
         {metersSection()}
       </Box>
     )
@@ -3004,6 +3081,117 @@ export const register: Register = on => {
     const shown = new Set((['codex', 'claude', 'copilot'] as const).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
 
     const METER_NAMES: Record<MeterProvider, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot' }
+    // ---- task routing: a target and model per kind of task, and the switch that tells Claude ----
+
+    const targetName = (t: string) =>
+      !t ? 'not set' : t === 'codex' ? 'Codex (built in)' : t === 'claude' ? 'Claude subagent' : (hs.find(h => h.id === t)?.name ?? t)
+
+    const setRoute = (task: string, patch: Partial<TaskRoute>) =>
+      saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
+
+    const routeModel = (r: TaskRoute) => {
+      const h = hs.find(x => x.id === r.target)
+      const known: { value: string; label: string }[] =
+        r.target === 'claude'
+          ? ['opus', 'sonnet', 'haiku'].map(m => ({ value: m, label: m }))
+          : (h?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
+      if (!r.target) return undefined
+      if (Select && known.length) {
+        const options = [
+          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${h?.model ? ` (${h.model})` : ''}` },
+          ...known,
+          ...(r.model && !known.some(k => k.value === r.model) ? [{ value: r.model, label: r.model }] : []),
+        ]
+        return <Select key={`r-model-${r.task}`} label="Model" options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
+      }
+      return (
+        Input && (
+          <Input
+            key={`r-model-${r.task}`}
+            label="Model"
+            value={r.model ?? ''}
+            placeholder={h?.model ?? 'default'}
+            submitLabel="keep"
+            onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
+          />
+        )
+      )
+    }
+
+    const routeRow = (r: TaskRoute) => {
+      const problem = routeProblem(r, hs, isCodexOn)
+      const hint = taskHint(r.task)
+      const targets = [
+        { value: '', label: 'Not set' },
+        { value: 'claude', label: 'Claude subagent' },
+        { value: 'codex', label: `Codex (built in)${isCodexOn ? '' : ' · off'}` },
+        ...hs.map(h => ({ value: h.id, label: `${h.name}${h.isEnabled ? '' : ' · off'}` })),
+        ...(r.target && r.target !== 'claude' && r.target !== 'codex' && !hs.some(h => h.id === r.target) ? [{ value: r.target, label: `${r.target} · missing` }] : []),
+      ]
+      return (
+        <Box key={`r-${r.task}`} flexDirection="column" gap={0}>
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+            <Text wrap="truncate-end">
+              <Text bold>{r.task}</Text>
+              {hint && <Text dimColor> {hint}</Text>}
+            </Text>
+            {Select && <Button key={`r-remove-${r.task}`} label="Remove" plain dimColor onPress={() => void saveRouting($, { ...routingState, routes: routingState.routes.filter(x => x.task !== r.task) })} />}
+          </Box>
+          {Select ? (
+            <Box flexDirection="column" gap={0}>
+              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined })} />
+              {routeModel(r)}
+            </Box>
+          ) : (
+            <Text dimColor>{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}`}</Text>
+          )}
+          {problem && <Text color="warning">{`Can't run: ${problem}.`}</Text>}
+        </Box>
+      )
+    }
+
+    const routingSection = () => {
+      const isOn = routingState.isOn
+      const missing = DEFAULT_TASKS.filter(t => !routingState.routes.some(r => r.task === t.task))
+      return (
+        <Box flexDirection="column" gap={1} marginTop={1}>
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+            <Text bold>Task routing</Text>
+            <Button key="r-toggle" label={isOn ? 'On' : 'Off'} variant={isOn ? 'primary' : undefined} onPress={() => void saveRouting($, { ...routingState, isOn: !isOn })} />
+          </Box>
+          <Text dimColor wrap="wrap">
+            {isOn
+              ? 'On: Claude hands each kind of task to the agent you pick here, and keeps quick questions and small edits itself. Changes reach Claude with your next message.'
+              : 'Off: Claude places work as usual. Pick an agent for each kind of task, then switch this on, here or with /agent-deck routing on.'}
+          </Text>
+          {routingState.routes.map(routeRow)}
+          {routingState.routes.length === 0 && <Text dimColor>No tasks yet.</Text>}
+          {Input && (
+            <Input
+              key="r-add"
+              label="Add a task"
+              value=""
+              placeholder="for example tests or docs"
+              submitLabel="add"
+              onSubmit={v => {
+                const task = taskSlug(v)
+                if (task && !routingState.routes.some(r => r.task === task)) void saveRouting($, { ...routingState, routes: [...routingState.routes, { task, target: '' }] })
+              }}
+            />
+          )}
+          {Select && missing.length > 0 && (
+            <Button
+              key="r-defaults"
+              label={`Add back ${missing.map(t => t.task).join(', ')}`}
+              plain
+              dimColor
+              onPress={() => void saveRouting($, { ...routingState, routes: [...routingState.routes, ...missing.map(t => ({ task: t.task, target: '' }))] })}
+            />
+          )}
+        </Box>
+      )
+    }
+
     const metersSection = () => (
       <Box flexDirection="column" gap={1} marginTop={1}>
         <Text bold>Usage meters</Text>

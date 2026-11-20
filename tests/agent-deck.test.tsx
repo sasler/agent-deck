@@ -23,7 +23,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { PRESETS, agentRunSpec, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, loadRouting, resolveRun, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -592,6 +592,7 @@ test('each harness has a way to list its models', () => {
   expect(modelQuery(of('opencode'))).toEqual({ query: { source: 'lines', command: 'opencode', args: ['models'] } })
   expect(modelQuery(of('codex-cli'))).toEqual({ query: { source: 'codex' } })
   expect('models' in (modelQuery(of('claude-cli')) ?? {})).toBe(true)
+  expect(modelQuery(of('antigravity'))).toEqual({ query: { source: 'lines', command: 'agy', args: ['models'] } })
   expect(modelQuery(of('gemini'))).toBeUndefined()
   const provider = { type: 'openai' as const, baseUrl: 'http://127.0.0.1:11434/v1' }
   expect(modelQuery({ ...of('copilot'), provider })).toEqual({ query: { source: 'api', provider } })
@@ -707,6 +708,43 @@ test('Copilot JSON events fill a card', () => {
   expect(card.aiCredits).toBe(0.17436825)
   expect(card.sessionRef).toBe('67e5')
   expect(final).toBe('done')
+})
+
+test('Antigravity stream-json events fill a card', () => {
+  const card = { id: 'a', provider: 'harness', title: 't', model: 'Antigravity', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  const lines = [
+    '{"event":"init","conversation_id":"08db","init":{"model":"gemini-3.8-flash-low","cwd":"C:\\\\p","tools":["run_command"],"permission_mode":"always-proceed"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":0,"state":"DONE","step_type":"user_input"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":8988,"output_tokens":119,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":9107}}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"},"output":"hi"}}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"f.txt"}}}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":4,"state":"ACTIVE","step_type":"agent_response","text_delta":"It says"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"08db","step_index":4,"state":"DONE","step_type":"agent_response","text_delta":" hello\\n","usage":{"input_tokens":2336,"output_tokens":99,"thinking_tokens":5,"cache_read_tokens":6942,"total_tokens":2435}}}',
+    '{"event":"result","result":{"conversation_id":"08db","status":"SUCCESS","response":"It says hello\\n","num_turns":1,"usage":{"input_tokens":11324,"output_tokens":218}}}',
+  ]
+  let final = ''
+  for (const l of lines) for (const ev of parseLine('antigravity', l)) ev.kind === 'final' ? (final = ev.text) : applyHarnessEvent(card, ev)
+  expect(card.model).toBe('gemini-3.8-flash-low')
+  expect(card.sessionRef).toBe('08db')
+  expect(card.activity).toEqual([
+    { id: 'step:2', label: '$ echo hi', status: 'done' },
+    { id: 'step:3', label: 'read_file f.txt', status: 'running' },
+  ])
+  expect(card.output).toBe('It says hello\n')
+  expect(card.tokens).toEqual({ input: 11324, output: 218, cacheRead: 6942, cacheWrite: 0, reasoning: 5 })
+  expect(final).toBe('It says hello\n')
+})
+
+test('an Antigravity error result shows its first line', () => {
+  const evs = parseLine('antigravity', '{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection: model nope is not recognized\\nAvailable models:\\n  Gemini 4 Neon (High)","finished_reason":"error"}}')
+  expect(evs).toEqual([{ kind: 'error', text: 'invalid model selection: model nope is not recognized' }])
+  const h = fromPreset(PRESETS.find(p => p.id === 'antigravity')!)
+  expect(harnessArgs(h, { prompt: '-x', model: 'gemini-4-neon-high', session: 'abc' })).toEqual([
+    '--output-format', 'stream-json', '--disable-slash-commands', '--dangerously-skip-permissions',
+    '--model', 'gemini-4-neon-high', '--conversation', 'abc', '-p', '-x',
+  ])
+  expect(harnessArgs(h, { prompt: 'hi' })).toEqual(['--output-format', 'stream-json', '--disable-slash-commands', '--dangerously-skip-permissions', '-p', 'hi'])
 })
 
 test('a reloaded Copilot run rebuilds its final per-model usage from events', async ($, on) => {
@@ -1191,4 +1229,137 @@ test('a long Codex tool call shows as running, and a quiet card says it may be s
   expect(staleFor(card, 2000 + 16 * 60_000)).toBe(16 * 60_000)
   card.status = 'done'
   expect(staleFor(card, 2000 + 16 * 60_000)).toBeUndefined()
+})
+
+// ---------- task routing ----------
+
+const routedCopilot = () => ({ ...fromPreset(PRESETS.find(p => p.id === 'copilot')!), model: 'gpt-6-luna' })
+
+test('task routing: stored values, routes that can run, and the note', () => {
+  expect(loadRouting(undefined)).toEqual(DEFAULT_ROUTING)
+  expect(loadRouting({ isOn: true, routes: [{ task: 'Code Review', target: 'copilot', model: 'x' }, { task: 'code-review', target: 'y' }, { task: 3 }] })).toEqual({
+    isOn: true,
+    routes: [{ task: 'code-review', target: 'copilot', model: 'x' }],
+  })
+  const hs = [routedCopilot(), { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), isEnabled: false }]
+  const routing = {
+    isOn: true,
+    routes: [
+      { task: 'review', target: 'copilot', model: 'claude-opus-5-5' },
+      { task: 'implement', target: 'codex' },
+      { task: 'research', target: 'antigravity' },
+      { task: 'ui', target: 'claude', model: 'opus' },
+      { task: 'image', target: '' },
+    ],
+  }
+  expect(routeProblem(routing.routes[2]!, hs, true)).toBe('Antigravity is switched off')
+  expect(routeProblem(routing.routes[1]!, hs, false)).toBe('the built-in Codex is off')
+  const routes = routedTasks(routing, hs, true)
+  expect(routes.map(r => r.task)).toEqual(['review', 'implement', 'ui'])
+  expect(routedTasks({ ...routing, isOn: false }, hs, true)).toEqual([])
+  const note = routingNote(routes)!
+  expect(note).toMatch(/review \(reviewing a diff, branch or pull request\): agent_run with task "review" \(Copilot, model claude-opus-5-5\)/)
+  expect(note).toMatch(/implement \(writing or changing code\): the codex tool\./)
+  expect(note).toMatch(/ui \(UI and visual design\): a Claude subagent \(the Agent tool, model opus\)/)
+  expect(routingNote([])).toBeUndefined()
+  expect(routingContext(note, undefined)).toBe(note)
+  expect(routingContext(note, note)).toBeUndefined()
+  expect(routingContext(undefined, note)).toBe(ROUTING_OFF_NOTE)
+  expect(routingContext(undefined, undefined)).toBeUndefined()
+
+  const spec = agentRunSpec(hs.filter(h => h.isEnabled), routes)
+  const props = (spec.inputSchema as { properties: Record<string, { enum?: string[] }>; required: string[] })
+  expect(props.properties.task?.enum).toEqual(['review'])
+  expect(props.required).toEqual(['prompt'])
+  expect(spec.description).toMatch(/review → copilot claude-opus-5-5/)
+  expect((agentRunSpec(hs, []).inputSchema as { required: string[] }).required).toEqual(['harness', 'prompt'])
+})
+
+test('task routing: agent_run picks the harness and model from the task', () => {
+  const hs = [routedCopilot()]
+  const routing = { isOn: true, routes: [{ task: 'review', target: 'copilot', model: 'claude-opus-5-5' }, { task: 'implement', target: 'codex', model: 'gpt-6' }, { task: 'ui', target: 'claude' }] }
+  expect(resolveRun({ task: 'review' }, routing, hs, true)).toEqual({ harness: 'copilot', model: 'claude-opus-5-5' })
+  expect(resolveRun({ task: 'review', model: 'gpt-6-luna' }, routing, hs, true)).toEqual({ harness: 'copilot', model: 'gpt-6-luna' })
+  expect(resolveRun({ task: 'review', harness: 'opencode' }, routing, hs, true)).toEqual({ harness: 'opencode', model: undefined })
+  expect(resolveRun({ harness: 'copilot' }, routing, hs, true)).toEqual({ harness: 'copilot', model: undefined })
+  expect(resolveRun({ task: 'implement' }, routing, hs, true)).toEqual({ error: expect.stringMatching(/use the codex tool with model gpt-6/) })
+  expect(resolveRun({ task: 'ui' }, routing, hs, true)).toEqual({ error: expect.stringMatching(/use the Agent tool\./) })
+  expect(resolveRun({ task: 'implement' }, routing, hs, false)).toEqual({ error: expect.stringMatching(/built-in Codex is off.*ask before/) })
+  expect(resolveRun({ task: 'docs' }, routing, hs, true)).toEqual({ error: expect.stringMatching(/No route for the task "docs"/) })
+  expect(resolveRun({ task: 'review' }, { ...routing, isOn: false }, hs, true)).toEqual({ error: expect.stringMatching(/task routing is off/) })
+})
+
+test('task routing: the note goes with the first prompt, again after a compaction, and an off note follows', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [routedCopilot()], 'codex-enabled': false, routing: { isOn: true, routes: [{ task: 'review', target: 'copilot' }] } })
+  on('session.id', () => ({ value: 'sid-route' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const seen: (readonly string[] | undefined)[] = []
+  on('prompt.submit', (_$, e) => {
+    seen.push(e.context)
+    return { text: e.text }
+  })
+  on('session.compact', (_$, e) => ({ messages: (e as { messages?: unknown[] }).messages ?? [] }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  const send = (text: string) => $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
+  await send('review my branch')
+  await send('and then?')
+  expect(seen[0]?.join('\n')).toMatch(/task routing is on[\s\S]*agent_run with task "review" \(Copilot\)/)
+  expect(seen[1] ?? []).toEqual([])
+
+  await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as never)
+  await send('after compaction')
+  expect(seen[2]?.join('\n')).toMatch(/task routing is on/)
+
+  const r = await $.command.run({ command: 'agent-deck', args: 'routing off', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(JSON.stringify(r)).toMatch(/Task routing is off/)
+  await send('now off')
+  expect(seen[3]).toEqual([ROUTING_OFF_NOTE])
+  await send('still off')
+  expect(seen[4] ?? []).toEqual([])
+
+  const status = await $.command.run({ command: 'agent-deck', args: 'routing on', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+  expect(JSON.stringify(status)).toMatch(/review: Copilot/)
+  const denied = JSON.stringify(await $.tool.call({ tool: 'mcp__agent-deck__agent_run', tool_use_id: 'r-1', task: 'docs', prompt: 'write docs' } as never).catch(e => String(e)))
+  expect(denied).toMatch(/No route for the task/)
+})
+
+test('the Task routing section switches routing and picks an agent per task', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [routedCopilot()] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Task routing/ })).toBeDefined()
+  expect(await ui.find({ text: /^Off: Claude places work as usual/ })).toBeDefined()
+  await ui.select({ key: 'r-target-review', value: 'copilot' })
+  await ui.redraw()
+  await ui.press({ key: 'r-toggle' } as never)
+  await ui.redraw()
+  expect((await ui.findAll({ type: 'Button' } as never)).some(b => (b as { key?: string; text?: string }).key === 'r-toggle' && (b as { text?: string }).text === 'On')).toBe(true)
+  expect(await ui.find({ text: /^On: Claude hands each kind of task/ })).toBeDefined()
+  await ui.input({ key: 'r-add', text: 'Write Tests', kind: 'submit' } as never)
+  await ui.redraw()
+  expect(await ui.find({ key: 'r-target-write-tests' })).toBeDefined()
+  await ui.press({ key: 'r-remove-image' } as never)
+  await ui.redraw()
+  expect(await ui.find({ key: 'r-target-image' })).toBeUndefined()
+  expect(await ui.find({ text: /Add back image/ })).toBeDefined()
+  await ui.unmount()
 })
