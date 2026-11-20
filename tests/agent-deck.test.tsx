@@ -23,7 +23,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, loadRouting, resolveRun, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, loadRouting, resolveRun, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -656,7 +656,7 @@ test('the edit form lists a harness\'s models and picks one', async ($, on) => {
   // A fixed list fills in as the form opens: one dropdown, no extra field.
   const options = (await ui.find({ key: 'h-model-pick' }))?.props.options
   if (!Array.isArray(options)) throw new Error('Model picker has no options')
-  expect(options.map((o: unknown) => o && typeof o === 'object' && 'value' in o ? o.value : undefined)).toEqual(['', 'opus', 'sonnet', 'haiku', 'claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', '__other__'])
+  expect(options.map((o: unknown) => o && typeof o === 'object' && 'value' in o ? o.value : undefined)).toEqual(['', 'opus', 'sonnet', 'haiku', 'claude-fable-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', '__other__'])
   expect(await ui.find({ key: 'h-model' } as never)).toBeUndefined()
   await ui.select({ key: 'h-model-pick', value: 'claude-sonnet-5-5' })
   await ui.redraw()
@@ -1395,5 +1395,36 @@ test('a routed harness with a model list offers its models in the Task routing t
   await ui.redraw()
   expect(((await ui.find({ key: 'r-model-research' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('gemini-4-neon-high')
   expect(await ui.find({ key: 'h-done' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('routed tasks offer named Claude models, the Codex model list and a harness list', () => {
+  expect(routeModelChoices('claude', undefined).map(c => c.label)).toEqual(['Fable 5.2', 'Opus 5.5', 'Sonnet 5.5', 'Haiku 5.5'])
+  expect(routeModelChoices('claude', undefined).map(c => c.value)).toEqual(['fable', 'opus', 'sonnet', 'haiku'])
+  expect(routeModelChoices('codex', undefined, ['gpt-6.1-terra'])).toEqual([{ value: 'gpt-6.1-terra', label: 'gpt-6.1-terra' }])
+  const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  expect(routeModelChoices('antigravity', agy)).toEqual([{ value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High) (gemini-4-neon-high)' }])
+})
+
+test('the routing switch sits next to Settings in the main view', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  const label = async (key: string) => ((await ui.findAll({ type: 'Button' } as never)) as { key?: string; text?: string }[]).find(b => b.key === key)?.text
+  expect(await label('r-toggle-main')).toBe('Routing off')
+  await ui.press({ key: 'r-toggle-main' } as never)
+  await ui.redraw()
+  expect(await label('r-toggle-main')).toBe('Routing on')
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  expect(await label('r-toggle')).toBe('On')
   await ui.unmount()
 })
