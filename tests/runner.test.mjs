@@ -234,3 +234,18 @@ test('model lister reads "id<TAB>name" lines and skips banners', t => {
   assert.ifError(result.error)
   assert.deepEqual(JSON.parse(result.stdout), { models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }, { id: 'plain-id' }] })
 })
+
+test('runner says a missing working folder is missing, not that the program is', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-test-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const dir = path.join(root, 'run')
+  fs.mkdirSync(dir)
+  const cwd = path.join(root, 'no-such-folder')
+  fs.writeFileSync(path.join(dir, 'spec.json'), JSON.stringify({ argv: [process.execPath, '-e', ''], cwd, parser: 'text' }))
+  const result = spawnSync(process.execPath, [runner, dir], { encoding: 'utf8', timeout: 10_000, env: { ...process.env, AGENT_DECK_DETACHED: '1' } })
+  assert.ifError(result.error)
+  assert.equal(fs.readFileSync(path.join(dir, 'exit.txt'), 'utf8'), '127')
+  const stderr = fs.readFileSync(path.join(dir, 'stderr.log'), 'utf8')
+  assert.match(stderr, /the working folder .*no-such-folder does not exist/)
+  assert.doesNotMatch(stderr, /ENOENT/)
+})

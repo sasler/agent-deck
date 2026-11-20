@@ -79,6 +79,12 @@ if (usageFile) {
     if (e?.code !== 'ENOENT') usageStatError = true
   }
 }
+// Node reports a missing working folder as ENOENT on the program, which reads as "not installed".
+if (spec.cwd && !fs.statSync(spec.cwd, { throwIfNoEntry: false })?.isDirectory()) {
+  fs.writeSync(err, `agent-deck: the working folder ${spec.cwd} does not exist; ${command} was not started. Create it, or pass another cwd.\n`)
+  fs.writeFileSync(path.join(dir, 'exit.txt'), '127')
+  process.exit(0)
+}
 let child
 try {
   const argv = launchArgv(command, args)

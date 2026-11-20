@@ -23,7 +23,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, loadRouting, resolveRun, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, resolveRun, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -1426,5 +1426,72 @@ test('the routing switch sits next to Settings in the main view', async ($, on) 
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
   expect(await label('r-toggle')).toBe('On')
+  await ui.unmount()
+})
+
+const AGY_QUOTA = {
+  response: {
+    groups: [
+      {
+        displayName: 'Gemini Models',
+        buckets: [
+          { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.9842, resetTime: '2026-11-27T13:51:35Z' },
+          { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9758, resetTime: '2026-11-20T18:51:35Z' },
+        ],
+      },
+      { displayName: 'Claude and GPT models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1, resetTime: '2026-11-20T19:54:37Z' }] },
+      { displayName: 'Gemini 4 Argon', buckets: [{ bucketId: 'gemini-argon-wtu-weekly', window: 'weekly', remainingFraction: 0.5 }] },
+    ],
+  },
+}
+
+test("Antigravity's quota summary becomes used-percent meters per model group", () => {
+  expect(agyLimits(AGY_QUOTA)).toEqual([
+    { label: 'Gemini 7d', name: 'Gemini · Weekly limit', percent: 1.6, resetsAt: Date.parse('2026-11-27T13:51:35Z') },
+    { label: 'Gemini 5h', name: 'Gemini · 5-hour limit', percent: 2.4, resetsAt: Date.parse('2026-11-20T18:51:35Z') },
+    { label: 'Claude & GPT 5h', name: 'Claude & GPT · 5-hour limit', percent: 0, resetsAt: Date.parse('2026-11-20T19:54:37Z') },
+    { label: 'Gemini 4 Argon 7d', name: 'Gemini 4 Argon · Weekly limit', percent: 50, resetsAt: undefined },
+  ])
+  expect(agyLimits({})).toEqual([])
+  expect(agyLimits({ response: { groups: [{ displayName: 'X', buckets: [{ window: '5h' }] }] } })).toEqual([])
+})
+
+test('an Antigravity harness brings its usage meters into the pane, and keeps the quota session', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on, { harnesses: [fromPreset(PRESETS.find(p => p.id === 'antigravity')!)], 'codex-enabled': false, 'agy-quota-session': 'saved-1' })
+  on('session.id', () => ({ value: 'sid-agy' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  const quotaCalls: string[][] = []
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[]; command?: string[] }).argv ?? (e as { command?: string[] }).command ?? []
+    if (argv.some(a => a.endsWith('agy-quota.mjs'))) {
+      quotaCalls.push(argv.slice(2))
+      return { value: { exitCode: 0, stdout: JSON.stringify({ sessionId: 'saved-2', quota: AGY_QUOTA }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.redraw()
+  expect(quotaCalls[0]).toEqual(['agy', 'saved-1'])
+  expect(await ui.find({ text: /^Antigravity$/ })).toBeDefined()
+  expect(await ui.find({ text: /Gemini · Weekly limit/ })).toBeDefined()
+  expect(await ui.find({ text: /Gemini 4 Argon · Weekly limit/ })).toBeDefined()
+  // The next check reopens the session the last one reported.
+  await clock.advance(10 * 60_000)
+  expect(quotaCalls.at(-1)).toEqual(['agy', 'saved-2'])
   await ui.unmount()
 })

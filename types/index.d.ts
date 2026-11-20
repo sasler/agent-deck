@@ -169,9 +169,11 @@ export type Limits = {
   /** Copilot's monthly AI credits, read with `gh api copilot_internal/user`. */
   copilot?: LimitWindow[]
   copilotPlan?: string
+  /** Antigravity's weekly and 5-hour limits, per model group, from agy's own language server. */
+  antigravity?: LimitWindow[]
 }
 
-export type MeterProvider = 'claude' | 'codex' | 'copilot'
+export type MeterProvider = 'claude' | 'codex' | 'copilot' | 'antigravity'
 
 /** Which usage meters the pane shows. */
 export type MeterChoice = {

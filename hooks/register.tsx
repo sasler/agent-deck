@@ -20,6 +20,7 @@ import {
   PRESETS,
   PROVIDER_TYPES,
   agentRunSpec,
+  agyLimits,
   applyHarnessEvent,
   codexFailure,
   codexModelProblem,
@@ -80,7 +81,8 @@ const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { m
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
-const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot'] }
+const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot', 'antigravity'] }
+const AGY_ACCENT = '#3186FF'
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
 const routingAtom = atom({ plugin: 'agent-deck', key: 'routing' } as const, DEFAULT_ROUTING)
 const COPILOT_ACCENT = '#8957E5'
@@ -949,6 +951,7 @@ async function saveHarnesses($: $T, list: Harness[]) {
   await update($, harnessesAtom, () => list)
   await registerAgentTools($)
   void detectHarnesses($, list)
+  if (!!agyHarness() !== !!agyPoller) startAgyLimits($)
 }
 
 /** The stored harnesses; on first use, the presets whose CLI is installed. */
@@ -1004,6 +1007,7 @@ const harnessFooter = (run: HarnessRun, card: AgentCard | undefined) => {
 
 const finishHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard, code: number) => {
   run.isFinished = true
+  if (run.parser === 'antigravity') void refreshAgyLimits($)
   const stderr = (await readText($, `${run.dir}/stderr.log`)) ?? ''
   const isOk = code === 0 && !card.error
   if (card.status === 'running') {
@@ -1250,11 +1254,53 @@ const startCopilotLimits = async ($: $T) => {
   copilotPoller = $.clock.every(5 * 60_000, () => void refreshCopilotLimits($))
 }
 
+// ---------- Antigravity's limits: asked of agy's own language server (bin/agy-quota.mjs) ----------
+
+const KEY_AGY_SESSION = 'agy-quota-session'
+let agyPoller: { cancel: () => void } | undefined
+let isAgyChecking = false
+
+/** The Antigravity harness the meters read through: the first one switched on. */
+const agyHarness = () => harnessList.find(h => h.isEnabled && h.parser === 'antigravity')
+
+const refreshAgyLimits = async ($: $T): Promise<boolean> => {
+  const h = agyHarness()
+  if (!h || isAgyChecking) return false
+  isAgyChecking = true
+  try {
+    const saved = await $.store.get(KEY_AGY_SESSION)
+    const args = ['node', `${$.plugin.root}/bin/agy-quota.mjs`, h.command, ...(typeof saved === 'string' && saved ? [saved] : [])]
+    const r = await $.process.run(args, { timeoutMs: 60_000 }).catch(() => undefined)
+    let answer: { sessionId?: string; quota?: unknown; error?: string } = {}
+    try {
+      answer = JSON.parse(r?.stdout ?? '')
+    } catch {}
+    if (answer.sessionId && answer.sessionId !== saved) await $.store.set(KEY_AGY_SESSION, answer.sessionId)
+    const windows = answer.quota ? agyLimits(answer.quota) : []
+    if (!windows.length) return false
+    await setLimits($, l => ({ ...l, antigravity: windows }))
+    return true
+  } finally {
+    isAgyChecking = false
+  }
+}
+
+/** Reads the limits now and every ten minutes, while an Antigravity harness is switched on. */
+const startAgyLimits = ($: $T) => {
+  if (!agyHarness()) {
+    agyPoller?.cancel()
+    agyPoller = undefined
+    return
+  }
+  void refreshAgyLimits($)
+  agyPoller ??= $.clock.every(10 * 60_000, () => void refreshAgyLimits($))
+}
+
 async function loadMeters($: $T) {
   const stored = await $.store.get(KEY_METERS)
   const o = (stored && typeof stored === 'object' ? stored : {}) as Partial<MeterChoice>
   const mode = o.mode === 'session' || o.mode === 'selected' ? o.mode : 'all'
-  const selected = Array.isArray(o.selected) ? o.selected.filter(x => ['claude', 'codex', 'copilot'].includes(x)) : DEFAULT_METERS.selected
+  const selected = Array.isArray(o.selected) ? o.selected.filter(x => ['claude', 'codex', 'copilot', 'antigravity'].includes(x)) : DEFAULT_METERS.selected
   await update($, metersAtom, () => ({ mode, selected }))
 }
 
@@ -1980,6 +2026,7 @@ export const register: Register = on => {
     poller = $.clock.every(60_000, () => void refreshClaudeLimits($))
     await loadMeters($).catch(() => undefined)
     void startCopilotLimits($)
+    startAgyLimits($)
     openPane($)
     strataSince = (await $.clock.now()) - 5000
     strataTimer = $.clock.every(1000, () => void pollStrata($))
@@ -2001,6 +2048,8 @@ export const register: Register = on => {
     harnessPoller?.cancel()
     copilotPoller?.cancel()
     copilotPoller = undefined
+    agyPoller?.cancel()
+    agyPoller = undefined
     return next(e)
   })
 
@@ -2387,7 +2436,7 @@ export const register: Register = on => {
 
     // A fixed-width name column keeps the meters aligned in a proportional font too.
     const nameCell = (name: string, color: string, isShown: boolean) => (
-      <Box width={7} flexShrink={0}>
+      <Box width={shown.has('antigravity') ? 11 : 7} flexShrink={0}>
         {isShown && (
           <Text bold color={color}>
             {name}
@@ -2429,7 +2478,7 @@ export const register: Register = on => {
       Svg ? limitBars(name, color, ws, extra) : limitText(name, color, ws, extra)
 
     const limitText = (name: string, color: string, ws: LimitWindow[], extra?: string) =>
-      isSideBySide || ws.length === 0 ? (
+      (isSideBySide && ws.length <= maxWindows) || ws.length === 0 ? (
         <Box key={`lim-${name}`} flexDirection="row" columnGap={2}>
           {nameCell(name, color, true)}
           {ws.length === 0 && <Text dimColor>no reading yet</Text>}
@@ -3097,16 +3146,18 @@ export const register: Register = on => {
     for (const c of list) {
       if (c.provider === 'codex' || presetOf(c.harness) === 'codex-cli') used.add('codex')
       if (presetOf(c.harness) === 'copilot') used.add('copilot')
+      if (hs.find(x => x.id === c.harness)?.parser === 'antigravity') used.add('antigravity')
     }
     // A provider shows only with a reading: Codex also only while its built-in mode is on.
     const hasReading: Record<MeterProvider, boolean> = {
       claude: lim.claude.length > 0,
       codex: isCodexOn && lim.codex.length > 0,
       copilot: (lim.copilot ?? []).length > 0,
+      antigravity: (lim.antigravity ?? []).length > 0,
     }
-    const shown = new Set((['codex', 'claude', 'copilot'] as const).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
+    const shown = new Set((['codex', 'claude', 'copilot', 'antigravity'] as const).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
 
-    const METER_NAMES: Record<MeterProvider, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot' }
+    const METER_NAMES: Record<MeterProvider, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', antigravity: 'Antigravity' }
     // ---- task routing: a target and model per kind of task, and the switch that tells Claude ----
 
     const targetName = (t: string) =>
@@ -3245,7 +3296,7 @@ export const register: Register = on => {
         )}
         {meters.mode === 'selected' && (
           <Box flexDirection="row" gap={1} flexWrap="wrap">
-            {(['claude', 'codex', 'copilot'] as const).map(x => {
+            {(['claude', 'codex', 'copilot', 'antigravity'] as const).map(x => {
               const isOn = meters.selected.includes(x)
               return (
                 <Button
@@ -3265,6 +3316,7 @@ export const register: Register = on => {
             'Claude: this session.',
             isCodexOn ? 'Codex: read from its session files.' : 'Codex: needs the built-in Codex on.',
             hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
+            hasReading.antigravity ? 'Antigravity: read from agy, as /usage shows them.' : 'Antigravity: needs an Antigravity harness switched on, and agy signed in.',
           ].join(' ')}
         </Text>
       </Box>
@@ -3434,6 +3486,7 @@ export const register: Register = on => {
           {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
           {shown.has('claude') && limitRow('Claude', 'claude', lim.claude)}
           {shown.has('copilot') && limitRow('Copilot', COPILOT_ACCENT, lim.copilot ?? [], lim.copilotPlan)}
+          {shown.has('antigravity') && limitRow('Antigravity', AGY_ACCENT, lim.antigravity ?? [])}
         </Box>
         {cacheBox}
         {list.length === 0 && <Text dimColor>No subagents yet. Codex, Claude and harness runs appear here.</Text>}

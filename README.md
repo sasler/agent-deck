@@ -7,7 +7,8 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 - **Usage limits.** Each provider's limits as a meter with a percentage and a reset countdown:
   - Claude's 5-hour and weekly windows, and every other limit your plan reports, such as a Team or Enterprise plan's spend limit or a weekly Opus limit;
   - Codex's limits, read from its session files;
-  - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`).
+  - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`);
+  - Antigravity's weekly and 5-hour limits for each model group (Gemini, Claude & GPT, Gemini 4 Argon), the same numbers agy's `/usage` shows. agent-deck asks agy itself every ten minutes and after each Antigravity run, while an Antigravity harness is switched on. It never reads your Google sign-in. To ask, agy opens a session, so agent-deck keeps reopening one session rather than adding a new empty conversation to agy's history each time.
 
   Under ⚙ (settings) → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
@@ -76,7 +77,7 @@ Each run's card shows the Codex version and path it started with, and so does it
 
 **When a run fails**, its report and `codex_result` show Codex's actual error, for example `model_not_found`, a usage limit or a sandbox error, not just `codex exited 1`.
 
-**Antigravity** runs Google's Antigravity CLI (`agy`) headless with `--output-format stream-json`. Its card shows each tool step as it runs (a command shows as `$ …`), the reply as it streams, and the tokens of every step, cache reads included. Claude can continue an earlier conversation by passing its id as `agent_run`'s `resume` (agy's `--conversation`). A failed run reports agy's own error, for example an unknown model. Antigravity gives no price, so its cards show tokens without a cost.
+**Antigravity** runs Google's Antigravity CLI (`agy`) headless with `--output-format stream-json`. Its card shows each tool step as it runs (a command shows as `$ …`), the reply as it streams, and the tokens of every step, cache reads included. Claude can continue an earlier conversation by passing its id as `agent_run`'s `resume` (agy's `--conversation`). A failed run reports agy's own error, for example an unknown model. Antigravity gives no price, so its cards show tokens without a cost. Its usage limits show with the other meters.
 
 **Your own API (BYOK).** Copilot and Claude Code harnesses can send their model calls to an API you choose instead of their own service, the way Copilot's *bring your own key* works: the CLI's agent still runs on your machine, with its tools and file edits, and only the model calls go to your endpoint. Add the **Copilot (own API)** preset, or open any Copilot or Claude Code harness's **Edit** form, and set **Model API**:
 
@@ -182,6 +183,7 @@ Then restart Claude Code, or run `/reload-plugins`. At the prompt, `/plugin` →
 - **Copilot costs are reported in AI credits**, not converted to dollars. Older request-based billing fields are ignored. BYOK charges are billed by your provider; the CLI may not report them, and agent-deck does not guess them from an unknown model or treat missing billing as a free run.
 - **Current Copilot flags need a recent CLI.** Use `copilot update` if it rejects an Auto profile, WebSockets, or an AI credit limit. Fusion is a preview and can still be unavailable for your account or organization; agent-deck does not bypass those checks.
 - **Keep-warm pings use tokens.** Each one is a short cache read, a small fraction of what a cold re-write costs.
+- **A run needs its working folder to exist.** When the folder passed as `cwd` is missing, the run fails at once and says so.
 - **Run files live under `~/.claude/agent-deck/`.** Each run keeps its prompt, events and report there.
 - **Strata cards are optional.** agent-deck also shows requests to a local model server at `127.0.0.1:8080` when one is running. Without it, nothing happens.
 
