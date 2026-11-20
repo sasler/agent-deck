@@ -14,6 +14,7 @@ agent-deck is a Claude Code plugin (a "mod"). It shows every background agent in
 | `bin/models.mjs` | Asks a harness's CLI or API which models it has |
 | `bin/launch.mjs` | Starts a CLI without a shell; shared by both scripts |
 | `bin/watch.mjs` | Codex session watcher |
+| `bin/agy-quota.mjs` | Reads Antigravity's usage limits from agy's own language server |
 | `tests/agent-deck.test.tsx` | Mod and UI tests |
 | `tests/runner.test.mjs` | Detached runner and model-query tests |
 | `.claude-plugin/plugin.json` | Manifest and version |

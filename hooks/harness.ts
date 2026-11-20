@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, Routing, TaskRoute, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -429,6 +429,35 @@ export const harnessError = (h: Harness, others: readonly Harness[]): string | u
     if (h.provider.transport === 'websockets' && (h.provider.type === 'anthropic' || h.provider.wireApi !== 'responses')) return 'WebSockets needs the Responses wire format.'
   }
   return undefined
+}
+
+// ---------- Antigravity's usage limits ----------
+
+/** A model group's short name: "Gemini Models" → "Gemini", "Claude and GPT models" → "Claude & GPT". */
+const agyGroupName = (name: string) => name.replace(/\s+models$/i, '').replace(/\s+and\s+/i, ' & ').trim()
+
+/**
+ * The windows of agy's RetrieveUserQuotaSummary (what `/usage` shows), as meters: each group's
+ * weekly and 5-hour limit, used rather than remaining, so they read like the other providers'.
+ */
+export const agyLimits = (quota: unknown): LimitWindow[] => {
+  const out: LimitWindow[] = []
+  for (const g of Array.isArray(obj(obj(quota).response).groups) ? (obj(obj(quota).response).groups as unknown[]) : []) {
+    const group = obj(g)
+    const name = agyGroupName(str(group.displayName) ?? 'Models')
+    for (const b of Array.isArray(group.buckets) ? group.buckets.map(obj) : []) {
+      if (typeof b.remainingFraction !== 'number') continue
+      const window = b.window === 'weekly' ? '7d' : str(b.window) ?? str(b.bucketId) ?? '?'
+      const reset = typeof b.resetTime === 'string' ? Date.parse(b.resetTime) : NaN
+      out.push({
+        label: `${name} ${window}`,
+        name: `${name} · ${window === '5h' ? '5-hour limit' : window === '7d' ? 'Weekly limit' : `${window} limit`}`,
+        percent: Math.min(100, Math.max(0, Math.round((1 - b.remainingFraction) * 1000) / 10)),
+        resetsAt: Number.isFinite(reset) ? reset : undefined,
+      })
+    }
+  }
+  return out
 }
 
 // ---------- reading a harness's output ----------
