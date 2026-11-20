@@ -3090,15 +3090,15 @@ export const register: Register = on => {
       saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
 
     const routeModel = (r: TaskRoute) => {
-      const h = hs.find(x => x.id === r.target)
+      const target = hs.find(x => x.id === r.target)
       const known: { value: string; label: string }[] =
         r.target === 'claude'
           ? ['opus', 'sonnet', 'haiku'].map(m => ({ value: m, label: m }))
-          : (h?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
+          : (target?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
       if (!r.target) return undefined
       if (Select && known.length) {
         const options = [
-          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${h?.model ? ` (${h.model})` : ''}` },
+          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${target?.model ? ` (${target.model})` : ''}` },
           ...known,
           ...(r.model && !known.some(k => k.value === r.model) ? [{ value: r.model, label: r.model }] : []),
         ]
@@ -3110,7 +3110,7 @@ export const register: Register = on => {
             key={`r-model-${r.task}`}
             label="Model"
             value={r.model ?? ''}
-            placeholder={h?.model ?? 'default'}
+            placeholder={target?.model ?? 'default'}
             submitLabel="keep"
             onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
           />
@@ -3356,12 +3356,25 @@ export const register: Register = on => {
       </Box>
     )
 
+    // A settings view that fails to draw says why and keeps a way back, not a blank pane.
+    const orBack = (draw: () => ReturnType<typeof listView>) => {
+      try {
+        return draw()
+      } catch (err) {
+        return (
+          <Box flexDirection="column" gap={1}>
+            <Text color="error" wrap="wrap">{`agent-deck could not draw this view: ${String((err as Error)?.message ?? err)}`}</Text>
+            <Button key="h-recover" label="Back to agents" onPress={() => void setView({ mode: 'cards' })} />
+          </Box>
+        )
+      }
+    }
     if (view.mode === 'codex') {
       if (codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
-      return codexView()
+      return orBack(codexView)
     }
-    if (view.mode === 'list') return listView()
-    if (view.mode === 'edit') return editView(view)
+    if (view.mode === 'list') return orBack(listView)
+    if (view.mode === 'edit') return orBack(() => editView(view))
 
     const running = list.filter(c => c.status === 'running')
     const finished = list.filter(c => c.status !== 'running').reverse()

@@ -1363,3 +1363,37 @@ test('the Task routing section switches routing and picks an agent per task', as
   expect(await ui.find({ text: /Add back image/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('a routed harness with a model list offers its models in the Task routing table', async ($, on) => {
+  mock.clock(on)
+  const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  mock.store(on, { harnesses: [agy], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-1' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
+  })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'r-target-research', value: 'antigravity' })
+  await ui.redraw()
+  expect(await ui.find({ key: 'r-model-research' })).toBeDefined()
+  await ui.select({ key: 'r-model-research', value: 'gemini-4-neon-high' })
+  await ui.redraw()
+  expect(((await ui.find({ key: 'r-model-research' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('gemini-4-neon-high')
+  expect(await ui.find({ key: 'h-done' })).toBeDefined()
+  await ui.unmount()
+})
