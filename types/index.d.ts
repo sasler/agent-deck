@@ -1,7 +1,7 @@
 export type Provider = 'codex' | 'claude' | 'strata' | 'harness'
 
 /** How a harness's stdout is read. */
-export type HarnessParser = 'codex' | 'copilot' | 'opencode' | 'gemini' | 'cursor' | 'claude' | 'text'
+export type HarnessParser = 'codex' | 'copilot' | 'opencode' | 'gemini' | 'antigravity' | 'cursor' | 'claude' | 'text'
 
 /** The API a harness's CLI sends its model calls to, instead of the CLI's own service (BYOK). */
 export type HarnessProvider = {
@@ -50,6 +50,15 @@ export type Harness = {
   /** The preset it came from, if any. */
   preset?: string
 }
+
+/**
+ * Who does one kind of task: a harness id, `codex` (the built-in codex tool) or `claude`
+ * (a Claude subagent). An empty target means no preference.
+ */
+export type TaskRoute = { task: string; target: string; model?: string }
+
+/** Task routing: the table, and whether Claude is told to follow it. */
+export type Routing = { isOn: boolean; routes: TaskRoute[] }
 
 export type HarnessView =
   | { mode: 'cards' }
@@ -232,6 +241,8 @@ declare module 'claude-code' {
       /** The Codex CLIs found and the one runs start with. */
       codexBin: CodexBin
       meters: MeterChoice
+      /** Task routing: who does each kind of task, and whether Claude is told. */
+      routing: Routing
     }
   }
 }

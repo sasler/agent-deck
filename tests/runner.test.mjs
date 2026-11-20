@@ -222,3 +222,15 @@ test('model lister redacts a key echoed in an API error', async t => {
   assert.match(JSON.parse(stdout).error, /\[redacted\]/)
   assert.equal(stdout.includes('fixture-key'), false)
 })
+
+test('model lister reads "id<TAB>name" lines and skips banners', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-model-test-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const cli = path.join(root, 'agy.mjs')
+  fs.writeFileSync(cli, "process.stdout.write('Fetching available models...\\r\\ngemini-4-neon-high\\tGemini 4 Neon (High)\\r\\nplain-id\\r\\n')\n")
+  const file = path.join(root, 'query.json')
+  fs.writeFileSync(file, JSON.stringify({ source: 'lines', command: process.execPath, args: [cli] }))
+  const result = spawnSync(process.execPath, [modelLister, file], { encoding: 'utf8', timeout: 10_000 })
+  assert.ifError(result.error)
+  assert.deepEqual(JSON.parse(result.stdout), { models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }, { id: 'plain-id' }] })
+})

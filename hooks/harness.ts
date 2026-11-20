@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, Tokens } from '../types'
+import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, Routing, TaskRoute, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -57,6 +57,17 @@ export const PRESETS: Preset[] = [
     note: 'Gemini CLI. --yolo approves every tool call.',
   },
   {
+    id: 'antigravity',
+    name: 'Antigravity',
+    color: '#3186FF',
+    command: 'agy',
+    args: '--output-format stream-json --disable-slash-commands --dangerously-skip-permissions --model {model} --conversation {session} -p {prompt}',
+    parser: 'antigravity',
+    note:
+      "Google Antigravity CLI (agy). Sign in once by running agy in a terminal. --dangerously-skip-permissions approves every tool call; " +
+      'swap it for --mode accept-edits to allow edits only, or --mode plan to keep it read-only.',
+  },
+  {
     id: 'cursor',
     name: 'Cursor',
     color: '#9CA3AF',
@@ -90,6 +101,7 @@ export const PARSERS: { value: HarnessParser; label: string }[] = [
   { value: 'copilot', label: 'Copilot JSON' },
   { value: 'opencode', label: 'OpenCode JSON' },
   { value: 'gemini', label: 'Gemini stream-json' },
+  { value: 'antigravity', label: 'Antigravity stream-json' },
   { value: 'cursor', label: 'Cursor stream-json' },
   { value: 'claude', label: 'Claude stream-json' },
   { value: 'text', label: 'Plain text' },
@@ -180,6 +192,7 @@ export const modelQuery = (h: Harness): { models: HarnessModel[] } | { query: Mo
     case 'copilot':
       return { query: { source: 'acp', command: h.command } }
     case 'opencode':
+    case 'antigravity':
       return { query: { source: 'lines', command: h.command, args: ['models'] } }
     case 'codex':
       return { query: { source: 'codex' } }
@@ -626,6 +639,61 @@ const gemini = (e: J): HarnessEvent[] => {
   return []
 }
 
+/** agy's tool parameters are PascalCase (CommandLine, Path, Query); the label wants the command or the target. */
+const agyCall = (name: string, params: unknown): string => {
+  const lower: J = {}
+  for (const [k, v] of Object.entries(obj(params))) lower[k.toLowerCase()] = v
+  const cmd = str(lower.commandline)
+  if (cmd) return `$ ${cmd.replace(/\s+/g, ' ')}`
+  for (const k of ['absolutepath', 'targetfile', 'directorypath', 'searchpath', 'searchdirectory']) {
+    if (str(lower[k])) return `${name} ${lower[k] as string}`
+  }
+  return summarizeCall(name, lower)
+}
+
+/** `agy -p … --output-format stream-json`: init, one step_update per step (text deltas, tools, per-step usage), then result. */
+const antigravity = (e: J): HarnessEvent[] => {
+  switch (e.event) {
+    case 'init': {
+      const i = obj(e.init)
+      const out: HarnessEvent[] = []
+      if (str(e.conversation_id)) out.push({ kind: 'session', id: e.conversation_id as string })
+      if (str(i.model)) out.push({ kind: 'model', model: i.model as string })
+      return out
+    }
+    case 'step_update': {
+      const s = obj(e.step_update)
+      const out: HarnessEvent[] = []
+      const state = String(s.state ?? '')
+      if (s.step_type === 'agent_response') {
+        if (str(s.thinking_delta)) out.push({ kind: 'reason', text: s.thinking_delta as string })
+        if (str(s.text_delta)) out.push({ kind: 'text', text: s.text_delta as string, isDelta: true })
+      } else if (s.step_type === 'tool') {
+        const info = obj(s.tool_info)
+        const name = str(s.tool_name) ?? str(info.name) ?? 'tool'
+        const status = state === 'DONE' ? 'done' : state === 'ACTIVE' || /PEND|RUN|WAIT/.test(state) ? 'running' : 'error'
+        out.push({ kind: 'act', id: `step:${String(s.step_index ?? name)}`, label: agyCall(name, info.parameters), status })
+      }
+      // Each step reports its own usage once, when it is done; input_tokens leaves out the cached part.
+      const u = obj(s.usage)
+      if (s.usage !== undefined) out.push({ kind: 'tokens', tokens: tok(num(u.input_tokens), num(u.output_tokens), num(u.cache_read_tokens), 0, num(u.thinking_tokens)), isAdded: true })
+      return out
+    }
+    case 'result': {
+      const r = obj(e.result)
+      const out: HarnessEvent[] = []
+      if (str(r.conversation_id)) out.push({ kind: 'session', id: r.conversation_id as string })
+      if (str(r.response)) out.push({ kind: 'final', text: r.response as string })
+      if (r.status !== undefined && r.status !== 'SUCCESS') {
+        const why = str(r.error)?.split('\n')[0] ??`Antigravity run ended ${String(r.finished_reason ?? r.status)}`
+        out.push({ kind: 'error', text: why })
+      }
+      return out
+    }
+  }
+  return []
+}
+
 const contentText = (content: unknown): string =>
   Array.isArray(content)
     ? content
@@ -762,7 +830,7 @@ const codex = (e: J): HarnessEvent[] => {
   return []
 }
 
-const PARSE: Record<Exclude<HarnessParser, 'text'>, (e: J) => HarnessEvent[]> = { codex, copilot, opencode, gemini, cursor, claude }
+const PARSE: Record<Exclude<HarnessParser, 'text'>, (e: J) => HarnessEvent[]> = { codex, copilot, opencode, gemini, antigravity, cursor, claude }
 
 /** One stdout line of a harness, as the events agent-deck draws. */
 export const parseLine = (parser: HarnessParser, line: string): HarnessEvent[] => {
@@ -877,34 +945,158 @@ const modelsHint = (h: Harness) => {
   return `, models ${ids.slice(0, MAX_HINTED_MODELS).join(', ')}${more}`
 }
 
-export const agentRunSpec = (enabled: readonly Harness[]): ToolSpec => ({
-  name: 'agent_run',
-  description:
-    'Start a task with another coding agent CLI (a harness set up in the Agents pane) in the background; returns at once with a run id. ' +
-    'The run is its own process and survives session drops; its live output, model and tokens show in the Agents pane. ' +
-    "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
-    (enabled.length
-      ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${modelsHint(h)})`).join('; ')}. `
-      : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
-    'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      harness: enabled.length
-        ? { type: 'string', enum: enabled.map(h => h.id), description: 'Which harness runs the task.' }
-        : { type: 'string', description: 'Which harness runs the task.' },
-      prompt: { type: 'string', description: 'The task.' },
-      title: { type: 'string', description: 'A few words shown on the card.' },
-      model: { type: 'string', description: "Model override; the harness's default when unset." },
-      autoTier: { type: 'string', description: 'Copilot Auto routing profile, such as efficiency, balance, intelligence, hydrafusion or hydrafusion-max. Requires Auto and account support; not BYOK.' },
-      maxAiCredits: { type: 'number', minimum: 30, description: 'Copilot session-wide soft AI credit limit, including subagents. Overrides the harness limit; at least 30.' },
-      cwd: { type: 'string', description: 'Working directory; defaults to the session cwd.' },
-      resume: { type: 'string', description: "The harness's session id to continue." },
+export const agentRunSpec = (enabled: readonly Harness[], routes: readonly RoutedTask[] = []): ToolSpec => {
+  const tasks = routes.filter((r): r is Extract<RoutedTask, { kind: 'harness' }> => r.kind === 'harness')
+  return {
+    name: 'agent_run',
+    description:
+      'Start a task with another coding agent CLI (a harness set up in the Agents pane) in the background; returns at once with a run id. ' +
+      'The run is its own process and survives session drops; its live output, model and tokens show in the Agents pane. ' +
+      "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
+      (enabled.length
+        ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${modelsHint(h)})`).join('; ')}. `
+        : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
+      (tasks.length
+        ? `Task routing is on: pass \`task\` instead of harness and model to use the person's pick (${tasks.map(r => `${r.task} → ${r.harness}${r.model ? ` ${r.model}` : ''}`).join('; ')}). `
+        : '') +
+      'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        harness: enabled.length
+          ? { type: 'string', enum: enabled.map(h => h.id), description: tasks.length ? 'Which harness runs the task; `task` picks it when left out.' : 'Which harness runs the task.' }
+          : { type: 'string', description: 'Which harness runs the task.' },
+        ...(tasks.length
+          ? { task: { type: 'string', enum: tasks.map(r => r.task), description: 'The kind of task: it runs on the harness and model the person routed it to. An explicit harness or model wins.' } }
+          : {}),
+        prompt: { type: 'string', description: 'The task.' },
+        title: { type: 'string', description: 'A few words shown on the card.' },
+        model: { type: 'string', description: "Model override; the harness's default when unset." },
+        autoTier: { type: 'string', description: 'Copilot Auto routing profile, such as efficiency, balance, intelligence, hydrafusion or hydrafusion-max. Requires Auto and account support; not BYOK.' },
+        maxAiCredits: { type: 'number', minimum: 30, description: 'Copilot session-wide soft AI credit limit, including subagents. Overrides the harness limit; at least 30.' },
+        cwd: { type: 'string', description: 'Working directory; defaults to the session cwd.' },
+        resume: { type: 'string', description: "The harness's session id to continue." },
+      },
+      required: tasks.length ? ['prompt'] : ['harness', 'prompt'],
+      additionalProperties: false,
     },
-    required: ['harness', 'prompt'],
-    additionalProperties: false,
-  },
-})
+  }
+}
+
+// ---------- task routing: who does which kind of task ----------
+
+/** The kinds of task offered at first, with what each covers; the person can add more. */
+export const DEFAULT_TASKS: { task: string; hint: string }[] = [
+  { task: 'implement', hint: 'writing or changing code' },
+  { task: 'review', hint: 'reviewing a diff, branch or pull request' },
+  { task: 'research', hint: 'finding things out from docs, the web or a codebase' },
+  { task: 'image', hint: 'generating or editing images' },
+  { task: 'ui', hint: 'UI and visual design' },
+]
+
+export const DEFAULT_ROUTING: Routing = { isOn: false, routes: DEFAULT_TASKS.map(t => ({ task: t.task, target: '' })) }
+
+export const taskHint = (task: string) => DEFAULT_TASKS.find(t => t.task === task)?.hint
+
+/** A task name as Claude passes it: lowercase words joined by dashes. */
+export const taskSlug = (name: string): string => slugId(name)
+
+/** The stored routing, with anything unreadable left out; the defaults when nothing is stored. */
+export const loadRouting = (stored: unknown): Routing => {
+  if (!stored || typeof stored !== 'object') return DEFAULT_ROUTING
+  const o = stored as Partial<Routing>
+  const seen = new Set<string>()
+  const routes: TaskRoute[] = []
+  for (const raw of Array.isArray(o.routes) ? o.routes : []) {
+    const r = obj(raw)
+    const task = typeof r.task === 'string' ? taskSlug(r.task) : ''
+    if (!task || seen.has(task)) continue
+    seen.add(task)
+    routes.push({ task, target: typeof r.target === 'string' ? r.target : '', ...(str(r.model) ? { model: r.model as string } : {}) })
+  }
+  return { isOn: o.isOn === true, routes }
+}
+
+/** A route that can run now, as Claude is told about it. */
+export type RoutedTask =
+  | { kind: 'harness'; task: string; harness: string; name: string; model?: string }
+  | { kind: 'codex'; task: string; model?: string }
+  | { kind: 'claude'; task: string; model?: string }
+
+/** Why a route can't run now; undefined when it can, or has no target. */
+export const routeProblem = (r: TaskRoute, harnesses: readonly Harness[], isCodexOn: boolean): string | undefined => {
+  if (!r.target || r.target === 'claude') return undefined
+  if (r.target === 'codex') return isCodexOn ? undefined : 'the built-in Codex is off'
+  const h = harnesses.find(x => x.id === r.target)
+  if (!h) return `there is no harness "${r.target}"`
+  return h.isEnabled ? undefined : `${h.name} is switched off`
+}
+
+/** The routes Claude can follow: routing on, a target set, there and switched on. */
+export const routedTasks = (routing: Routing, harnesses: readonly Harness[], isCodexOn: boolean): RoutedTask[] => {
+  if (!routing.isOn) return []
+  const out: RoutedTask[] = []
+  for (const r of routing.routes) {
+    if (!r.target || routeProblem(r, harnesses, isCodexOn)) continue
+    const model = r.model?.trim() || undefined
+    if (r.target === 'codex' || r.target === 'claude') out.push({ kind: r.target, task: r.task, model })
+    else out.push({ kind: 'harness', task: r.task, harness: r.target, name: harnesses.find(h => h.id === r.target)?.name ?? r.target, model })
+  }
+  return out
+}
+
+const routeLine = (r: RoutedTask): string => {
+  const hint = taskHint(r.task)
+  const what = `${r.task}${hint ? ` (${hint})` : ''}`
+  const model = r.model ? `, model ${r.model}` : ''
+  if (r.kind === 'codex') return `- ${what}: the codex tool${model}.`
+  if (r.kind === 'claude') return `- ${what}: a Claude subagent (the Agent tool${model}).`
+  return `- ${what}: agent_run with task "${r.task}" (${r.name}${model}).`
+}
+
+/** The note that tells the main thread who does what; undefined when routing is off or nothing is routed. */
+export const routingNote = (routes: readonly RoutedTask[]): string | undefined =>
+  routes.length
+    ? [
+        'agent-deck task routing is on. The person picked who does each kind of task:',
+        ...routes.map(routeLine),
+        'Hand matching work to that agent in the background with a complete brief, then carry on or end your turn while it runs. ' +
+          'Keep quick questions and small edits yourself. Check a report before you tell the person the work is done. ' +
+          'If the routed agent fails or is unavailable, say so and ask before using another. Place tasks not listed as usual.',
+      ].join('\n')
+    : undefined
+
+export const ROUTING_OFF_NOTE = 'agent-deck task routing is now off: ignore the earlier routing note and place work as usual.'
+
+/** What to tell the model with the next prompt, given the routing note it already has (`last`) and the one it should have. */
+export const routingContext = (want: string | undefined, last: string | undefined): string | undefined =>
+  want === last ? undefined : (want ?? (last ? ROUTING_OFF_NOTE : undefined))
+
+/**
+ * The harness and model an agent_run call runs on: an explicit harness and model win,
+ * then the task's route. An error tells Claude what to do instead.
+ */
+export const resolveRun = (
+  input: { harness?: string; task?: string; model?: string },
+  routing: Routing,
+  harnesses: readonly Harness[],
+  isCodexOn: boolean,
+): { harness: string; model?: string } | { error: string } => {
+  if (!input.task) return input.harness ? { harness: input.harness, model: input.model } : { error: 'Name a harness, or a routed task.' }
+  const task = taskSlug(input.task)
+  const r = routing.routes.find(x => x.task === task)
+  if (!routing.isOn || !r?.target) {
+    if (input.harness) return { harness: input.harness, model: input.model }
+    return { error: `No route for the task "${input.task}"${routing.isOn ? '' : ': task routing is off'}. Name a harness instead.` }
+  }
+  if (input.harness) return { harness: input.harness, model: input.model ?? (input.harness === r.target ? r.model?.trim() || undefined : undefined) }
+  const problem = routeProblem(r, harnesses, isCodexOn)
+  if (problem) return { error: `The "${task}" route can't run: ${problem}. Tell the person, and ask before using another agent.` }
+  const model = input.model ?? (r.model?.trim() || undefined)
+  if (r.target === 'codex') return { error: `The "${task}" task goes to the built-in Codex: use the codex tool${model ? ` with model ${model}` : ''}.` }
+  if (r.target === 'claude') return { error: `The "${task}" task goes to a Claude subagent: use the Agent tool${model ? ` with model ${model}` : ''}.` }
+  return { harness: r.target, model }
+}
 
 export const AGENT_RESULT_SPEC: ToolSpec = {
   name: 'agent_result',
