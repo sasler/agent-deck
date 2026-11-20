@@ -119,8 +119,13 @@ Pick an agent and model for each kind of task, and Claude hands that work to the
 Set it up under ⚙ Settings → **Task routing**:
 
 - The table starts with **implement**, **review**, **research**, **image** and **ui**. Add your own with **Add a task**, for example `tests` or `docs`, and **Remove** the ones you don't need.
-- For each task, pick the **Agent**: any harness, the built-in **Codex**, or a **Claude subagent**. Then pick its **Model**, or leave it at the agent's default. The model list comes from the harness's own model list. Where it has none yet, type the id.
-- The **On/Off** button next to **Task routing** switches routing on or off. `/agent-deck routing on`, `off` and `status` do the same from the prompt.
+- For each task, pick the **Agent**: any harness, the built-in **Codex**, or a **Claude subagent**. Then pick its **Model**, or leave it at the agent's default:
+  - a harness offers the models its CLI reports. agent-deck asks the CLI again when you pick the harness and when you open Settings (at most every ten minutes), and **↻** asks right away;
+  - Codex offers the models of the Codex CLI it starts;
+  - a Claude subagent offers Fable, Opus, Sonnet and Haiku, named with the version each runs.
+
+  Where there is no list, type the model id.
+- The **On/Off** button next to **Task routing**, or **Routing on/off** next to ⚙ Settings in the main view, switches routing on or off. `/agent-deck routing on`, `off` and `status` do the same from the prompt.
 
 When routing is on, Claude gets a short note with your picks along with your next message. The note says which agent gets each kind of task, and that Claude keeps quick questions and small edits itself. The note goes out again after a compaction or `/clear`, and again whenever you change a pick. When you switch routing off, Claude is told so with your next message. Claude starts a routed harness with `agent_run` and the task's name (`task: "review"`), and agent-deck fills in the harness and model. An explicit harness or model that Claude passes still wins.
 

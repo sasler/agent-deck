@@ -9,6 +9,7 @@ import {
   DEFAULT_TASKS,
   loadRouting,
   resolveRun,
+  routeModelChoices,
   routeProblem,
   routedTasks,
   routingContext,
@@ -1193,6 +1194,31 @@ async function saveRouting($: $T, next: Routing) {
   await $.store.set(KEY_ROUTING, next)
   await update($, routingAtom, () => next)
   await registerAgentTools($)
+}
+
+/** When each harness's models were last asked for from the routing table. */
+const modelsAskedAt = new Map<string, number>()
+const MODELS_TTL_MS = 10 * 60_000
+
+/**
+ * Asks the routed harnesses (or one, `only`) for their current models and saves them, so the
+ * routing table offers what the CLI has now, not the list saved when its form was last opened.
+ * A built-in Codex route asks the Codex finder. `force` skips the ten-minute wait.
+ */
+async function refreshRoutedModels($: $T, opts: { only?: string; force?: boolean } = {}) {
+  const now = await $.clock.now()
+  const targets = new Set(opts.only ? [opts.only] : routing.routes.map(r => r.target).filter(Boolean))
+  if (targets.has('codex') && codexOn) void findCodex($, { force: opts.force }).catch(() => undefined)
+  for (const id of targets) {
+    const h = harnessList.find(x => x.id === id)
+    if (!h) continue
+    if (!opts.force && now - (modelsAskedAt.get(id) ?? 0) < MODELS_TTL_MS) continue
+    const how = modelQuery(h)
+    if (!how || !('query' in how)) continue
+    modelsAskedAt.set(id, now)
+    const r = await queryModels($, how.query, h)
+    if ('models' in r) await saveHarnesses($, harnessList.map(x => (x.id === id ? { ...x, models: r.models } : x)))
+  }
 }
 
 /** The note the main thread should have now. */
@@ -3091,18 +3117,25 @@ export const register: Register = on => {
 
     const routeModel = (r: TaskRoute) => {
       const target = hs.find(x => x.id === r.target)
-      const known: { value: string; label: string }[] =
-        r.target === 'claude'
-          ? ['opus', 'sonnet', 'haiku'].map(m => ({ value: m, label: m }))
-          : (target?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
+      const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
       if (!r.target) return undefined
+      const defaultModel = r.target === 'codex' ? codexDefaults.model : target?.model
+      const canRefresh = r.target === 'codex' || (!!target && !!modelQuery(target) && 'query' in modelQuery(target)!)
+      const refreshButton = canRefresh && (
+        <Button key={`r-refresh-${r.task}`} label="↻" plain dimColor onPress={() => void refreshRoutedModels($, { only: r.target, force: true })} />
+      )
       if (Select && known.length) {
         const options = [
-          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${target?.model ? ` (${target.model})` : ''}` },
+          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${defaultModel ? ` (${defaultModel})` : ''}` },
           ...known,
           ...(r.model && !known.some(k => k.value === r.model) ? [{ value: r.model, label: r.model }] : []),
         ]
-        return <Select key={`r-model-${r.task}`} label="Model" options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
+        return (
+          <Box key={`r-models-${r.task}`} flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+            <Select key={`r-model-${r.task}`} label="Model" options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
+            {refreshButton}
+          </Box>
+        )
       }
       return (
         Input && (
@@ -3110,7 +3143,7 @@ export const register: Register = on => {
             key={`r-model-${r.task}`}
             label="Model"
             value={r.model ?? ''}
-            placeholder={target?.model ?? 'default'}
+            placeholder={defaultModel ?? 'default'}
             submitLabel="keep"
             onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
           />
@@ -3139,7 +3172,7 @@ export const register: Register = on => {
           </Box>
           {Select ? (
             <Box flexDirection="column" gap={0}>
-              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined })} />
+              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))} />
               {routeModel(r)}
             </Box>
           ) : (
@@ -3382,8 +3415,20 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={0}>
-        <Box flexDirection="row" justifyContent="flex-end">
-          <Button key="h-open" label="⚙ Settings" plain dimColor onPress={() => void setView({ mode: 'list' })} />
+        <Box flexDirection="row" justifyContent="flex-end" alignItems="center" columnGap={1}>
+          <Button
+            key="r-toggle-main"
+            label={`Routing ${routingState.isOn ? 'on' : 'off'}`}
+            variant={routingState.isOn ? 'primary' : undefined}
+            onPress={() => void saveRouting($, { ...routingState, isOn: !routingState.isOn })}
+          />
+          <Button
+            key="h-open"
+            label="⚙ Settings"
+            plain
+            dimColor
+            onPress={() => void setView({ mode: 'list' }).then(() => refreshRoutedModels($))}
+          />
         </Box>
         <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
           {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}

@@ -170,11 +170,22 @@ const CLAUDE_MODELS: HarnessModel[] = [
   { id: 'opus', note: 'alias' },
   { id: 'sonnet', note: 'alias' },
   { id: 'haiku', note: 'alias' },
-  { id: 'claude-fable-5-1', name: 'Fable 5.1' },
+  { id: 'claude-fable-5-2', name: 'Fable 5.2' },
   { id: 'claude-opus-5-5', name: 'Opus 5.5' },
   { id: 'claude-sonnet-5-5', name: 'Sonnet 5.5' },
   { id: 'claude-haiku-5-5', name: 'Haiku 5.5' },
 ]
+
+/** What a Claude subagent takes (the Agent tool's model: a family), named by the version it runs now. */
+export const SUBAGENT_MODELS: HarnessModel[] = CLAUDE_MODELS.filter(m => m.name).map(m => ({ id: m.name!.split(' ')[0]!.toLowerCase(), name: m.name }))
+
+/** The models a task's route can pick from: a harness's last list, the chosen Codex's, or Claude's families. */
+export const routeModelChoices = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): { value: string; label: string }[] =>
+  target === 'claude'
+    ? SUBAGENT_MODELS.map(m => ({ value: m.id, label: m.name ?? m.id }))
+    : target === 'codex'
+      ? codexModels.map(id => ({ value: id, label: id }))
+      : (h?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
 
 /** What bin/models.mjs is asked to do; the env and provider can hold a key, so it goes through a file it deletes. */
 export type ModelQuery = {
