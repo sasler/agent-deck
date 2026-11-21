@@ -297,7 +297,7 @@ const tick = () => {
 // Seed the limit bars from the newest reading on the machine, whatever its age; ts is when Codex wrote it.
 const seedLimits = () => {
   const found = newestLimits(sessionsDir)
-  if (found) emit({ t: 'limits', ts: found.ts, limits: found.limits })
+  if (found) emit({ t: 'limits', ts: found.ts, limits: found.limits, source: 'rollout' })
 }
 
 emit({ t: 'hello', pid: process.pid })

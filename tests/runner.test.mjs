@@ -8,12 +8,14 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
-import { newestLimits } from '../bin/codex-limits.mjs'
+import { liveLimitsOf, newestLimits } from '../bin/codex-limits.mjs'
 import { launchEnv } from '../bin/launch.mjs'
 
 const runner = fileURLToPath(new URL('../bin/run.mjs', import.meta.url))
 const modelLister = fileURLToPath(new URL('../bin/models.mjs', import.meta.url))
 const watcher = fileURLToPath(new URL('../bin/watch.mjs', import.meta.url))
+const codexLimitsScript = fileURLToPath(new URL('../bin/codex-limits.mjs', import.meta.url))
+const pluginVersion = JSON.parse(fs.readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8')).version
 const fixture = `
 import fs from 'node:fs'
 if (process.env.COPILOT_PROVIDER_API_KEY !== 'fixture-key' || process.env.COPILOT_PROVIDER_API_KEY_COMMAND) {
@@ -348,6 +350,143 @@ test('Codex limits are read on demand from the newest rollout that has a reading
   })
   assert.equal(path.basename(found.file), 'older.jsonl')
   assert.equal(newestLimits(path.join(root, 'missing'), { now }), undefined)
+})
+
+const makeFakeCodex = (dir, body) => {
+  if (process.platform === 'win32') {
+    const script = path.join(dir, 'fake-codex.mjs')
+    const shim = path.join(dir, 'codex.cmd')
+    fs.writeFileSync(script, body)
+    fs.writeFileSync(shim, '@echo off\r\n"node" "%dp0%\\fake-codex.mjs" %*\r\n')
+    return shim
+  }
+  const bin = path.join(dir, 'codex')
+  fs.writeFileSync(bin, `#!${process.execPath}\n${body}`)
+  fs.chmodSync(bin, 0o755)
+  return bin
+}
+
+test('Codex limits read live from codex app-server and map to meter windows', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-codex-live-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const fakeCodex = makeFakeCodex(
+    root,
+    `
+import readline from 'node:readline'
+if (process.argv[2] !== 'app-server') process.exit(2)
+let sawInitialized = false
+const keepAlive = setInterval(() => {}, 60_000)
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id === 1 && msg.method === 'initialize') {
+    if (msg.params?.clientInfo?.name !== 'agent-deck' || msg.params?.clientInfo?.version !== ${JSON.stringify(pluginVersion)}) process.exit(3)
+    process.stdout.write(JSON.stringify({ id: 1, result: { userAgent: 'fake-codex/0.160.1' } }) + '\\n')
+  } else if (msg.method === 'initialized' && msg.id === undefined) {
+    sawInitialized = true
+  } else if (msg.id === 2 && msg.method === 'account/rateLimits/read') {
+    if (!sawInitialized) process.exit(4)
+    process.stdout.write(JSON.stringify({
+      id: 2,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 24, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+          secondary: { usedPercent: 61, windowDurationMins: 10080, resetsAt: 1_800_500_000 },
+          planType: 'plus',
+          credits: { hasCredits: false },
+        },
+        rateLimitsByLimitId: { codex: { primary: { usedPercent: 24, windowDurationMins: 300, resetsAt: 1_800_000_000 } } },
+      },
+    }) + '\\n')
+  }
+})
+rl.on('close', () => clearInterval(keepAlive))
+`,
+  )
+  const before = Date.now()
+  const result = spawnSync(process.execPath, [codexLimitsScript, path.join(root, 'empty-sessions'), fakeCodex], {
+    encoding: 'utf8',
+    timeout: 10_000,
+  })
+  const after = Date.now()
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  const out = JSON.parse(result.stdout)
+  assert.equal(out.source, 'live')
+  assert.ok(out.ts >= before && out.ts <= after)
+  assert.deepEqual(out.limits, {
+    windows: [
+      { minutes: 300, percent: 24, resetsAt: 1_800_000_000_000 },
+      { minutes: 10080, percent: 61, resetsAt: 1_800_500_000_000 },
+    ],
+    plan: 'plus',
+  })
+  assert.equal(result.stdout.includes('userAgent'), false)
+  assert.equal(result.stdout.includes('hasCredits'), false)
+  assert.deepEqual(
+    liveLimitsOf({ primary: { usedPercent: 10, windowDurationMins: 300 }, planType: 'team' }),
+    { windows: [{ minutes: 300, percent: 10, resetsAt: undefined }], plan: 'team' },
+  )
+})
+
+test('Codex limits fall back to the newest rollout file when app-server errors', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-codex-fallback-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessionsDir = path.join(root, 'sessions')
+  const now = new Date()
+  const dayDir = path.join(
+    sessionsDir,
+    String(now.getFullYear()),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  )
+  fs.mkdirSync(dayDir, { recursive: true })
+  const tsIso = new Date(now.getTime() - 2 * 3_600_000).toISOString()
+  fs.writeFileSync(
+    path.join(dayDir, 'last.jsonl'),
+    JSON.stringify({
+      timestamp: tsIso,
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        rate_limits: {
+          plan_type: 'pro',
+          primary: { used_percent: 33, window_minutes: 300, resets_at: 1_800_000_000 },
+          secondary: { used_percent: 55, window_minutes: 10080 },
+        },
+      },
+    }) + '\n',
+  )
+  const fakeCodex = makeFakeCodex(
+    root,
+    `
+import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id === 1) process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n')
+  else if (msg.id === 2) process.stdout.write(JSON.stringify({ id: 2, error: { code: -32603, message: 'not logged in raw-secret-value' } }) + '\\n')
+})
+`,
+  )
+  const result = spawnSync(process.execPath, [codexLimitsScript, sessionsDir, fakeCodex], {
+    encoding: 'utf8',
+    timeout: 10_000,
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  const out = JSON.parse(result.stdout)
+  assert.equal(out.source, 'rollout')
+  assert.equal(out.ts, Date.parse(tsIso))
+  assert.deepEqual(out.limits, {
+    windows: [
+      { minutes: 300, percent: 33, resetsAt: 1_800_000_000_000 },
+      { minutes: 10080, percent: 55 },
+    ],
+    plan: 'pro',
+  })
+  assert.equal(result.stdout.includes('raw-secret-value'), false)
+  assert.equal(result.stderr.includes('raw-secret-value'), false)
 })
 
 test('watcher matches MSYS paths, trailing slashes, subfolders and scratchpads, and ignores sibling folders', async t => {

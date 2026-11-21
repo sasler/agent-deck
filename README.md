@@ -6,18 +6,18 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
 At the top of the pane sit three controls: **♨ Keep warm**, **⇄ Routing** and **⚙ Settings**. Under them come the prompt cache, the usage limits, then the agent cards.
 
-- **Usage limits.** Each provider's limits as a meter with a percentage and a reset countdown:
+- **Usage limits.** Each provider's limits as a meter with a percentage and a reset countdown. Claude comes first, followed by the other providers in alphabetical order (Antigravity, Codex, Copilot) — in the expanded rows, the folded one-line summary and ⚙ Settings → **Usage meters**:
   - Claude's 5-hour and weekly windows, and every other limit your plan reports, such as a Team or Enterprise plan's spend limit or a weekly Opus limit;
-  - Codex's limits, read from its session files;
-  - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`);
-  - Antigravity's weekly and 5-hour limits for each model group (Gemini, Claude & GPT, Gemini 4 Argon), the same numbers agy's `/usage` shows. agent-deck asks agy itself every ten minutes and after each Antigravity run, while an Antigravity harness is switched on. It never reads your Google sign-in. To ask, agy opens a session, so agent-deck keeps reopening one session rather than adding a new empty conversation to agy's history each time.
+  - Antigravity's weekly and 5-hour limits for each model group (Gemini, Claude & GPT, Gemini 4 Argon), the same numbers agy's `/usage` shows. agent-deck asks agy itself every ten minutes and after each Antigravity run, while an Antigravity harness is switched on. It never reads your Google sign-in. To ask, agy opens a session, so agent-deck keeps reopening one session rather than adding a new empty conversation to agy's history each time;
+  - Codex's limits, read live from the Codex CLI (`codex app-server`) at session start, every ten minutes while the built-in Codex is switched on, and on **↻ Refresh**, falling back to Codex's newest session file if the CLI cannot answer. Live runs continue to update the meters as Codex writes them, and an older session file never replaces a newer live reading;
+  - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`).
 
   The **Usage limits** header has three controls:
   - **▾ / ▸** folds the meters into one line with each provider's highest percent, and opens them again;
   - the view switch picks **All**, **Used here** (the providers this session used) or **Selected**. It is the same setting as ⚙ Settings → **Usage meters**, where you also pick which providers **Selected** shows;
-  - **↻ Refresh** reads every provider's limits again now and says **Refreshing…** while it does. For Codex that means its newest session file, since Codex writes its limits only while it works.
+  - **↻ Refresh** reads every provider's limits again now — for Codex, live from the Codex CLI (falling back to its last session file if needed) — and says **Refreshing…** while it does.
 
-  A reading older than 15 minutes says how old it is, for example `updated 3h ago`. When a window's reset time has passed since the reading, the meter says **out of date** instead of a countdown: the window has started over, so the old percentage no longer holds. A Codex reading updates with Codex's next run.
+  A reading older than 15 minutes says how old it is, for example `updated 3h ago`. When a window's reset time has passed since the reading, the meter says **out of date** instead of a countdown: the window has started over, so the old percentage no longer holds. If Codex had to fall back to its last session file, the pane says `from last session` and **↻ Refresh** tries live again.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn, and shows whether keep-warm is on.
 - **Keep-warm.** Pick 2, 4 or 6 hours with **♨ Keep warm** at the top of the pane, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
 - **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. After **Send anyway** the band says at once that it was sent and that the cache is being re-written, since that can take a while before the reply starts. Change this with `/cache guard refuse|warn|off`.

@@ -163,16 +163,20 @@ export type LimitWindow = {
   resetsAt?: number
 }
 
+export type CodexLimitSource = 'live' | 'rollout'
+
 export type Limits = {
   codex: LimitWindow[]
   claude: LimitWindow[]
   codexPlan?: string
+  /** Where Codex's reading came from: live from `codex app-server`, or a fallback session file. */
+  codexSource?: CodexLimitSource
   /** Copilot's monthly AI credits, read with `gh api copilot_internal/user`. */
   copilot?: LimitWindow[]
   copilotPlan?: string
   /** Antigravity's weekly and 5-hour limits, per model group, from agy's own language server. */
   antigravity?: LimitWindow[]
-  /** When each provider's reading was taken, epoch ms; Codex's is the time of the rollout line it came from. */
+  /** When each provider's reading was taken, epoch ms; a rollout fallback uses the time of the rollout line. */
   readAt?: Partial<Record<MeterProvider, number>>
   /** Refresh was pressed and the readings are being taken again. */
   isRefreshing?: boolean

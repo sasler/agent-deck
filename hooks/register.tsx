@@ -1,10 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, CacheState, CodexBin, CodexLimitSource, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
   CARD_STALE_MS,
+  METER_PROVIDERS,
   cardModelName,
   effortProblem,
   fmtSpan,
@@ -13,6 +14,7 @@ import {
   readingAge,
   resetNote,
   routeEffortChoices,
+  shouldTakeCodexLimits,
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
@@ -97,7 +99,7 @@ const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { m
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
-const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot', 'antigravity'] }
+const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: METER_PROVIDERS.map(m => m.id) }
 const AGY_ACCENT = '#3186FF'
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
 const routingAtom = atom({ plugin: 'agent-deck', key: 'routing' } as const, DEFAULT_ROUTING)
@@ -259,9 +261,15 @@ const windowLabel = (minutes: number | undefined): string =>
   minutes === undefined ? '?' : minutes <= 300 ? `${Math.round(minutes / 60)}h` : minutes >= 10080 ? '7d' : `${Math.round(minutes / 1440)}d`
 
 const statusText = (l: Limits): string | undefined => {
+  const windows: Record<MeterProvider, LimitWindow[]> = {
+    claude: l.claude,
+    codex: l.codex,
+    copilot: l.copilot ?? [],
+    antigravity: l.antigravity ?? [],
+  }
   const part = (name: string, ws: LimitWindow[]) =>
     ws.length ? `${name} ${ws.map(w => `${w.label} ${Math.round(w.percent)}%`).join(' · ')}` : ''
-  const text = [part('Codex', l.codex), part('Claude', l.claude), part('Copilot', l.copilot ?? [])].filter(Boolean).join('  │  ')
+  const text = METER_PROVIDERS.map(m => part(m.name, windows[m.id])).filter(Boolean).join('  │  ')
   return text || undefined
 }
 
@@ -464,11 +472,21 @@ const refreshClaudeLimits = async ($: $T) => {
   await setLimits($, l => ({ ...l, claude, readAt: { ...l.readAt, claude: at } }))
 }
 
-/** Codex's reading, unless one written later is already shown: `ts` is when Codex wrote it. */
-const setCodexLimits = async ($: $T, ts: number, reading: WatchLimits) => {
+/** Codex's reading, unless a newer one is already shown; a live reading beats a rollout fallback at the same timestamp. */
+const setCodexLimits = async ($: $T, ts: number, reading: WatchLimits, source?: CodexLimitSource) => {
   const codex = toLimitWindows(reading)
   if (!codex.length) return
-  await setLimits($, l => (ts < (l.readAt?.codex ?? 0) ? l : { ...l, codex, codexPlan: reading.plan, readAt: { ...l.readAt, codex: ts } }))
+  await setLimits($, l =>
+    !shouldTakeCodexLimits(l.readAt?.codex, l.codexSource, ts, source)
+      ? l
+      : {
+          ...l,
+          codex,
+          codexPlan: reading.plan,
+          codexSource: source ?? l.codexSource ?? 'rollout',
+          readAt: { ...l.readAt, codex: ts },
+        },
+  )
 }
 
 let version: string | undefined
@@ -524,7 +542,7 @@ export const newCodexCard = (id: string, title: string, startedAt: number, extra
 
 export type WatchEvent =
   | { t: 'hello' }
-  | { t: 'limits'; ts: number; limits: WatchLimits }
+  | { t: 'limits'; ts: number; limits: WatchLimits; source?: CodexLimitSource }
   | { t: 'run'; run: string; thread: string }
   | { t: 'meta'; f: string; ts: number; cwd: string }
   | { t: 'ctx'; f: string; ts: number; model?: string; effort?: string }
@@ -638,7 +656,7 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
 export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
   if (ev.t === 'hello') return
   if (ev.t === 'limits') {
-    await setCodexLimits($, ev.ts, ev.limits)
+    await setCodexLimits($, ev.ts, ev.limits, ev.source)
     return
   }
   if (ev.t === 'run') {
@@ -1415,18 +1433,48 @@ const readAgyLimits = async ($: $T, h: Harness): Promise<boolean> => {
   return true
 }
 
-/** Reads Codex's newest reading now (bin/codex-limits.mjs), the way the watcher seeds its meters. */
-const refreshCodexLimits = async ($: $T): Promise<boolean> => {
-  const home = await codexHome($)
-  if (!home || !codexOn) return false
-  const r = await $.process.run(['node', `${$.plugin.root}/bin/codex-limits.mjs`, `${home}/sessions`], { timeoutMs: 30_000 }).catch(() => undefined)
-  let found: { ts?: unknown; limits?: WatchLimits } = {}
+let codexLimitsPoller: { cancel: () => void } | undefined
+let codexLimitsCheck: Promise<boolean> | undefined
+
+/** The Codex CLI to ask for live limits: the configured override, else the newest installed, else `codex` on PATH. */
+const codexLimitsCommand = async ($: $T): Promise<string> => {
+  const override = await codexOverride($)
+  if (override) return override
+  const found = await findCodex($).catch(() => undefined)
+  return found?.chosen?.path ?? 'codex'
+}
+
+/** Reads Codex's limits live via `codex app-server` (bin/codex-limits.mjs), falling back to its newest session file. */
+const refreshCodexLimits = ($: $T): Promise<boolean> => {
+  if (!codexOn) return Promise.resolve(false)
+  codexLimitsCheck ??= readCodexLimits($).finally(() => {
+    codexLimitsCheck = undefined
+  })
+  return codexLimitsCheck
+}
+
+const readCodexLimits = async ($: $T): Promise<boolean> => {
+  const [home, command] = await Promise.all([codexHome($), codexLimitsCommand($)])
+  const r = await $.process.run(['node', `${$.plugin.root}/bin/codex-limits.mjs`, home ? `${home}/sessions` : '', command], { timeoutMs: 30_000 }).catch(() => undefined)
+  let found: { ts?: unknown; limits?: WatchLimits; source?: unknown } = {}
   try {
     found = JSON.parse(r?.stdout ?? '')
   } catch {}
   if (typeof found.ts !== 'number' || !Array.isArray(found.limits?.windows)) return false
-  await setCodexLimits($, found.ts, found.limits!)
+  const source: CodexLimitSource = found.source === 'rollout' ? 'rollout' : 'live'
+  await setCodexLimits($, found.ts, found.limits!, source)
   return true
+}
+
+/** Reads Codex's limits now and every ten minutes, while the built-in Codex is switched on. */
+const startCodexLimits = ($: $T) => {
+  if (!codexOn) {
+    codexLimitsPoller?.cancel()
+    codexLimitsPoller = undefined
+    return
+  }
+  void refreshCodexLimits($)
+  codexLimitsPoller ??= $.clock.every(10 * 60_000, () => void refreshCodexLimits($))
 }
 
 let isRefreshingLimits = false
@@ -1468,7 +1516,8 @@ async function loadMeters($: $T) {
   const stored = await $.store.get(KEY_METERS)
   const o = (stored && typeof stored === 'object' ? stored : {}) as Partial<MeterChoice>
   const mode = o.mode === 'session' || o.mode === 'selected' ? o.mode : 'all'
-  const selected = Array.isArray(o.selected) ? o.selected.filter(x => ['claude', 'codex', 'copilot', 'antigravity'].includes(x)) : DEFAULT_METERS.selected
+  const valid = METER_PROVIDERS.map(m => m.id)
+  const selected = Array.isArray(o.selected) ? o.selected.filter(x => valid.includes(x)) : DEFAULT_METERS.selected
   await update($, metersAtom, () => ({ mode, selected, ...(o.isCollapsed === true ? { isCollapsed: true } : {}) }))
 }
 
@@ -1517,9 +1566,11 @@ async function setCodexEnabled($: $T, on: boolean) {
   if (on) {
     await registerCodexTools($)
     await startCodexWatcher($)
+    startCodexLimits($)
   } else {
     stopWatcher()
-    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined, readAt: { ...l.readAt, codex: undefined } }))
+    startCodexLimits($)
+    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined, codexSource: undefined, readAt: { ...l.readAt, codex: undefined } }))
   }
 }
 
@@ -2215,6 +2266,7 @@ export const register: Register = on => {
     await loadMeters($).catch(() => undefined)
     void startCopilotLimits($)
     startAgyLimits($)
+    startCodexLimits($)
     openPane($)
     strataSince = (await $.clock.now()) - 5000
     strataTimer = $.clock.every(1000, () => void pollStrata($))
@@ -2242,6 +2294,8 @@ export const register: Register = on => {
     copilotPoller = undefined
     agyPoller?.cancel()
     agyPoller = undefined
+    codexLimitsPoller?.cancel()
+    codexLimitsPoller = undefined
     return next(e)
   })
 
@@ -2678,13 +2732,15 @@ export const register: Register = on => {
     /** A provider's meters, with how old the reading is once that matters. */
     const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string) => {
       const hasPast = ws.some(w => isResetPast(w, now))
-      const extra = [plan, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
+      const isCodexFallback = p === 'codex' && lim.codexSource === 'rollout'
+      const extra =
+        [plan, isCodexFallback ? 'from last session' : undefined, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
       return (
         <Box key={`lim-row-${p}`} flexDirection="column">
           {Svg ? limitBars(name, color, ws, extra) : limitText(name, color, ws, extra)}
-          {hasPast && p === 'codex' && (
+          {isCodexFallback && hasPast && (
             <Text dimColor wrap="wrap">
-              Codex writes its limits only while it works, so this reading updates with its next run.
+              Could not read Codex's limits live, so this is from its last session file. Press Refresh to try again, or run Codex.
             </Text>
           )}
         </Box>
@@ -3391,9 +3447,7 @@ export const register: Register = on => {
       copilot: (lim.copilot ?? []).length > 0,
       antigravity: (lim.antigravity ?? []).length > 0,
     }
-    const shown = new Set((['codex', 'claude', 'copilot', 'antigravity'] as const).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
-
-    const METER_NAMES: Record<MeterProvider, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', antigravity: 'Antigravity' }
+    const shown = new Set(METER_PROVIDERS.map(m => m.id).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
     // ---- task routing: a target and model per kind of task, and the switch that tells Claude ----
 
     const targetName = (t: string) =>
@@ -3553,12 +3607,12 @@ export const register: Register = on => {
         )}
         {meters.mode === 'selected' && (
           <Box flexDirection="row" gap={1} flexWrap="wrap">
-            {(['claude', 'codex', 'copilot', 'antigravity'] as const).map(x => {
+            {METER_PROVIDERS.map(({ id: x, name }) => {
               const isOn = meters.selected.includes(x)
               return (
                 <Button
                   key={`m-${x}`}
-                  label={`${METER_NAMES[x]} ${isOn ? '✓' : '·'}`}
+                  label={`${name} ${isOn ? '✓' : '·'}`}
                   variant={isOn ? 'primary' : undefined}
                   onPress={() =>
                     void saveMeters($, { ...meters, selected: isOn ? meters.selected.filter(y => y !== x) : [...meters.selected, x] })
@@ -3569,12 +3623,12 @@ export const register: Register = on => {
           </Box>
         )}
         <Text dimColor wrap="wrap">
-          {[
-            'Claude: this session.',
-            isCodexOn ? 'Codex: read from its session files.' : 'Codex: needs the built-in Codex on.',
-            hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
-            hasReading.antigravity ? 'Antigravity: read from agy, as /usage shows them.' : 'Antigravity: needs an Antigravity harness switched on, and agy signed in.',
-          ].join(' ')}
+          {METER_PROVIDERS.map(({ id }) => {
+            if (id === 'claude') return 'Claude: this session.'
+            if (id === 'antigravity') return hasReading.antigravity ? 'Antigravity: read from agy, as /usage shows them.' : 'Antigravity: needs an Antigravity harness switched on, and agy signed in.'
+            if (id === 'codex') return isCodexOn ? 'Codex: read live from the Codex CLI, falling back to its last session file.' : 'Codex: needs the built-in Codex on.'
+            return hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.'
+          }).join(' ')}
         </Text>
         <Text dimColor wrap="wrap">
           The Usage limits header in the main view switches between these views too, folds the meters into one line, and
@@ -3733,12 +3787,13 @@ export const register: Register = on => {
       { value: 'session', label: 'Used here' },
       { value: 'selected', label: 'Selected' },
     ]
-    const limitProviders = [
-      { p: 'codex' as const, name: 'Codex', color: CODEX_ACCENT, windows: lim.codex, plan: lim.codexPlan },
-      { p: 'claude' as const, name: 'Claude', color: 'claude', windows: lim.claude, plan: undefined },
-      { p: 'copilot' as const, name: 'Copilot', color: COPILOT_ACCENT, windows: lim.copilot ?? [], plan: lim.copilotPlan },
-      { p: 'antigravity' as const, name: 'Antigravity', color: AGY_ACCENT, windows: lim.antigravity ?? [], plan: undefined },
-    ].filter(x => shown.has(x.p))
+    const meterData: Record<MeterProvider, { color: string; windows: LimitWindow[]; plan?: string }> = {
+      claude: { color: 'claude', windows: lim.claude, plan: undefined },
+      antigravity: { color: AGY_ACCENT, windows: lim.antigravity ?? [], plan: undefined },
+      codex: { color: CODEX_ACCENT, windows: lim.codex, plan: lim.codexPlan },
+      copilot: { color: COPILOT_ACCENT, windows: lim.copilot ?? [], plan: lim.copilotPlan },
+    }
+    const limitProviders = METER_PROVIDERS.map(({ id, name }) => ({ p: id, name, ...meterData[id] })).filter(x => shown.has(x.p))
     const isCollapsed = meters.isCollapsed === true
     const viewIndex = Math.max(0, LIMIT_VIEWS.findIndex(v => v.value === meters.mode))
     const summary = limitSummary(limitProviders, now)

@@ -24,7 +24,7 @@ import {
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
-import { CODEX_EFFORTS, SUBAGENT_EFFORTS, cardModelName, effortProblem, harnessEfforts, isResetPast, limitSummary, readingAge, resetNote, routeEffortChoices } from '../hooks/harness'
+import { CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, cardModelName, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
 import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -1898,6 +1898,28 @@ test('a usage reading says how old it is, and a window past its reset is out of 
   ])
 })
 
+test('usage meters put Claude first, then the rest alphabetically, and newer Codex readings win', () => {
+  expect(METER_PROVIDERS.map(m => m.id)).toEqual(['claude', 'antigravity', 'codex', 'copilot'])
+  expect(
+    orderMeters([
+      { name: 'Zed' },
+      { name: 'Codex' },
+      { name: 'Copilot' },
+      { name: 'Claude' },
+      { name: 'Antigravity' },
+      { name: 'Bedrock' },
+    ]).map(m => m.name),
+  ).toEqual(['Claude', 'Antigravity', 'Bedrock', 'Codex', 'Copilot', 'Zed'])
+
+  // A live reading wins over an older rollout reading; a newer rollout reading updates it.
+  expect(shouldTakeCodexLimits(undefined, undefined, 1000, 'rollout')).toBe(true)
+  expect(shouldTakeCodexLimits(1000, 'rollout', 2000, 'live')).toBe(true)
+  expect(shouldTakeCodexLimits(2000, 'live', 1000, 'rollout')).toBe(false)
+  expect(shouldTakeCodexLimits(2000, 'live', 2000, 'rollout')).toBe(false)
+  expect(shouldTakeCodexLimits(2000, 'rollout', 2000, 'live')).toBe(true)
+  expect(shouldTakeCodexLimits(2000, 'live', 3000, 'rollout')).toBe(true)
+})
+
 type TestEngine = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0]
 
 const mountPane = ($: TestEngine, bodyColumns = 50) =>
@@ -1922,7 +1944,7 @@ test('the top row holds keep-warm, Routing and Settings in that order, above the
   await ui.unmount()
 })
 
-test('usage limits fold into one line, switch views, and Refresh reads them again, Codex too', async ($, on) => {
+test('usage limits fold into one line, switch views, and Refresh reads them live, Codex too', async ($, on) => {
   const now = Date.UTC(2026, 10, 21, 12)
   const clock = mock.clock(on, { now })
   mock.store(on, { harnesses: [], 'codex-enabled': true })
@@ -1938,35 +1960,46 @@ test('usage limits fold into one line, switch views, and Refresh reads them agai
   on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
   on('fs.list', () => ({ value: [] }))
   on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
   let claudePercent = 40
   on('session.usage', () => ({
     value: { startedAt: now, context: { tokens: 0 }, rateLimits: [{ kind: 'five_hour', percentUsed: claudePercent, resetsAt: new Date(now + 3_600_000).toISOString() }] } as never,
   }))
-  // Codex's last reading is three hours old, from before its 5-hour window reset.
+  // Codex's last rollout reading is three hours old, from before its 5-hour window reset.
   const old = { windows: [{ minutes: 300, percent: 14, resetsAt: now - 30 * 60_000 }, { minutes: 10080, percent: 80, resetsAt: now + 86_400_000 }], plan: 'plus' }
+  const oldTs = now - 3 * 3_600_000
   on('process.spawn', async function* () {
-    yield { stream: 'stdout', text: `${JSON.stringify({ t: 'limits', ts: now - 3 * 3_600_000, limits: old })}\n` } as never
+    yield { stream: 'stdout', text: `${JSON.stringify({ t: 'limits', ts: oldTs, limits: old, source: 'rollout' })}\n` } as never
     return { value: { exitCode: 0 } } as never
   })
-  const asked: string[] = []
+  let liveReady = false
+  const asked: string[][] = []
   on('process.run', async (_$, e) => {
     const argv = (e as { argv?: string[] }).argv ?? []
     if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) {
-      asked.push(argv[2]!)
+      asked.push(argv.slice(2))
+      if (!liveReady) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ts: oldTs, limits: old, source: 'rollout' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
       await clock.sleep(1000)
       const fresh = { windows: [{ minutes: 300, percent: 30, resetsAt: now + 4 * 3_600_000 }, { minutes: 10080, percent: 81, resetsAt: now + 86_400_000 }], plan: 'plus' }
-      return { value: { exitCode: 0, stdout: JSON.stringify({ ts: now, limits: fresh }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ ts: now, limits: fresh, source: 'live' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
   await clock.settle()
   const ui = await mountPane($)
-  expect(await ui.find({ text: /Codex · plus · updated 3h ago/ })).toBeDefined()
+  // Fallback case: shows source ("from last session"), age, out of date, and plain-words fallback hint.
+  expect(asked.length).toBe(1)
+  expect(asked[0]).toEqual(['C:\\Users\\me/.codex/sessions', 'codex'])
+  expect(await ui.find({ text: /Codex · plus · from last session · updated 3h ago/ })).toBeDefined()
   expect(await ui.find({ text: 'out of date' })).toBeDefined()
   expect(await ui.find({ text: /resets in 0m/ })).toBeUndefined()
-  expect(await ui.find({ text: /Codex writes its limits only while it works/ })).toBeDefined()
+  expect(await ui.find({ text: /Could not read Codex's limits live/ })).toBeDefined()
 
+  // Live read via Refresh: replaces the older rollout reading, drops the fallback label and hint.
+  liveReady = true
   claudePercent = 55
   await ui.press({ key: 'lim-refresh' } as never)
   await ui.redraw()
@@ -1974,17 +2007,27 @@ test('usage limits fold into one line, switch views, and Refresh reads them agai
   await clock.advance(1000)
   await ui.redraw()
   expect((await ui.find({ key: 'lim-refresh' }))?.text).toBe('↻ Refresh')
-  expect(asked).toEqual(['C:\\Users\\me/.codex/sessions'])
+  expect(asked.length).toBe(2)
   expect(await ui.find({ text: 'out of date' })).toBeUndefined()
   expect(await ui.find({ text: /updated 3h ago/ })).toBeUndefined()
+  expect(await ui.find({ text: /from last session/ })).toBeUndefined()
+  expect(await ui.find({ text: /Could not read Codex's limits live/ })).toBeUndefined()
   expect(await ui.find({ text: 'resets in 4h' })).toBeDefined()
   expect(await ui.find({ text: '55%' })).toBeDefined()
 
+  // Folded summary puts Claude first, then Codex.
   await ui.press({ key: 'lim-toggle' } as never)
   await ui.redraw()
-  expect(await ui.find({ type: 'Text', text: /^Codex 81% · Claude 55%$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Claude 55% · Codex 81%$/ })).toBeDefined()
   expect(await ui.find({ text: /5-hour limit/ })).toBeUndefined()
   expect((await ui.find({ key: 'lim-toggle' }))?.text).toBe('▸ Usage limits')
+
+  // Ten minutes later, the poller asks again; an older fallback must not replace the newer live reading.
+  liveReady = false
+  await clock.advance(10 * 60_000)
+  await ui.redraw()
+  expect(asked.length).toBe(3)
+  expect(await ui.find({ type: 'Text', text: /^Claude 55% · Codex 81%$/ })).toBeDefined()
 
   // The header's view switch and Settings → Usage meters are one setting.
   await ui.select({ key: 'lim-view', value: 'selected' })
@@ -1996,6 +2039,95 @@ test('usage limits fold into one line, switch views, and Refresh reads them agai
   await ui.press({ key: 'h-done' } as never)
   await ui.redraw()
   expect(((await ui.find({ key: 'lim-view' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('session')
+  await ui.unmount()
+})
+
+test('usage meters keep the same order (Claude, Antigravity, Codex, Copilot) in expanded rows, folded summary and Settings', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  const clock = mock.clock(on, { now })
+  mock.store(on, { harnesses: [preset('antigravity')], 'codex-enabled': true, 'codex-path': 'C:\\custom\\codex.exe' })
+  on('session.id', () => ({ value: 'sid-order' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: { startedAt: now, context: { tokens: 0 }, rateLimits: [{ kind: 'five_hour', percentUsed: 15, resetsAt: new Date(now + 3_600_000).toISOString() }] } as never,
+  }))
+  on('process.spawn', async function* () {
+    return { value: { exitCode: 0 } } as never
+  })
+  let codexLimitsArgv: string[] = []
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv[0] === 'gh') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            token_based_billing: true,
+            quota_reset_date_utc: new Date(now + 10 * 86_400_000).toISOString(),
+            quota_snapshots: { premium_interactions: { unlimited: false, entitlement: 1000, remaining: 580, percent_remaining: 58 } },
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    if (argv.some(a => a.endsWith('agy-quota.mjs'))) {
+      return { value: { exitCode: 0, stdout: JSON.stringify({ sessionId: 's1', quota: AGY_QUOTA }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (argv.some(a => a.endsWith('codex-limits.mjs'))) {
+      codexLimitsArgv = [...argv]
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            ts: now,
+            source: 'live',
+            limits: { windows: [{ minutes: 300, percent: 25, resetsAt: now + 3_600_000 }], plan: 'plus' },
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(codexLimitsArgv.slice(2)).toEqual(['C:\\Users\\me/.codex/sessions', 'C:\\custom\\codex.exe'])
+  const ui = await mountPane($, 60)
+
+  // 1. Expanded rows order
+  const rowKeys = (await ui.findAll({}))
+    .map(el => (el as { key?: string }).key)
+    .filter((k): k is string => typeof k === 'string' && k.startsWith('lim-row-'))
+  expect(rowKeys).toEqual(['lim-row-claude', 'lim-row-antigravity', 'lim-row-codex', 'lim-row-copilot'])
+
+  // 2. Folded one-line summary order
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^Claude 15% · Antigravity 50% · Codex 25% · Copilot 42%$/ })).toBeDefined()
+
+  // 3. Settings → Usage meters Selected buttons order
+  await ui.select({ key: 'lim-view', value: 'selected' })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  const meterButtons = (await ui.findAll({ type: 'Button' } as never))
+    .map(b => (b as { key?: string }).key)
+    .filter((k): k is string => typeof k === 'string' && /^m-(claude|antigravity|codex|copilot)$/.test(k))
+  expect(meterButtons).toEqual(['m-claude', 'm-antigravity', 'm-codex', 'm-copilot'])
   await ui.unmount()
 })
 

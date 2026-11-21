@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, CodexLimitSource, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -1351,6 +1351,41 @@ export const limitSummary = (rows: readonly { name: string; windows: readonly Li
     const live = r.windows.filter(w => !isResetPast(w, now))
     return { name: r.name, percent: live.length ? Math.max(...live.map(w => w.percent)) : undefined }
   })
+
+/**
+ * Orders usage-meter entries: Claude first (this is Claude Code), then the rest
+ * alphabetically by their shown name so any future provider slots in automatically.
+ */
+export const orderMeters = <T extends { name: string }>(items: readonly T[]): T[] =>
+  [...items].sort((a, b) => {
+    const ac = a.name.toLowerCase() === 'claude'
+    const bc = b.name.toLowerCase() === 'claude'
+    if (ac !== bc) return ac ? -1 : 1
+    return a.name.localeCompare(b.name, 'en', { sensitivity: 'base' })
+  })
+
+/** The single ordered list of usage-meter providers: Claude first, then alphabetical by shown name. */
+export const METER_PROVIDERS: readonly { id: MeterProvider; name: string }[] = orderMeters([
+  { id: 'claude' as const, name: 'Claude' },
+  { id: 'codex' as const, name: 'Codex' },
+  { id: 'copilot' as const, name: 'Copilot' },
+  { id: 'antigravity' as const, name: 'Antigravity' },
+])
+
+/**
+ * Whether an incoming Codex usage reading replaces the one already shown.
+ * Newer timestamps win; at the same timestamp a live reading beats a rollout fallback.
+ */
+export const shouldTakeCodexLimits = (
+  currentAt: number | undefined,
+  currentSource: CodexLimitSource | undefined,
+  incomingAt: number,
+  incomingSource?: CodexLimitSource,
+): boolean => {
+  if (currentAt === undefined) return true
+  if (incomingAt !== currentAt) return incomingAt > currentAt
+  return !(currentSource === 'live' && incomingSource === 'rollout')
+}
 
 // ---------- handing a finished run's report over, once ----------
 
