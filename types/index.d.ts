@@ -139,6 +139,8 @@ export type AgentCard = {
   binary?: string
   /** Epoch ms of the last rollout line a Codex card got. */
   lastEventAt?: number
+  /** Byte offset in the Codex rollout file already processed, so reopening does not duplicate output. */
+  rolloutOffset?: number
   error?: string
 }
 
@@ -281,6 +283,8 @@ declare module 'claude-code' {
       meters: MeterChoice
       /** Task routing: who does each kind of task, and whether Claude is told. */
       routing: Routing
+      /** Run keys whose completion reports were already accepted in this session, for receiver-side dedup across reloads. */
+      deliveredRuns: string[]
     }
   }
 }

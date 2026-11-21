@@ -7,9 +7,13 @@ import {
   AGY_VIEWS,
   effortLabel,
   shownWindows,
+  CARD_MAX_BYTES,
   CARD_STALE_MS,
+  DEAD_RUNNER_REASON,
   METER_PROVIDERS,
   cardModelName,
+  cardsKey,
+  deadRunnerFailure,
   effortProblem,
   fmtSpan,
   isResetPast,
@@ -29,11 +33,18 @@ import {
   DEFAULT_TASKS,
   DELIVERY_CLAIM_TTL_MS,
   deliveryClaim,
+  deliveryRunKey,
   isDeliveryTaken,
   readDeliveryMark,
+  rememberDeliveredRun,
+  reportRunKey,
   loadRouting,
   loadSessionCards,
-  mergeSavedCards,
+  loadSingleSessionCards,
+  migrateLegacyCards,
+  parseCardsIndex,
+  parseRunPid,
+  planCardsSave,
   resolveRun,
   restoreCard,
   routeModelChoices,
@@ -120,6 +131,7 @@ const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: METER_PROVIDERS.map
 const AGY_ACCENT = '#3186FF'
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
 const routingAtom = atom({ plugin: 'agent-deck', key: 'routing' } as const, DEFAULT_ROUTING)
+const deliveredRunsAtom = atom({ plugin: 'agent-deck', key: 'deliveredRuns' } as const, [] as string[])
 const COPILOT_ACCENT = '#8957E5'
 /** The streamed output an open card shows before Show all: its last lines, newest at the bottom. */
 const OUTPUT_LINES = 12
@@ -408,10 +420,12 @@ const CODEX_RESULT_SPEC: ToolSpec = {
 }
 
 const KEY_CARDS = 'cards'
+const KEY_CARDS_INDEX = 'cards-index'
 let flushTimer: { cancel: () => void } | undefined
 let isSavingCards = false
 let hasPendingCardSave = false
 let cardSavePromise: Promise<void> | undefined
+let hasLoggedCardSaveError = false
 
 const saveCards = ($: $T): Promise<void> => {
   hasPendingCardSave = true
@@ -425,13 +439,28 @@ const saveCards = ($: $T): Promise<void> => {
         if (!sid) return
         const list = [...cards.values()].slice(-MAX_CARDS)
         const now = await $.clock.now()
-        const stored = await $.store.get(KEY_CARDS)
-        const storedObj = stored && typeof stored === 'object' && !Array.isArray(stored) ? (stored as Record<string, unknown>) : undefined
-        const hadSession = !!storedObj && sid in storedObj
-        const next = mergeSavedCards(stored, sid, list, now, { maxCards: MAX_CARDS, maxOutput: MAX_OUTPUT })
-        const pruned = !!storedObj && Object.keys(storedObj).some(k => k !== sid && !(k in next))
-        if (list.length === 0 && !hadSession && !pruned) continue
-        await $.store.set(KEY_CARDS, next)
+        try {
+          const prevIndex = parseCardsIndex(await $.store.get(KEY_CARDS_INDEX))
+          const hadSession = sid in prevIndex
+          const { entry, index, prune } = planCardsSave(prevIndex, sid, list, now, {
+            maxCards: MAX_CARDS,
+            maxOutput: MAX_OUTPUT,
+            maxBytes: CARD_MAX_BYTES,
+          })
+          if (list.length === 0 && !hadSession && prune.length === 0) continue
+          if (entry) await $.store.set(cardsKey(sid), entry)
+          else if (hadSession) await $.store.delete(cardsKey(sid))
+          for (const oldSid of prune) {
+            await $.store.delete(cardsKey(oldSid)).catch(() => undefined)
+          }
+          await $.store.set(KEY_CARDS_INDEX, index)
+          hasLoggedCardSaveError = false
+        } catch (err) {
+          if (!hasLoggedCardSaveError) {
+            hasLoggedCardSaveError = true
+            $.ui.log(`agent-deck: could not save session cards: ${String((err as Error)?.message ?? err).slice(0, 120)}`)
+          }
+        }
       }
     } finally {
       isSavingCards = false
@@ -543,10 +572,24 @@ const openPane = ($: $T) => {
   } catch {}
 }
 
+/** True while a card belongs to a managed background run whose report has not been delivered yet. */
+const hasPendingDelivery = (c: AgentCard): boolean => {
+  if (!c.runId) return false
+  if (c.provider === 'harness') {
+    const r = hruns.get(c.runId)
+    return !!r && !r.isDelivered
+  }
+  if (c.provider === 'codex') {
+    const r = runs.get(c.runId)
+    return !!r && !r.isDelivered
+  }
+  return false
+}
+
 const addCard = async ($: $T, card: AgentCard) => {
   cards.set(card.id, card)
   while (cards.size > MAX_CARDS) {
-    const oldest = [...cards.values()].find(c => c.status !== 'running')
+    const oldest = [...cards.values()].find(c => c.status !== 'running' && !hasPendingDelivery(c))
     if (!oldest) break
     cards.delete(oldest.id)
   }
@@ -576,19 +619,22 @@ export type WatchEvent =
   | { t: 'hello' }
   | { t: 'limits'; ts: number; limits: WatchLimits; source?: CodexLimitSource }
   | { t: 'run'; run: string; thread: string }
-  | { t: 'meta'; f: string; ts: number; cwd: string }
-  | { t: 'ctx'; f: string; ts: number; model?: string; effort?: string }
-  | { t: 'prompt'; f: string; ts: number; text: string }
-  | { t: 'msg'; f: string; ts: number; text: string; phase?: string }
-  | { t: 'reason'; f: string; ts: number; text: string }
-  | { t: 'act'; f: string; ts: number; id: string; label?: string; status: Activity['status'] }
+  | { t: 'meta'; f: string; ts: number; cwd: string; off?: number }
+  | { t: 'ctx'; f: string; ts: number; model?: string; effort?: string; off?: number }
+  | { t: 'prompt'; f: string; ts: number; text: string; off?: number }
+  | { t: 'msg'; f: string; ts: number; text: string; phase?: string; off?: number }
+  | { t: 'reason'; f: string; ts: number; text: string; off?: number }
+  | { t: 'act'; f: string; ts: number; id: string; label?: string; status: Activity['status']; off?: number }
   /** Any other rollout line: Codex is still writing. */
-  | { t: 'beat'; f: string; ts: number }
-  | { t: 'tok'; f: string; ts: number; tokens?: Omit<Tokens, never>; limits?: WatchLimits }
-  | { t: 'task'; f: string; ts: number; state: 'running' | 'done' | 'aborted' }
-  | { t: 'err'; f: string; ts: number; text: string }
+  | { t: 'beat'; f: string; ts: number; off?: number }
+  | { t: 'tok'; f: string; ts: number; tokens?: Omit<Tokens, never>; limits?: WatchLimits; off?: number }
+  | { t: 'task'; f: string; ts: number; state: 'running' | 'done' | 'aborted'; off?: number }
+  | { t: 'err'; f: string; ts: number; text: string; off?: number }
 
 type WatchLimits = { windows: { minutes?: number; percent: number; resetsAt?: number }[]; plan?: string }
+
+/** Timestamp high-water mark for Codex cards restored from store, used to ignore replayed lines when no byte offset is present. */
+const restoredWatermark = new Map<string, number>()
 
 export const toLimitWindows = (l: WatchLimits): LimitWindow[] =>
   l.windows.map(w => ({ label: windowLabel(w.minutes), percent: w.percent, resetsAt: w.resetsAt }))
@@ -620,6 +666,8 @@ const adoptThread = ($: $T, runId: string, thread: string) => {
     runCard.model = stray.model
     runCard.effort = stray.effort ?? runCard.effort
     runCard.isThinking = stray.isThinking
+    runCard.lastEventAt = Math.max(runCard.lastEventAt ?? 0, stray.lastEventAt ?? 0) || undefined
+    runCard.rolloutOffset = Math.max(runCard.rolloutOffset ?? 0, stray.rolloutOffset ?? 0) || undefined
     cards.delete(stray.id)
   }
   threadToCard.set(thread, runCard.id)
@@ -635,12 +683,17 @@ export const staleFor = (c: AgentCard, now: number): number | undefined => {
   return quiet >= STALE_MS ? quiet : undefined
 }
 
-export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string }>) => {
+export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string }>, replayCutoff?: number) => {
+  if (ev.off !== undefined) {
+    if (card.rolloutOffset !== undefined && ev.off <= card.rolloutOffset) return
+    card.rolloutOffset = ev.off
+  }
+  const isReplay = ev.off === undefined && replayCutoff !== undefined && ev.ts <= replayCutoff
   const isRunCard = card.runId !== undefined
   card.lastEventAt = Math.max(card.lastEventAt ?? 0, ev.ts)
   switch (ev.t) {
     case 'meta':
-      if (card.isExternal) card.startedAt = ev.ts
+      if (card.isExternal && !isReplay) card.startedAt = ev.ts
       break
     case 'ctx':
       if (ev.model) card.model = ev.model
@@ -650,10 +703,12 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
       if (card.isExternal && card.title === 'Codex') card.title = ev.text.split('\n')[0]!.slice(0, 70)
       break
     case 'msg':
+      if (isReplay) break
       card.isThinking = false
       appendOutput(card, `${ev.text.trimEnd()}\n`)
       break
     case 'reason':
+      if (isReplay) break
       appendOutput(card, `${ev.text.split('\n').map(l => `∴ ${l}`).join('\n')}\n`)
       break
     case 'act': {
@@ -665,7 +720,7 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
             a.id !== ev.id ? a : { ...a, label: ev.label ?? a.label, status: !ev.label && a.status === 'error' ? 'error' : ev.status },
           )
         : [...card.activity, { id: ev.id, label: ev.label!, status: ev.status }].slice(-30)
-      card.isThinking = !card.activity.some(a => a.status === 'running')
+      if (!isReplay) card.isThinking = !card.activity.some(a => a.status === 'running')
       break
     }
     case 'tok':
@@ -673,14 +728,14 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
       break
     case 'task':
       // A run's card is finished by its exit file; an external one by its rollout.
-      if (!isRunCard) {
+      if (!isRunCard && !(isReplay && card.status !== 'running')) {
         card.status = ev.state
         card.endedAt = ev.state === 'running' ? undefined : ev.ts
         card.isThinking = ev.state === 'running'
       }
       break
     case 'err':
-      card.error = redactSecrets(stripAnsi(ev.text)).trim() || ev.text
+      if (!isReplay) card.error = redactSecrets(stripAnsi(ev.text)).trim() || ev.text
       break
   }
 }
@@ -696,9 +751,11 @@ export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
     return
   }
   const card = await cardForThread($, ev.f, ev.ts)
-  applyToCard(card, ev)
+  const cutoff = restoredWatermark.get(card.id)
+  if (cutoff !== undefined && ev.ts > cutoff) restoredWatermark.delete(card.id)
+  applyToCard(card, ev, cutoff)
   if (ev.t === 'tok' && ev.limits) await setCodexLimits($, ev.ts, ev.limits)
-  if (ev.t === 'task' && ev.state === 'running') startTicking($)
+  if (ev.t === 'task' && ev.state === 'running' && (cutoff === undefined || ev.ts > cutoff)) startTicking($)
   schedule($)
 }
 
@@ -877,14 +934,63 @@ type DeliveryState = {
 }
 const deliveries = new Map<string, DeliveryState>()
 
+type ClaimResult =
+  | { state: 'delivered' }
+  | { state: 'owned'; token: string; at: number }
+  | { state: 'taken'; token?: string; at?: number }
+  | { state: 'claimed'; token: string; at: number }
+  | { state: 'none' }
+  | { state: 'released' }
+  | { state: 'kept' }
+
+/** Serializes delivered.txt updates through bin/claim.mjs (O_EXCL lockfile), without a shell. */
+const runClaimScript = async ($: $T, args: string[]): Promise<ClaimResult | undefined> => {
+  const r = await $.process.run(['node', `${$.plugin.root}/bin/claim.mjs`, ...args], { timeoutMs: 5_000 }).catch(() => undefined)
+  if (!r || r.exitCode !== 0 || !r.stdout) return undefined
+  try {
+    const parsed = JSON.parse(r.stdout.trim()) as ClaimResult
+    return parsed && typeof parsed === 'object' && typeof parsed.state === 'string' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const isRunDelivered = async ($: $T, runKey: string): Promise<boolean> => {
+  const list = await read($, deliveredRunsAtom).catch(() => [] as string[])
+  return list.includes(runKey)
+}
+
+const markRunDelivered = async ($: $T, runKey: string): Promise<void> => {
+  await update($, deliveredRunsAtom, list => rememberDeliveredRun(list, runKey)).catch(() => undefined)
+}
+
+const releaseClaim = async ($: $T, dir: string, token: string | undefined) => {
+  if (!token) return
+  const res = await runClaimScript($, ['release', dir, token])
+  if (res) return
+  const file = `${dir}/delivered.txt`
+  const mark = readDeliveryMark(await readText($, file))
+  if (mark.state === 'claimed' && mark.token === token) {
+    await $.fs.write(file, '').catch(() => undefined)
+  }
+}
+
 const writeDeliveredMark = async ($: $T, dir: string, d: DeliveryState): Promise<boolean> => {
   const at = d.deliveredAt ?? (await $.clock.now())
   d.deliveredAt = at
   d.claim = undefined
   d.claimAt = undefined
   if (d.isWritten) return true
+  const res = await runClaimScript($, ['deliver', dir, String(at)])
+  if (res?.state === 'delivered') {
+    d.isWritten = true
+    d.onDelivered?.()
+    return true
+  }
   try {
-    await $.fs.write(`${dir}/delivered.txt`, String(at))
+    const file = `${dir}/delivered.txt`
+    const cur = readDeliveryMark(await readText($, file))
+    if (cur.state !== 'delivered') await $.fs.write(file, String(at))
     d.isWritten = true
     d.onDelivered?.()
     return true
@@ -893,22 +999,23 @@ const writeDeliveredMark = async ($: $T, dir: string, d: DeliveryState): Promise
   }
 }
 
-const sendReport = async ($: $T, dir: string, what: string, text: string, d: DeliveryState) => {
-  const file = `${dir}/delivered.txt`
+const sendReport = async ($: $T, dir: string, what: string, text: string, d: DeliveryState, runKey?: string) => {
+  const token = d.claim
   try {
     const entered = await $.prompt.submit({ text })
     if (entered?.drop !== undefined) throw new Error(`refused: ${entered.drop}`)
+    if (runKey) await markRunDelivered($, runKey)
     await writeDeliveredMark($, dir, d)
   } catch (err) {
-    // If prompt.submit already saw the prompt accepted, never release the claim or submit it a second time.
-    if (d.deliveredAt !== undefined) {
+    // If prompt.submit already accepted the report (or another copy delivered it), never release the claim or submit again.
+    if (d.deliveredAt !== undefined || (runKey && (await isRunDelivered($, runKey)))) {
       await writeDeliveredMark($, dir, d)
       return
     }
     const at = await $.clock.now()
     d.claim = undefined
     d.claimAt = undefined
-    await $.fs.write(file, '').catch(() => undefined)
+    await releaseClaim($, dir, token)
     d.tries++
     d.nextAt = at + 30_000 * d.tries
     if (d.tries >= MAX_DELIVERY_TRIES) {
@@ -928,55 +1035,124 @@ const releaseUnsentClaims = async ($: $T) => {
     const token = d.claim
     d.claim = undefined
     d.claimAt = undefined
-    const file = `${dir}/delivered.txt`
-    const mark = readDeliveryMark(await readText($, file))
-    if (mark.state === 'claimed' && mark.token === token) {
-      await $.fs.write(file, '').catch(() => undefined)
-    }
+    await releaseClaim($, dir, token)
   }
 }
 
 /**
  * Hands a finished run's report to the model as a new turn, once. Another copy of agent-deck
  * can be watching the same run folder: the copy a reload replaced, still finishing its poll, or
- * the released plugin beside a dev copy. So one poll claims the folder's delivered.txt, and a
- * later poll submits the report only if the claim there is still this copy's; a copy that finds
- * another's claim leaves the report alone. A refused or failed submit lets the claim go and is
- * tried again later (30 s, 60 s, ...), five times at most. True once nothing is left to do here.
+ * the released plugin beside a dev copy. So one poll claims the folder's delivered.txt (atomically
+ * through bin/claim.mjs), and a later poll submits the report only if the claim there is still
+ * this copy's; a copy that finds another's claim leaves the report alone. A refused or failed
+ * submit lets the claim go and is tried again later (30 s, 60 s, ...), five times at most.
+ * True once nothing is left to do here.
  */
-const deliverReport = async ($: $T, dir: string, what: string, text: string, onDelivered?: () => void): Promise<boolean> => {
+const deliverReport = async (
+  $: $T,
+  dir: string,
+  what: string,
+  text: string,
+  onDelivered?: () => void,
+  runKey?: string,
+): Promise<boolean> => {
   const d = deliveries.get(dir) ?? { tries: 0, nextAt: 0, isSending: false }
   if (onDelivered) d.onDelivered = onDelivered
   deliveries.set(dir, d)
   const file = `${dir}/delivered.txt`
   const now = await $.clock.now()
+  if (runKey && (await isRunDelivered($, runKey))) {
+    return writeDeliveredMark($, dir, d)
+  }
   if (d.deliveredAt !== undefined) {
-    const mark = readDeliveryMark(await readText($, file))
-    if (mark.state === 'delivered') {
-      d.isWritten = true
-      return true
-    }
-    d.isWritten = false
+    if (d.isWritten) return true
     return writeDeliveredMark($, dir, d)
   }
   if (d.isSending) {
     // Keep our claim fresh while $.prompt.submit waits on a long turn, so another copy doesn't take it over.
     if (d.claim && d.claimAt !== undefined && now - d.claimAt >= DELIVERY_CLAIM_TTL_MS / 2) {
-      const mark = readDeliveryMark(await readText($, file))
-      if (mark.state === 'claimed' && mark.token === d.claim) {
-        d.claimAt = now
-        await $.fs.write(file, deliveryClaim(d.claim, now)).catch(() => undefined)
+      const res = await runClaimScript($, ['refresh', dir, d.claim, String(now)])
+      if (res) {
+        if (res.state === 'owned') d.claimAt = now
+        else if (res.state === 'delivered') {
+          d.deliveredAt = now
+          d.isWritten = true
+          d.claim = undefined
+          d.claimAt = undefined
+        }
+      } else {
+        const mark = readDeliveryMark(await readText($, file))
+        if (mark.state === 'claimed' && mark.token === d.claim) {
+          d.claimAt = now
+          await $.fs.write(file, deliveryClaim(d.claim, now)).catch(() => undefined)
+        }
       }
     }
     return false
   }
   if (d.tries >= MAX_DELIVERY_TRIES) return true
+
+  if (!d.claim && now >= d.nextAt) {
+    const token = `${now.toString(36)}-${Math.floor(Math.random() * 36 ** 6).toString(36)}`
+    const res = await runClaimScript($, ['claim', dir, token, String(now), String(DELIVERY_CLAIM_TTL_MS)])
+    if (res) {
+      if (res.state === 'delivered') {
+        d.deliveredAt = now
+        d.isWritten = true
+        d.claim = undefined
+        d.claimAt = undefined
+        d.onDelivered?.()
+        return true
+      }
+      if (res.state === 'claimed' || res.state === 'owned') {
+        d.claim = res.token
+        d.claimAt = res.at
+      }
+      return false
+    }
+  } else if (d.claim) {
+    const res = await runClaimScript($, ['claim', dir, d.claim, String(now), String(DELIVERY_CLAIM_TTL_MS)])
+    if (res) {
+      if (res.state === 'delivered') {
+        d.deliveredAt = now
+        d.isWritten = true
+        d.claim = undefined
+        d.claimAt = undefined
+        d.onDelivered?.()
+        return true
+      }
+      if (res.state === 'taken') {
+        d.claim = undefined
+        d.claimAt = undefined
+        return false
+      }
+      if (res.state === 'claimed') {
+        d.claim = res.token
+        d.claimAt = res.at
+        return false
+      }
+      if (res.state === 'owned') {
+        if (now - res.at < CLAIM_SETTLE_MS) return false
+        if (runKey && (await isRunDelivered($, runKey))) return writeDeliveredMark($, dir, d)
+        d.isSending = true
+        d.sendingText = text
+        void sendReport($, dir, what, text, d, runKey)
+        return false
+      }
+    }
+  }
+
+  // Fallback when bin/claim.mjs is unavailable (e.g. mocked process.run in tests).
   const mark = readDeliveryMark(await readText($, file))
+  if (runKey && (await isRunDelivered($, runKey))) {
+    return writeDeliveredMark($, dir, d)
+  }
   if (mark.state === 'delivered') {
     d.deliveredAt = now
     d.isWritten = true
     d.claim = undefined
     d.claimAt = undefined
+    d.onDelivered?.()
     return true
   }
   if (mark.state !== 'claimed' || mark.token !== d.claim) {
@@ -997,7 +1173,7 @@ const deliverReport = async ($: $T, dir: string, what: string, text: string, onD
   d.isSending = true
   d.sendingText = text
   // Submit without stalling other runs in the poll loop while the session is busy.
-  void sendReport($, dir, what, text, d)
+  void sendReport($, dir, what, text, d, runKey)
   return false
 }
 
@@ -1025,9 +1201,16 @@ const finishRun = async ($: $T, run: Run, outcome: RunOutcome) => {
       ? `Background Codex run ${run.id} ("${run.title}") finished after ${elapsed}. Its report:`
       : `Background Codex run ${run.id} ("${run.title}") failed after ${elapsed}: ${outcome.error ?? 'unknown error'}${outcome.report ? '\n\nIts last message:' : ''}`
   const text = `[agent-deck] ${head}\n\n${outcome.report}\n\n${footerOf(run, card)}`.trim()
-  run.isDelivered = await deliverReport($, run.dir, `Codex run ${run.id}`, text, () => {
-    run.isDelivered = true
-  })
+  run.isDelivered = await deliverReport(
+    $,
+    run.dir,
+    `Codex run ${run.id}`,
+    text,
+    () => {
+      run.isDelivered = true
+    },
+    deliveryRunKey('codex', run.id),
+  )
 }
 
 let isPollingRuns = false
@@ -1125,6 +1308,29 @@ type HarnessRun = HarnessRunMeta & {
   final: string
   isFinished: boolean
   isDelivered?: boolean
+  /** Last time pid.txt was checked for liveness; undefined on restored runs so they check on the first poll. */
+  lastPidCheckAt?: number
+  /** Snapshot of the card at finish so delivery still succeeds if the card is ever removed from the pane. */
+  finishedCard?: AgentCard
+}
+
+const PID_CHECK_INTERVAL_MS = 10_000
+
+/** Checks whether `pid` is still alive via bin/pid-alive.mjs without a shell; undefined when the check cannot run. */
+const checkPidAlive = async ($: $T, pid: number): Promise<boolean | undefined> => {
+  const r = await $.process.run(['node', `${$.plugin.root}/bin/pid-alive.mjs`, String(pid)], { timeoutMs: 5_000 }).catch(() => undefined)
+  if (!r || r.exitCode !== 0 || !r.stdout) return undefined
+  try {
+    const parsed = JSON.parse(r.stdout.trim()) as { alive?: unknown }
+    return typeof parsed.alive === 'boolean' ? parsed.alive : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const harnessSecrets = (harnessId: string): string[] | undefined => {
+  const key = harnessList.find(h => h.id === harnessId)?.provider?.apiKey?.trim()
+  return key ? [key] : undefined
 }
 
 const hruns = new Map<string, HarnessRun>()
@@ -1214,10 +1420,11 @@ const readHarnessEvents = async ($: $T, run: HarnessRun, card: AgentCard, isLast
   run.offset = text.length
   const lines = fresh.split('\n')
   run.partial = isLast ? '' : (lines.pop() ?? '')
+  const secrets = harnessSecrets(run.harness)
   for (const line of lines) {
     for (const ev of parseLine(run.parser, line.replace(/\r$/, ''))) {
       if (ev.kind === 'final') run.final = ev.text
-      else applyHarnessEvent(card, ev)
+      else applyHarnessEvent(card, ev, secrets)
     }
   }
 }
@@ -1243,21 +1450,23 @@ const finishHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard, code: n
   run.isFinished = true
   if (run.parser === 'antigravity') void refreshAgyLimits($)
   const stderr = (await readText($, `${run.dir}/stderr.log`)) ?? ''
+  const secrets = harnessSecrets(run.harness)
   const exitCode = Number.isNaN(code) ? undefined : code
   const isOk = code === 0 && !card.error
   if (card.status === 'running') {
     card.status = isOk ? 'done' : 'error'
     card.endedAt = await $.clock.now()
     card.isThinking = false
-    if (!isOk) card.error = harnessFailure(run.name, exitCode, card.error, stderr, run.parser)
+    if (!isOk) card.error = harnessFailure(run.name, exitCode, card.error, stderr, run.parser, secrets)
     schedule($)
   } else if (card.status === 'error') {
-    const nextError = harnessFailure(run.name, exitCode, card.error, stderr, run.parser)
+    const nextError = harnessFailure(run.name, exitCode, card.error, stderr, run.parser, secrets)
     if (nextError !== card.error) {
       card.error = nextError
       schedule($)
     }
   }
+  run.finishedCard = { ...card }
   await deliverHarnessRun($, run, card)
 }
 
@@ -1273,9 +1482,16 @@ const deliverHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard) => {
     ? `Background ${run.name} run ${run.id} ("${run.title}") finished after ${elapsed}. Its report:`
     : `Background ${run.name} run ${run.id} ("${run.title}") failed after ${elapsed}: ${card.error ?? 'unknown error'}${report ? '\n\nIts last output:' : ''}`
   const text = `[agent-deck] ${head}\n\n${report}\n\n${harnessFooter(run, card)}`.trim()
-  run.isDelivered = await deliverReport($, run.dir, `${run.name} run ${run.id}`, text, () => {
-    run.isDelivered = true
-  })
+  run.isDelivered = await deliverReport(
+    $,
+    run.dir,
+    `${run.name} run ${run.id}`,
+    text,
+    () => {
+      run.isDelivered = true
+    },
+    deliveryRunKey('harness', run.id),
+  )
 }
 
 let isPollingHarness = false
@@ -1288,14 +1504,46 @@ const pollHarnessRuns = async ($: $T) => {
     for (const run of hruns.values()) {
       if (run.isDelivered) continue
       const card = cards.get(harnessCardId(run.id))
-      if (!card) continue
       if (run.isFinished) {
-        await deliverHarnessRun($, run, card)
+        await deliverHarnessRun($, run, card ?? run.finishedCard ?? newHarnessCard(run))
         continue
       }
+      if (!card) continue
       const exit = await readText($, `${run.dir}/exit.txt`)
       await readHarnessEvents($, run, card, exit !== undefined)
-      if (exit !== undefined) await finishHarnessRun($, run, card, Number.parseInt(exit.trim(), 10))
+      if (exit !== undefined) {
+        await finishHarnessRun($, run, card, Number.parseInt(exit.trim(), 10))
+      } else {
+        const now = await $.clock.now()
+        if (run.lastPidCheckAt === undefined || now - run.lastPidCheckAt >= PID_CHECK_INTERVAL_MS) {
+          run.lastPidCheckAt = now
+          const pid = parseRunPid(await readText($, `${run.dir}/pid.txt`))
+          if (pid !== undefined) {
+            const isPidAlive = await checkPidAlive($, pid)
+            if (isPidAlive === false) {
+              // Re-check exit.txt in case the process exited normally right before writing it.
+              const exitAfter = await readText($, `${run.dir}/exit.txt`)
+              if (exitAfter !== undefined) {
+                await readHarnessEvents($, run, card, true)
+                await finishHarnessRun($, run, card, Number.parseInt(exitAfter.trim(), 10))
+              } else {
+                const deadReason = deadRunnerFailure({ hasExit: false, pid, isPidAlive })
+                if (deadReason) {
+                  await readHarnessEvents($, run, card, true)
+                  run.isFinished = true
+                  card.status = 'error'
+                  card.endedAt = await $.clock.now()
+                  card.isThinking = false
+                  card.error = deadReason
+                  run.finishedCard = { ...card }
+                  schedule($)
+                  await deliverHarnessRun($, run, card)
+                }
+              }
+            }
+          }
+        }
+      }
       schedule($)
     }
     if (![...hruns.values()].some(r => !r.isDelivered)) {
@@ -1386,7 +1634,7 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     if (hasEnv) await clearTempSecretFile($, envFile)
     throw error
   }
-  const run: HarnessRun = { ...meta, dir, offset: 0, partial: '', final: '', isFinished: false }
+  const run: HarnessRun = { ...meta, dir, offset: 0, partial: '', final: '', isFinished: false, lastPidCheckAt: meta.startedAt }
   hruns.set(id, run)
   await addCard($, newHarnessCard(meta))
   startHarnessPoller($)
@@ -1701,7 +1949,15 @@ const startCodexWatcher = async ($: $T) => {
   const root = await runsRoot($)
   if (!home || !root) return
   const since = (await $.clock.now()) - 30 * 60_000
-  startWatcher($, [`${home}/sessions`, root, await $.session.root(), String(since)])
+  const offsets: Record<string, number> = {}
+  for (const c of cards.values()) {
+    if (c.provider === 'codex' && c.threadId && typeof c.rolloutOffset === 'number' && c.rolloutOffset > 0) {
+      offsets[c.threadId] = Math.max(offsets[c.threadId] ?? 0, c.rolloutOffset)
+    }
+  }
+  const args = [`${home}/sessions`, root, await $.session.root(), String(since)]
+  if (Object.keys(offsets).length > 0) args.push(JSON.stringify(offsets))
+  startWatcher($, args)
 }
 
 /** The stored switch; on first use, on when `codex` is on PATH. */
@@ -2291,6 +2547,10 @@ const registerCache = (on: On) => {
   // The guard: only the first character of the prompt is read, for a slash.
   // A prompt that goes through also carries the task-routing note when the model doesn't have it yet.
   on('prompt.submit', async ($, e, next) => {
+    const reportKey = e.origin.kind === 'plugin' ? reportRunKey(e.text) : undefined
+    if (reportKey && (await isRunDelivered($, reportKey))) {
+      return { drop: 'agent-deck: report already delivered' }
+    }
     await syncSettings($).catch(() => undefined)
     const want = currentRoutingNote()
     const extra = routingContext(want, routingSent)
@@ -2299,6 +2559,7 @@ const registerCache = (on: On) => {
       if (!r.drop) {
         if (extra) routingSent = want
         if (e.origin.kind === 'plugin') {
+          if (reportKey) await markRunDelivered($, reportKey)
           for (const [dir, d] of deliveries) {
             if (d.isSending && d.sendingText === e.text && d.deliveredAt === undefined) {
               await writeDeliveredMark($, dir, d)
@@ -3468,19 +3729,44 @@ export const register: Register = on => {
     const started = await next(e)
     sessionId = await $.session.id()
     const now = await $.clock.now()
+    hasLoggedCardSaveError = false
     cards.clear()
     threadToCard.clear()
+    restoredWatermark.clear()
     const fromAtom = await read($, agents)
     const isSameProcess = fromAtom.length > 0
+    // Migrate legacy shared `cards` key once into per-session `cards:<sid>` + `cards-index`.
+    const legacyCards = await $.store.get(KEY_CARDS).catch(() => undefined)
+    if (legacyCards !== undefined) {
+      try {
+        const existingIndex = await $.store.get(KEY_CARDS_INDEX).catch(() => undefined)
+        const { sessions, index } = migrateLegacyCards(legacyCards, existingIndex, now, {
+          maxCards: MAX_CARDS,
+          maxOutput: MAX_OUTPUT,
+          maxBytes: CARD_MAX_BYTES,
+        })
+        for (const [sid, entry] of Object.entries(sessions)) {
+          await $.store.set(cardsKey(sid), entry)
+        }
+        if (Object.keys(index).length > 0 || Object.keys(sessions).length > 0) {
+          await $.store.set(KEY_CARDS_INDEX, index)
+        }
+        await $.store.delete(KEY_CARDS)
+      } catch {}
+    }
+    const perSessionRaw = isSameProcess ? undefined : await $.store.get(cardsKey(sessionId)).catch(() => undefined)
     const initial = isSameProcess
       ? fromAtom
-      : loadSessionCards(await $.store.get(KEY_CARDS).catch(() => undefined), sessionId, MAX_OUTPUT)
+      : perSessionRaw !== undefined
+        ? loadSingleSessionCards(perSessionRaw, MAX_OUTPUT)
+        : loadSessionCards(legacyCards, sessionId, MAX_OUTPUT)
     for (const raw of initial) {
       // On a hot reload (cards came from $.state), running Claude subagents are still alive;
       // on a fresh start (loaded from $.store), they aren't. Stale external Codex cards still stop.
       const c = restoreCard(raw, now, STALE_MS, isSameProcess)
       cards.set(c.id, c)
       if (c.threadId) threadToCard.set(c.threadId, c.id)
+      if (c.provider === 'codex' && c.lastEventAt !== undefined) restoredWatermark.set(c.id, c.lastEventAt)
     }
     await $.command.register({
       name: 'agent-deck',
@@ -3973,7 +4259,7 @@ export const register: Register = on => {
           ) : (
             title
           )}
-          {ws.length === 0 && <Text dimColor>{empty}</Text>}
+          {ws.length === 0 && empty && <Text dimColor>{empty}</Text>}
           {ws.map(w => {
             const isPast = isResetPast(w, now)
             const shownPercent = isPast ? 0 : w.percent
@@ -4000,14 +4286,17 @@ export const register: Register = on => {
     const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string, control?: RenderElement, empty?: string) => {
       const hasPast = ws.some(w => isResetPast(w, now))
       const codexError = p === 'codex' ? lim.codexError : undefined
+      const codexRetry = <Button key="lim-codex-retry" label="Retry" plain dimColor onPress={() => void refreshCodexLimits($)} />
+      const rowControl = p === 'codex' && ws.length === 0 && !codexError ? codexRetry : control
+      const rowEmpty = p === 'codex' && ws.length === 0 && codexError ? '' : empty
       const extra = [plan, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
       return (
         <Box key={`lim-row-${p}`} flexDirection="column" marginBottom={Svg ? 1 : 0}>
-          {Svg ? limitBars(name, color, ws, extra, control, empty) : limitText(name, color, ws, extra, control, empty)}
+          {Svg ? limitBars(name, color, ws, extra, rowControl, rowEmpty) : limitText(name, color, ws, extra, rowControl, rowEmpty)}
           {codexError && (
             <Box key="lim-codex-err" flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
               <Text dimColor wrap="wrap">{`Live reading failed: ${codexError}`}</Text>
-              <Button key="lim-codex-retry" label="Retry" plain dimColor onPress={() => void refreshCodexLimits($)} />
+              {codexRetry}
             </Box>
           )}
         </Box>
@@ -4018,7 +4307,7 @@ export const register: Register = on => {
       (isSideBySide && ws.length <= maxWindows) || ws.length === 0 ? (
         <Box key={`lim-${name}`} flexDirection="row" columnGap={2}>
           {nameCell(name, color, true)}
-          {ws.length === 0 && <Text dimColor>{empty}</Text>}
+          {ws.length === 0 && empty && <Text dimColor>{empty}</Text>}
           {ws.map(w => limitWindow(name, w))}
           {extra && <Text dimColor>{extra}</Text>}
           {control}
@@ -4319,7 +4608,8 @@ export const register: Register = on => {
     }
 
     const { used, hasReading } = meterReadings(list, hs, lim, isCodexOn)
-    const shown = new Set(METER_PROVIDERS.map(m => m.id).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
+    const hasMeter: Record<MeterProvider, boolean> = { ...hasReading, codex: isCodexOn }
+    const shown = new Set(METER_PROVIDERS.map(m => m.id).filter(x => hasMeter[x] && isMeterShown(meters, x, used)))
 
 
     const running = list.filter(c => c.status === 'running')
@@ -4356,8 +4646,8 @@ export const register: Register = on => {
     )
     const isCollapsed = meters.isCollapsed === true
     const viewIndex = Math.max(0, LIMIT_VIEWS.findIndex(v => v.value === meters.mode))
-    const summary = limitSummary(limitProviders, now)
-    const limitsBlock = Object.values(hasReading).some(Boolean) && (
+    const summary = limitSummary(limitProviders.filter(x => x.windows.length > 0), now)
+    const limitsBlock = Object.values(hasMeter).some(Boolean) && (
       <Box key="limits" flexDirection="column" marginTop={1} marginBottom={Svg ? 0 : 1}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} flexWrap="wrap">
           <Button
@@ -4387,7 +4677,7 @@ export const register: Register = on => {
           </Text>
         )}
         {isCollapsed ? (
-          limitProviders.length > 0 && (
+          summary.length > 0 ? (
             <Text key="lim-summary" wrap="wrap">
               {summary.map((x, i) => (
                 <Text key={`lim-sum-${x.name}`}>
@@ -4401,6 +4691,8 @@ export const register: Register = on => {
                 </Text>
               ))}
             </Text>
+          ) : (
+            limitProviders.length > 0 && <Text dimColor>no reading yet</Text>
           )
         ) : (
           limitProviders.map(x =>

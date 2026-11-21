@@ -608,3 +608,183 @@ test('watcher matches MSYS paths, trailing slashes, subfolders and scratchpads, 
   assert.deepEqual(await runWatch(t, rollouts, 'C:\\src\\proj\\'), expected)
   assert.deepEqual(await runWatch(t, rollouts, 'C:\\src\\proj'), expected)
 })
+
+test('2 (runner): run.mjs scrubs known credential values from env.json before writing stderr.log', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-scrub-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const dir = path.join(root, 'run')
+  const cwd = path.join(root, 'project')
+  const cli = path.join(root, 'leaky.mjs')
+  fs.mkdirSync(dir)
+  fs.mkdirSync(cwd)
+  // Emits a short, odd-shaped secret directly and across chunks.
+  fs.writeFileSync(cli, `
+    process.stderr.write('x-api-key: ' + process.env.COPILOT_PROVIDER_API_KEY + '\\n')
+    process.stderr.write('raw leak: ' + process.env.COPILOT_PROVIDER_API_KEY.slice(0, 2))
+    setTimeout(() => {
+      process.stderr.write(process.env.COPILOT_PROVIDER_API_KEY.slice(2) + ' end\\n')
+      process.exit(1)
+    }, 20)
+  `)
+  fs.writeFileSync(path.join(dir, 'spec.json'), JSON.stringify({ argv: [process.execPath, cli], cwd, parser: 'text' }))
+  fs.writeFileSync(path.join(dir, 'env.json'), JSON.stringify({ COPILOT_PROVIDER_API_KEY: 'q7!z' }))
+  const res = spawnSync(process.execPath, [runner, dir], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 10_000,
+    env: { ...process.env, AGENT_DECK_DETACHED: '1' },
+  })
+  assert.ifError(res.error)
+  assert.equal(res.status, 0, res.stderr)
+  assert.equal(fs.existsSync(path.join(dir, 'env.json')), false)
+  const stderr = fs.readFileSync(path.join(dir, 'stderr.log'), 'utf8')
+  assert.equal(stderr.includes('q7!z'), false, `expected secret scrubbed from stderr.log, got: ${stderr}`)
+  assert.match(stderr, /\[redacted\]/)
+})
+
+test('4 (runner): Codex limits cleans up grandchild processes even when taskkill fails, and read timeout leaves cleanup margin', async t => {
+  const mod = await import('../bin/codex-limits.mjs')
+  if (process.platform === 'win32') {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-codex-fallback-kill-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const pidFile = path.join(root, 'grandchild.pid')
+    const sleeper = path.join(root, 'sleeper.mjs')
+    fs.writeFileSync(
+      sleeper,
+      `import fs from 'node:fs'\nfs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))\nsetInterval(() => {}, 60_000)\n`,
+    )
+    const fakeCodex = makeFakeCodex(
+      root,
+      `
+import { spawn } from 'node:child_process'
+import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id === 1) {
+    spawn(process.execPath, [${JSON.stringify(sleeper)}], { stdio: 'ignore', windowsHide: true })
+    process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n')
+  } else if (msg.id === 2) {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({
+        id: 2,
+        result: { rateLimits: { primary: { usedPercent: 19, windowDurationMins: 300, resetsAt: 1_800_000_000 }, planType: 'plus' } },
+      }) + '\\n')
+    }, 200)
+  }
+})
+`,
+    )
+    // Force taskkill to fail by pointing taskkillPath at a non-existent binary (without breaking SystemRoot for PowerShell).
+    const res = await mod.readLiveLimits(fakeCodex, { taskkillPath: path.join(root, 'no-such-taskkill.exe') })
+    assert.equal(res.source, 'live')
+    assert.equal(res.limits.windows[0].percent, 19)
+    assert.equal(fs.existsSync(pidFile), true, 'expected grandchild to have started')
+    const grandchildPid = Number(fs.readFileSync(pidFile, 'utf8').trim())
+    let alive = true
+    try {
+      process.kill(grandchildPid, 0)
+    } catch {
+      alive = false
+    }
+    if (alive) {
+      try { process.kill(grandchildPid, 'SIGKILL') } catch {}
+    }
+    assert.equal(alive, false, `grandchild process ${grandchildPid} survived when taskkill failed`)
+  }
+  assert.ok(typeof mod.LIVE_TIMEOUT_MS === 'number' && mod.LIVE_TIMEOUT_MS <= 15_000, `expected LIVE_TIMEOUT_MS <= 15000, got ${mod.LIVE_TIMEOUT_MS}`)
+})
+
+test('1 (runner): bin/claim.mjs serializes claim, refresh, deliver and release without overwriting delivered', t => {
+  const claimScript = fileURLToPath(new URL('../bin/claim.mjs', import.meta.url))
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-claim-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const call = args => {
+    const r = spawnSync(process.execPath, [claimScript, ...args], { encoding: 'utf8', timeout: 5_000 })
+    assert.ifError(r.error)
+    assert.equal(r.status, 0, r.stderr)
+    return JSON.parse(r.stdout.trim())
+  }
+  assert.deepEqual(call(['claim', root, 'tok-a', '1000', '600000']), { state: 'claimed', token: 'tok-a', at: 1000 })
+  assert.deepEqual(call(['claim', root, 'tok-b', '1500', '600000']), { state: 'taken', token: 'tok-a', at: 1000 })
+  assert.deepEqual(call(['claim', root, 'tok-a', '1500', '600000']), { state: 'owned', token: 'tok-a', at: 1000 })
+  assert.deepEqual(call(['refresh', root, 'tok-a', '2000']), { state: 'owned', token: 'tok-a', at: 2000 })
+  assert.deepEqual(call(['release', root, 'tok-b']), { state: 'kept' })
+  assert.deepEqual(call(['release', root, 'tok-a']), { state: 'released' })
+  assert.deepEqual(call(['claim', root, 'tok-b', '3000', '600000']), { state: 'claimed', token: 'tok-b', at: 3000 })
+  assert.deepEqual(call(['deliver', root, '3500']), { state: 'delivered' })
+  // Delivered timestamp is never overwritten by claim, deliver, or release.
+  assert.deepEqual(call(['claim', root, 'tok-a', '4000', '600000']), { state: 'delivered' })
+  assert.deepEqual(call(['deliver', root, '5000']), { state: 'delivered' })
+  assert.deepEqual(call(['release', root, 'tok-b']), { state: 'delivered' })
+  assert.equal(fs.readFileSync(path.join(root, 'delivered.txt'), 'utf8'), '3500')
+})
+
+test('7 (runner): watch.mjs emits byte offsets and resumes from a saved offset without replaying old messages', async t => {
+  const watchScript = fileURLToPath(new URL('../bin/watch.mjs', import.meta.url))
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-watch-off-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = new Date()
+  const dayDir = path.join(root, 'sessions', String(now.getFullYear()), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0'))
+  fs.mkdirSync(dayDir, { recursive: true })
+  fs.mkdirSync(path.join(root, 'runs'), { recursive: true })
+  const rollout = path.join(dayDir, 'rollout-th-resume.jsonl')
+  const line1 = JSON.stringify({ type: 'session_meta', timestamp: now.toISOString(), payload: { id: 'th-resume', cwd: 'C:\\src\\proj' } }) + '\n'
+  const line2 = JSON.stringify({ type: 'event_msg', timestamp: now.toISOString(), payload: { type: 'item_completed', item: { type: 'AgentMessage', id: 'm1', content: [{ text: 'First line — utf8 ✓' }] } } }) + '\n'
+  const line3 = JSON.stringify({ type: 'event_msg', timestamp: now.toISOString(), payload: { type: 'item_completed', item: { type: 'AgentMessage', id: 'm2', content: [{ text: 'Second line after reopen' }] } } }) + '\n'
+  fs.writeFileSync(rollout, line1 + line2)
+
+  const readWatch = extraArgs =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [watchScript, path.join(root, 'sessions'), path.join(root, 'runs'), 'C:\\src\\proj', String(Date.now() - 60_000), ...extraArgs], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: false,
+      })
+      const events = []
+      let buf = ''
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL')
+        resolve(events)
+      }, 600)
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', chunk => {
+        buf += chunk
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+        for (const l of lines) {
+          if (l.startsWith('{')) events.push(JSON.parse(l))
+        }
+      })
+      child.on('error', err => { clearTimeout(timer); reject(err) })
+    })
+
+  const first = await readWatch([])
+  const firstMsg = first.find(e => e.t === 'msg')
+  assert.ok(firstMsg, 'expected first message')
+  assert.equal(firstMsg.text, 'First line — utf8 ✓')
+  assert.equal(firstMsg.off, Buffer.byteLength(line1 + line2, 'utf8'))
+
+  // Append a second message and start a fresh watcher with the saved byte offset.
+  fs.appendFileSync(rollout, line3)
+  const second = await readWatch([JSON.stringify({ 'th-resume': firstMsg.off })])
+  const msgs = second.filter(e => e.t === 'msg')
+  assert.deepEqual(msgs.map(m => m.text), ['Second line after reopen'])
+  assert.equal(msgs[0].off, Buffer.byteLength(line1 + line2 + line3, 'utf8'))
+})
+
+test('9 (runner): bin/pid-alive.mjs reports alive for running pid and false for an exited process', async () => {
+  const pidScript = fileURLToPath(new URL('../bin/pid-alive.mjs', import.meta.url))
+  const check = pid => {
+    const r = spawnSync(process.execPath, [pidScript, String(pid)], { encoding: 'utf8', timeout: 5_000 })
+    assert.ifError(r.error)
+    assert.equal(r.status, 0, r.stderr)
+    return JSON.parse(r.stdout.trim())
+  }
+  assert.deepEqual(check(process.pid), { alive: true })
+  // Spawn a short-lived child, wait for it to exit, then verify pid-alive reports false.
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore', windowsHide: true })
+  const deadPid = child.pid
+  await once(child, 'close')
+  assert.deepEqual(check(deadPid), { alive: false })
+})

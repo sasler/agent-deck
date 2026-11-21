@@ -20,7 +20,9 @@ import { launchArgv } from './launch.mjs'
 const isWindows = process.platform === 'win32'
 const TAIL_BYTES = 262_144
 const MAX_FILES = 8
-const LIVE_TIMEOUT_MS = 20_000
+/** Live read timeout: leaves margin for process-tree cleanup inside the 22s outer timeout. */
+export const LIVE_TIMEOUT_MS = 12_000
+const CLEANUP_TIMEOUT_MS = 3_000
 const MAX_REASON = 80
 
 const pluginVersion = () => {
@@ -87,22 +89,133 @@ const closeStdio = child => {
   }
 }
 
+/** Parses `pid,ppid` or WMIC CSV (`Node,ParentProcessId,ProcessId`) rows into descendant PIDs of `rootPid`, deepest first. */
+export const collectDescendants = (rootPid, rows) => {
+  const byParent = new Map()
+  for (const { pid, ppid } of rows) {
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid <= 0) continue
+    let list = byParent.get(ppid)
+    if (!list) {
+      list = []
+      byParent.set(ppid, list)
+    }
+    list.push(pid)
+  }
+  const seen = new Set([rootPid])
+  const order = []
+  const queue = [rootPid]
+  while (queue.length) {
+    const cur = queue.shift()
+    for (const childPid of byParent.get(cur) ?? []) {
+      if (seen.has(childPid) || childPid === process.pid) continue
+      seen.add(childPid)
+      order.push(childPid)
+      queue.push(childPid)
+    }
+  }
+  return order.reverse()
+}
+
+const parseWmicCsv = text => {
+  const rows = []
+  let pidIdx = -1
+  let ppidIdx = -1
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    const cols = line.split(',').map(c => c.trim())
+    if (pidIdx < 0) {
+      pidIdx = cols.findIndex(c => c.toLowerCase() === 'processid')
+      ppidIdx = cols.findIndex(c => c.toLowerCase() === 'parentprocessid')
+      continue
+    }
+    const pid = Number.parseInt(cols[pidIdx] ?? '', 10)
+    const ppid = Number.parseInt(cols[ppidIdx] ?? '', 10)
+    if (Number.isInteger(pid) && Number.isInteger(ppid)) rows.push({ pid, ppid })
+  }
+  return rows
+}
+
+const parsePidPairs = text => {
+  const rows = []
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const m = /^\s*(\d+)\s*,\s*(\d+)\s*$/.exec(raw)
+    if (m) rows.push({ pid: Number.parseInt(m[1], 10), ppid: Number.parseInt(m[2], 10) })
+  }
+  return rows
+}
+
+const resolveSystemTool = (relPath, fallback) => {
+  if (process.env.SystemRoot) {
+    const full = path.join(process.env.SystemRoot, relPath)
+    if (fs.existsSync(full)) return full
+  }
+  return fallback
+}
+
+/** Lists `(pid, ppid)` rows on Windows without a shell: WMIC first where installed, else CIM via PowerShell. */
+const listWindowsProcesses = ({ wmicPath, powershellPath, timeoutMs = CLEANUP_TIMEOUT_MS } = {}) => {
+  const wmic = wmicPath ?? resolveSystemTool(path.join('System32', 'wbem', 'WMIC.exe'), 'wmic.exe')
+  try {
+    const r = spawnSync(wmic, ['process', 'get', 'ProcessId,ParentProcessId', '/format:csv'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      shell: false,
+      timeout: timeoutMs,
+    })
+    if (!r.error && r.status === 0 && r.stdout) {
+      const rows = parseWmicCsv(r.stdout)
+      if (rows.length) return rows
+    }
+  } catch {}
+  const ps = powershellPath ?? resolveSystemTool(path.join('System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), 'powershell.exe')
+  try {
+    const r = spawnSync(
+      ps,
+      ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId),$($_.ParentProcessId)" }'],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        shell: false,
+        timeout: timeoutMs,
+      },
+    )
+    if (!r.error && r.status === 0 && r.stdout) return parsePidPairs(r.stdout)
+  } catch {}
+  return []
+}
+
 /** Kills `child` and every descendant it started, without a shell, then closes its stdio pipes. */
-const killTree = child => {
+export const killTree = (child, { taskkillPath, wmicPath, powershellPath, timeoutMs = CLEANUP_TIMEOUT_MS } = {}) => {
   const pid = child?.pid
   if (pid) {
     if (isWindows) {
+      let taskkillOk = false
       try {
-        const taskkill = process.env.SystemRoot
-          ? path.join(process.env.SystemRoot, 'System32', 'taskkill.exe')
-          : 'taskkill'
-        spawnSync(taskkill, ['/PID', String(pid), '/T', '/F'], {
+        const taskkill =
+          taskkillPath ??
+          (process.env.SystemRoot ? path.join(process.env.SystemRoot, 'System32', 'taskkill.exe') : 'taskkill')
+        const r = spawnSync(taskkill, ['/PID', String(pid), '/T', '/F'], {
           stdio: 'ignore',
           windowsHide: true,
           shell: false,
-          timeout: 3_000,
+          timeout: timeoutMs,
         })
+        taskkillOk = !r.error && r.status === 0
       } catch {}
+      if (!taskkillOk) {
+        const descendants = collectDescendants(pid, listWindowsProcesses({ wmicPath, powershellPath, timeoutMs }))
+        for (const descPid of descendants) {
+          try {
+            process.kill(descPid, 'SIGKILL')
+          } catch {}
+        }
+        try {
+          process.kill(pid, 'SIGKILL')
+        } catch {}
+      }
     } else {
       try {
         process.kill(-pid, 'SIGKILL')
@@ -162,7 +275,10 @@ const liveLimitsFromResult = result => {
 }
 
 /** Asks `codex app-server` for the current rate limits over stdio JSON lines, then kills its whole tree. */
-export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS, version = pluginVersion(), now = () => Date.now() } = {}) =>
+export const readLiveLimits = (
+  command = 'codex',
+  { timeoutMs = LIVE_TIMEOUT_MS, version = pluginVersion(), now = () => Date.now(), taskkillPath, wmicPath, powershellPath } = {},
+) =>
   new Promise((resolve, reject) => {
     let argv
     try {
@@ -188,7 +304,7 @@ export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS,
       if (settled) return
       settled = true
       clearTimeout(timer)
-      killTree(child)
+      killTree(child, { taskkillPath, wmicPath, powershellPath })
       fn(value)
     }
     const timer = setTimeout(() => finish(reject, safeError('timed out')), timeoutMs)

@@ -19,7 +19,7 @@ At the top of the pane sit three controls: **♨ Keep warm**, **⇄ Routing** an
   - the view switch picks **All**, **Used here** (the providers this session used) or **Selected**. It is the same setting as ⚙ Settings → **Usage meters**, where you also pick which providers **Selected** shows, and the Antigravity view;
   - **↻ Refresh** reads every provider's limits again now — for Codex, live from the Codex CLI (falling back to its last session file if needed) — and says **Refreshing…** while it does.
 
-  A reading older than 15 minutes says how old it is, for example `updated 3h ago`. When a window's reset time has passed since the reading, the meter shows `0%` dimmed with **reset since this reading** instead of a countdown. If Codex could not be read live, the pane shows one dim line saying why with a **Retry** button.
+  A reading older than 15 minutes says how old it is, for example `updated 3h ago`. When a window's reset time has passed since the reading, the meter shows `0%` dimmed with **reset since this reading** instead of a countdown. Whenever the built-in Codex is on, the pane keeps **↻ Refresh** and Codex's **Retry** button available even before any reading arrives, and shows one dim line saying why if a live read failed.
 - **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn, and shows whether keep-warm is on.
 - **Keep-warm.** Pick 2, 4 or 6 hours with **♨ Keep warm** at the top of the pane, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
 - **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. After **Send anyway** the band says at once that it was sent and that the cache is being re-written, since that can take a while before the reply starts. Change this with `/cache guard refuse|warn|off`.
@@ -68,7 +68,7 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 - runs as its own detached process, so it survives a plugin reload or a dropped session;
 - streams into a card in the pane;
-- delivers its final report back to the conversation as a new message when it finishes, once, even when agent-deck reloads meanwhile or a second copy of it (a dev copy beside the release) watches the same runs. When a harness exits non-zero without reporting an error event, its card and report include the last lines of its stderr (with keys and tokens redacted) rather than only the exit code.
+- delivers its final report back to the conversation as a new message when it finishes, once, even when agent-deck reloads meanwhile or a second copy of it (a dev copy beside the release) watches the same runs. When a harness exits non-zero without reporting an error event, its card and report include the last lines of its stderr (with keys and tokens redacted) rather than only the exit code. If a runner process stops without finishing (for example after a crash or machine restart), agent-deck detects that the process is gone, marks the card failed with a plain reason and delivers that report once.
 
 `agent_result` reads a run on demand.
 

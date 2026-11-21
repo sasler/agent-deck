@@ -1455,7 +1455,7 @@ const append = (card: AgentCard, text: string) => {
 }
 
 /** Folds one event into a harness card. */
-export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
+export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent, knownSecrets?: readonly string[]) => {
   switch (ev.kind) {
     case 'model':
       card.model = ev.model
@@ -1523,7 +1523,7 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
       break
     }
     case 'error':
-      if (!ev.isExitCode || !card.error) card.error = redactSecrets(stripAnsi(ev.text)).trim() || ev.text
+      if (!ev.isExitCode || !card.error) card.error = redactSecrets(stripAnsi(ev.text), knownSecrets).trim() || ev.text
       break
     case 'final':
       break
@@ -1538,9 +1538,18 @@ const sumTokens = (a: Tokens, b: Tokens): Tokens => ({
 
 export const CARD_TTL_MS = 3 * 86_400_000
 export const CARD_STALE_MS = 2 * 60_000
+/** Total serialized JSON byte budget for persisted cards across all sessions (safely under the 4 MiB store limit). */
+export const CARD_MAX_BYTES = 1_500_000
+export const CARDS_KEY_PREFIX = 'cards:'
+export const cardsKey = (sessionId: string): string => `${CARDS_KEY_PREFIX}${sessionId}`
 
 export type SavedSessionCards = { savedAt: number; cards: AgentCard[] }
 export type SavedCards = Record<string, SavedSessionCards>
+export type CardsIndexEntry = { savedAt: number; bytes: number }
+export type CardsIndex = Record<string, CardsIndexEntry>
+
+const utf8Encoder = new TextEncoder()
+export const jsonBytes = (value: unknown): number => utf8Encoder.encode(JSON.stringify(value)).length
 
 const snapshotCard = (c: AgentCard, maxOutput: number): AgentCard => {
   const output = typeof c.output === 'string' ? c.output : ''
@@ -1559,20 +1568,78 @@ const snapshotCard = (c: AgentCard, maxOutput: number): AgentCard => {
   }
 }
 
+const cleanCardList = (raw: unknown, maxOutput: number): AgentCard[] =>
+  Array.isArray(raw)
+    ? raw
+        .filter((c): c is AgentCard => {
+          const o = obj(c)
+          return typeof o.id === 'string' && !!o.id && typeof o.provider === 'string' && typeof o.status === 'string'
+        })
+        .map(c => snapshotCard(c, maxOutput))
+    : []
+
+/**
+ * Fits one session's cards into `maxBytes`: trims output of the oldest finished cards first,
+ * then drops the oldest finished cards (and then oldest cards), and finally shrinks any single
+ * remaining card's output and optional metadata until serialized JSON fits.
+ */
+const fitSessionCards = (
+  cards: readonly AgentCard[],
+  now: number,
+  opts: { maxCards: number; maxOutput: number; maxBytes: number },
+): SavedSessionCards => {
+  const list = cards.slice(-opts.maxCards).map(c => snapshotCard(c, opts.maxOutput))
+  const entry: SavedSessionCards = { savedAt: now, cards: list }
+  if (jsonBytes(entry) <= opts.maxBytes) return entry
+  // First, trim output of the oldest finished cards so cards stay listed while shedding bulk.
+  for (const card of list) {
+    if (jsonBytes(entry) <= opts.maxBytes) return entry
+    if (card.status === 'running' || !card.output) continue
+    let out = card.output
+    while (out.length > 0 && jsonBytes(entry) > opts.maxBytes) {
+      out = out.length <= 16 ? '' : out.slice(-Math.floor(out.length / 2))
+      card.output = out
+    }
+  }
+  if (jsonBytes(entry) <= opts.maxBytes) return entry
+  // Next, drop oldest finished cards first, then oldest remaining cards while more than one remains.
+  while (list.length > 1 && jsonBytes(entry) > opts.maxBytes) {
+    const finishedIdx = list.findIndex(c => c.status !== 'running')
+    list.splice(finishedIdx >= 0 ? finishedIdx : 0, 1)
+  }
+  // If a single card still exceeds the budget, trim its output, then optional fields.
+  if (list.length === 1 && jsonBytes(entry) > opts.maxBytes) {
+    const card = list[0]!
+    let out = card.output
+    while (out.length > 0 && jsonBytes(entry) > opts.maxBytes) {
+      out = out.length <= 16 ? '' : out.slice(-Math.floor(out.length / 2))
+      card.output = out
+    }
+    if (jsonBytes(entry) > opts.maxBytes && card.activity.length > 0) card.activity = []
+    if (jsonBytes(entry) > opts.maxBytes && card.modelUsage) card.modelUsage = undefined
+    if (jsonBytes(entry) > opts.maxBytes && card.error && card.error.length > 120) card.error = card.error.slice(0, 120)
+    if (jsonBytes(entry) > opts.maxBytes) list.length = 0
+  }
+  return entry
+}
+
 /**
  * Merges one session's cards into the stored per-session map, trimming each card's
- * output to maxOutput, capping to maxCards, and pruning entries older than ttlMs.
+ * output to maxOutput, capping to maxCards, pruning entries older than ttlMs, and
+ * enforcing a total serialized byte budget (dropping oldest sessions, then oldest
+ * cards and their output).
  */
 export const mergeSavedCards = (
   stored: unknown,
   sessionId: string,
   cards: readonly AgentCard[],
   now: number,
-  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number } = {},
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number; maxBytes?: number } = {},
 ): SavedCards => {
   const maxCards = opts.maxCards ?? 40
   const maxOutput = opts.maxOutput ?? MAX_OUTPUT
   const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const maxBytes = opts.maxBytes ?? CARD_MAX_BYTES
   const next: SavedCards = {}
   if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
     for (const [sid, entry] of Object.entries(stored as Record<string, unknown>)) {
@@ -1589,20 +1656,162 @@ export const mergeSavedCards = (
       cards: cards.slice(-maxCards).map(c => snapshotCard(c, maxOutput)),
     }
   }
+  if (jsonBytes(next) > maxBytes) {
+    const others = Object.entries(next)
+      .filter(([sid]) => sid !== sessionId)
+      .sort((a, b) => a[1].savedAt - b[1].savedAt)
+    for (const [sid] of others) {
+      if (jsonBytes(next) <= maxBytes) break
+      delete next[sid]
+    }
+    if (sessionId && next[sessionId] && jsonBytes(next) > maxBytes) {
+      const overhead = jsonBytes({ [sessionId]: { savedAt: now, cards: [] } }) - jsonBytes({ savedAt: now, cards: [] })
+      const fitted = fitSessionCards(next[sessionId]!.cards, now, {
+        maxCards,
+        maxOutput,
+        maxBytes: Math.max(0, maxBytes - overhead),
+      })
+      if (fitted.cards.length > 0) next[sessionId] = fitted
+      else delete next[sessionId]
+    }
+  }
   return next
 }
 
-/** Reads one session's saved cards from the store value; empty when absent or unreadable. */
+/** Reads one session's saved cards from the legacy shared map; empty when absent or unreadable. */
 export const loadSessionCards = (stored: unknown, sessionId: string, maxOutput = MAX_OUTPUT): AgentCard[] => {
   if (!sessionId || !stored || typeof stored !== 'object' || Array.isArray(stored)) return []
-  const entry = obj((stored as Record<string, unknown>)[sessionId])
-  if (!Array.isArray(entry.cards)) return []
-  return entry.cards
-    .filter((c): c is AgentCard => {
-      const o = obj(c)
-      return typeof o.id === 'string' && !!o.id && typeof o.provider === 'string' && typeof o.status === 'string'
-    })
-    .map(c => snapshotCard(c, maxOutput))
+  return loadSingleSessionCards((stored as Record<string, unknown>)[sessionId], maxOutput)
+}
+
+/** Reads one session's saved cards from its own `cards:<sessionId>` store value. */
+export const loadSingleSessionCards = (stored: unknown, maxOutput = MAX_OUTPUT): AgentCard[] => {
+  const entry = obj(stored)
+  return cleanCardList(entry.cards, maxOutput)
+}
+
+/** Parses the small `cards-index` map (`sessionId -> { savedAt, bytes }`), ignoring malformed entries. */
+export const parseCardsIndex = (stored: unknown): CardsIndex => {
+  const out: CardsIndex = {}
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return out
+  for (const [sid, raw] of Object.entries(stored as Record<string, unknown>)) {
+    if (!sid) continue
+    const o = obj(raw)
+    const savedAt = typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : undefined
+    const bytes = typeof o.bytes === 'number' && Number.isFinite(o.bytes) && o.bytes >= 0 ? o.bytes : undefined
+    if (savedAt === undefined || bytes === undefined) continue
+    out[sid] = { savedAt, bytes }
+  }
+  return out
+}
+
+/**
+ * Plans a per-session card save: trims this session's entry, prunes expired sessions and
+ * oldest other sessions until the indexed total fits within `maxBytes`, and returns the
+ * entry to write to `cards:<sessionId>`, the updated `cards-index`, and session ids to delete.
+ */
+export const planCardsSave = (
+  indexStored: unknown,
+  sessionId: string,
+  cards: readonly AgentCard[],
+  now: number,
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number; maxBytes?: number } = {},
+): { entry?: SavedSessionCards; index: CardsIndex; prune: string[] } => {
+  const maxCards = opts.maxCards ?? 40
+  const maxOutput = opts.maxOutput ?? MAX_OUTPUT
+  const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const maxBytes = opts.maxBytes ?? CARD_MAX_BYTES
+  const prev = parseCardsIndex(indexStored)
+  const index: CardsIndex = {}
+  const prune: string[] = []
+  for (const [sid, meta] of Object.entries(prev)) {
+    if (sid === sessionId) continue
+    if (now - meta.savedAt > ttlMs) prune.push(sid)
+    else index[sid] = meta
+  }
+  let entry: SavedSessionCards | undefined
+  if (sessionId && cards.length > 0) {
+    entry = fitSessionCards(cards, now, { maxCards, maxOutput, maxBytes })
+    if (entry.cards.length > 0) {
+      index[sessionId] = { savedAt: now, bytes: jsonBytes(entry) }
+    } else {
+      entry = undefined
+    }
+  }
+  const totalBytes = () =>
+    Object.values(index).reduce((sum, e) => sum + e.bytes, 0) + jsonBytes(index)
+  if (totalBytes() > maxBytes) {
+    const others = Object.entries(index)
+      .filter(([sid]) => sid !== sessionId)
+      .sort((a, b) => a[1].savedAt - b[1].savedAt)
+    for (const [sid] of others) {
+      if (totalBytes() <= maxBytes) break
+      delete index[sid]
+      prune.push(sid)
+    }
+    if (entry && totalBytes() > maxBytes) {
+      const indexBytes = jsonBytes(index)
+      const fitted = fitSessionCards(entry.cards, now, {
+        maxCards,
+        maxOutput,
+        maxBytes: Math.max(0, maxBytes - indexBytes),
+      })
+      if (fitted.cards.length > 0) {
+        entry = fitted
+        index[sessionId] = { savedAt: now, bytes: jsonBytes(fitted) }
+      } else {
+        entry = undefined
+        delete index[sessionId]
+      }
+    }
+  }
+  return { entry, index, prune }
+}
+
+/**
+ * Migrates the legacy shared `cards` map into per-session `cards:<sessionId>` entries and
+ * a `cards-index`, pruning expired entries and keeping total serialized bytes within `maxBytes`.
+ */
+export const migrateLegacyCards = (
+  legacyStored: unknown,
+  existingIndexStored: unknown,
+  now: number,
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number; maxBytes?: number } = {},
+): { sessions: Record<string, SavedSessionCards>; index: CardsIndex } => {
+  const maxCards = opts.maxCards ?? 40
+  const maxOutput = opts.maxOutput ?? MAX_OUTPUT
+  const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const maxBytes = opts.maxBytes ?? CARD_MAX_BYTES
+  const index = parseCardsIndex(existingIndexStored)
+  for (const [sid, meta] of Object.entries(index)) {
+    if (now - meta.savedAt > ttlMs) delete index[sid]
+  }
+  const sessions: Record<string, SavedSessionCards> = {}
+  if (legacyStored && typeof legacyStored === 'object' && !Array.isArray(legacyStored)) {
+    const entries = Object.entries(legacyStored as Record<string, unknown>)
+      .map(([sid, raw]) => {
+        const o = obj(raw)
+        const savedAt = typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : undefined
+        const cards = cleanCardList(o.cards, maxOutput).slice(-maxCards)
+        return savedAt !== undefined && cards.length > 0 && now - savedAt <= ttlMs ? { sid, savedAt, cards } : undefined
+      })
+      .filter((x): x is { sid: string; savedAt: number; cards: AgentCard[] } => !!x)
+      .sort((a, b) => b.savedAt - a.savedAt)
+    let used = Object.values(index).reduce((s, e) => s + e.bytes, 0) + jsonBytes(index)
+    for (const item of entries) {
+      if (index[item.sid] && index[item.sid]!.savedAt >= item.savedAt) continue
+      const remaining = maxBytes - used
+      if (remaining <= 0) break
+      const fitted = fitSessionCards(item.cards, item.savedAt, { maxCards, maxOutput, maxBytes: remaining })
+      if (!fitted.cards.length) continue
+      const bytes = jsonBytes(fitted)
+      if (used + bytes > maxBytes) continue
+      sessions[item.sid] = fitted
+      index[item.sid] = { savedAt: item.savedAt, bytes }
+      used += bytes
+    }
+  }
+  return { sessions, index }
 }
 
 /**
@@ -1991,13 +2200,36 @@ export const deliveryClaim = (token: string, at: number) => `claim ${token} ${at
 export const readDeliveryMark = (text: string | undefined): DeliveryMark => {
   const t = (text ?? '').trim()
   if (!t) return { state: 'none' }
-  const m = t.match(/^claim (\S+) (\d+)$/)
+  const m = t.match(/^claim (\S+) (-?\d+)$/)
   return m ? { state: 'claimed', token: m[1]!, at: Number(m[2]) } : { state: 'delivered' }
 }
 
 /** Whether a copy should leave the report alone: it went out, or another copy is handing it over now. */
 export const isDeliveryTaken = (mark: DeliveryMark, now: number): boolean =>
   mark.state === 'delivered' || (mark.state === 'claimed' && now - mark.at < DELIVERY_CLAIM_TTL_MS)
+
+export const MAX_DELIVERED_RUNS = 200
+
+/** Stable delivery identity for a background run, shared across reloads and concurrent copies. */
+export const deliveryRunKey = (kind: 'codex' | 'harness', runId: string): string => `${kind}:${runId}`
+
+/** Extracts the stable run key from a submitted `[agent-deck]` completion report, if any. */
+export const reportRunKey = (text: string | undefined): string | undefined => {
+  if (!text || !text.startsWith('[agent-deck] ')) return undefined
+  const harnessFooterMatch = text.match(/\[[^\n\]]+ run (\S+) · harness [^\n\]]+\]\s*$/)
+  if (harnessFooterMatch) return deliveryRunKey('harness', harnessFooterMatch[1]!)
+  const codexFooterMatch = text.match(/\[codex run (\S+) · [^\n\]]+\]\s*$/)
+  if (codexFooterMatch) return deliveryRunKey('codex', codexFooterMatch[1]!)
+  const codexHeadMatch = text.match(/^\[agent-deck\] Background Codex run (\S+) \(/)
+  if (codexHeadMatch) return deliveryRunKey('codex', codexHeadMatch[1]!)
+  const harnessHeadMatch = text.match(/^\[agent-deck\] Background .+ run (\S+) \(/)
+  if (harnessHeadMatch) return deliveryRunKey('harness', harnessHeadMatch[1]!)
+  return undefined
+}
+
+/** Appends a delivered run key to a bounded history list (deduplicated). */
+export const rememberDeliveredRun = (list: readonly string[], key: string, max = MAX_DELIVERED_RUNS): string[] =>
+  list.includes(key) ? [...list] : [...list, key].slice(-max)
 
 export const AGENT_RESULT_SPEC: ToolSpec = {
   name: 'agent_result',
@@ -2070,6 +2302,17 @@ const ANSI_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\
 /** Strips terminal escape codes (CSI, OSC, and 2-byte ESC sequences). */
 export const stripAnsi = (text: string): string => text.replace(ANSI_RE, '')
 
+const CRED_FIELD_PART =
+  '(?:[A-Za-z0-9_-]*(?:api[-_]?key|[-_]token|[-_]secret|[-_]password|[-_]passwd)|(?:x-)?(?:api[-_]?key|authorization|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token|bearer[-_]?token|client[-_]?secret|api[-_]?secret|token|secret|password|passwd))'
+const JSON_CRED_RE = new RegExp(`"(${CRED_FIELD_PART})"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, 'gi')
+const KV_CRED_RE = new RegExp(
+  `\\b(${CRED_FIELD_PART})\\s*=\\s*(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s&;,'"\`)\\]}]+)`,
+  'gi',
+)
+const HEADER_CRED_RE = new RegExp(
+  `\\b(${CRED_FIELD_PART})\\s*:\\s*(?:(?:Bearer|Basic|Token)\\s+)?(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;'"\`)\\]}]+)`,
+  'gi',
+)
 const BEARER_SECRET_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
 const PREFIXED_SECRET_RE =
   /\b(?:sk-[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9._-]{8,}|eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g
@@ -2077,11 +2320,22 @@ const LONG_HEX_RE = /\b[0-9a-fA-F]{32,}\b/g
 const LONG_TOKEN_RE = /(?<![:/\\A-Za-z0-9_+-])([A-Za-z0-9+/_-]{32,}={0,2})(?![A-Za-z0-9+/_=-])/g
 
 /**
- * Redacts API keys, tokens, Bearer credentials and long hex/base64 secrets while leaving
- * ordinary error messages, file paths, URLs and UUIDs readable.
+ * Redacts API keys, tokens, credential fields (header, JSON and key=value forms),
+ * exact known credential values, Bearer credentials and long hex/base64 secrets while
+ * leaving ordinary error messages, file paths, URLs and UUIDs readable.
  */
-export const redactSecrets = (text: string): string =>
-  text
+export const redactSecrets = (text: string, knownSecrets?: readonly string[]): string => {
+  let out = text
+  if (knownSecrets?.length) {
+    const sorted = [...new Set(knownSecrets.map(s => s.trim()).filter(Boolean))].sort((a, b) => b.length - a.length)
+    for (const secret of sorted) {
+      if (out.includes(secret)) out = out.split(secret).join('[redacted]')
+    }
+  }
+  return out
+    .replace(JSON_CRED_RE, '"$1": "[redacted]"')
+    .replace(KV_CRED_RE, '$1=[redacted]')
+    .replace(HEADER_CRED_RE, '$1: [redacted]')
     .replace(BEARER_SECRET_RE, '[redacted]')
     .replace(PREFIXED_SECRET_RE, '[redacted]')
     .replace(LONG_HEX_RE, '[redacted]')
@@ -2096,6 +2350,7 @@ export const redactSecrets = (text: string): string =>
       }
       return match
     })
+}
 
 const STDERR_SUMMARY_MAX = 500
 const STDERR_NOISE_RE = /^(?:at\s+\S|Node\.js\s+v\d|[\^~]+$)/
@@ -2104,7 +2359,7 @@ const STDERR_NOISE_RE = /^(?:at\s+\S|Node\.js\s+v\d|[\^~]+$)/
  * Turns a failed run's stderr.log into a short, safe reason: ANSI-stripped, secrets redacted,
  * last meaningful lines trimmed and capped to `maxChars` (default 500).
  */
-export const summarizeStderr = (stderr: string, maxChars = STDERR_SUMMARY_MAX): string => {
+export const summarizeStderr = (stderr: string, maxChars = STDERR_SUMMARY_MAX, knownSecrets?: readonly string[]): string => {
   const all = stripAnsi(stderr)
     .split(/\r?\n/)
     .map(raw => {
@@ -2114,7 +2369,7 @@ export const summarizeStderr = (stderr: string, maxChars = STDERR_SUMMARY_MAX): 
     .filter(Boolean)
   if (!all.length) return ''
   const meaningful = all.filter(l => !STDERR_NOISE_RE.test(l))
-  const lines = (meaningful.length ? meaningful : all).map(l => redactSecrets(l))
+  const lines = (meaningful.length ? meaningful : all).map(l => redactSecrets(l, knownSecrets))
   const picked: string[] = []
   let len = 0
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -2150,14 +2405,15 @@ export const harnessFailure = (
   eventError: string | undefined,
   stderr: string,
   parser?: HarnessParser,
+  knownSecrets?: readonly string[],
 ): string => {
-  const cleaned = eventError ? redactSecrets(stripAnsi(eventError)).trim() : ''
+  const cleaned = eventError ? redactSecrets(stripAnsi(eventError), knownSecrets).trim() : ''
   let message: string
   if (cleaned && !BARE_EXIT_RE.test(cleaned)) {
     message = cleaned
   } else {
     const base = cleaned || `${name} exited ${code !== undefined && !Number.isNaN(code) ? code : '?'}`
-    const detail = summarizeStderr(stderr)
+    const detail = summarizeStderr(stderr, STDERR_SUMMARY_MAX, knownSecrets)
     message = detail ? `${base}: ${detail}` : base
   }
   const hint = copilotFailureHint(parser, message)
@@ -2181,7 +2437,7 @@ export const codexErrorText = (message: string): string => {
  * The real reason a `codex exec --json` run failed: its turn.failed / error events first,
  * then stderr's last error lines (timestamped log lines included, MCP transport noise not).
  */
-export const codexFailure = (events: string, stderr: string, code: number | undefined): string => {
+export const codexFailure = (events: string, stderr: string, code: number | undefined, knownSecrets?: readonly string[]): string => {
   const fromEvents: string[] = []
   for (const line of events.split('\n')) {
     if (!line.startsWith('{')) continue
@@ -2189,7 +2445,7 @@ export const codexFailure = (events: string, stderr: string, code: number | unde
       const e = JSON.parse(line) as J
       const msg = e.type === 'turn.failed' ? str(obj(e.error).message) : e.type === 'error' ? str(e.message) : undefined
       if (msg) {
-        const text = redactSecrets(stripAnsi(codexErrorText(msg))).trim()
+        const text = redactSecrets(stripAnsi(codexErrorText(msg)), knownSecrets).trim()
         if (text && fromEvents.at(-1) !== text) fromEvents.push(text)
       }
     } catch {}
@@ -2202,5 +2458,31 @@ export const codexFailure = (events: string, stderr: string, code: number | unde
     .filter(l => !/^\d{4}-\d\d-\d\dT\S+\s+(INFO|DEBUG|TRACE|WARN)\b/.test(l))
     .map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s+ERROR\s+/, ''))
     .join('\n')
-  return summarizeStderr(filtered) || `codex exited ${code ?? '?'} with no error output`
+  return summarizeStderr(filtered, STDERR_SUMMARY_MAX, knownSecrets) || `codex exited ${code ?? '?'} with no error output`
+}
+
+// ---------- detecting a harness runner process that died without writing exit.txt ----------
+
+export const DEAD_RUNNER_REASON = 'The runner stopped without finishing (the process is gone).'
+
+/** Parses a run folder's pid.txt into a positive integer PID, or undefined when missing or invalid. */
+export const parseRunPid = (text: string | undefined): number | undefined => {
+  const trimmed = (text ?? '').trim()
+  if (!/^\d+$/.test(trimmed)) return undefined
+  const pid = Number.parseInt(trimmed, 10)
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}
+
+/**
+ * Decides whether a running harness run whose exit.txt is still absent has lost its runner process.
+ * Returns the plain failure reason once `pid` is confirmed dead (and no exit file appeared),
+ * or undefined when the run should keep polling.
+ */
+export const deadRunnerFailure = (opts: {
+  hasExit: boolean
+  pid: number | undefined
+  isPidAlive: boolean | undefined
+}): string | undefined => {
+  if (opts.hasExit || opts.pid === undefined || opts.isPidAlive !== false) return undefined
+  return DEAD_RUNNER_REASON
 }
