@@ -24,7 +24,7 @@ import {
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
-import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, cardModelName, codexLiveError, effortLabel, orderWindows, parseCodexLimitsOutput, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
+import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, capSelectOptions, cardModelName, codexLiveError, effortLabel, orderWindows, parseCodexLimitsOutput, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
 import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -2701,6 +2701,7 @@ test('Task routing draws a card per task, and its Agent, Model and Effort picker
   expect(model?.props?.options).toEqual([
     { value: '', label: 'Default' },
     { value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High)' },
+    { value: '__other__', label: 'Other…' },
   ])
   expect(await settings.find({ key: 'r-refresh-research' })).toBeDefined()
   await settings.select({ key: 'r-model-research', value: 'gemini-4-neon-high' })
@@ -2727,6 +2728,84 @@ test('Task routing draws a card per task, and its Agent, Model and Effort picker
   await settings.redraw()
   expect(await settings.find({ key: 'r-target-docs' })).toBeDefined()
   expect(((await settings.find({ key: 'r-add' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('')
+  await settings.unmount()
+})
+
+test('capSelectOptions stays within max while keeping head, tail and the selected value in order', () => {
+  const head = [{ value: '', label: 'Default' }]
+  const tail = [{ value: '__other__', label: 'Other…' }]
+  const small = [
+    { value: 'm1', label: 'M1' },
+    { value: 'm2', label: 'M2' },
+  ]
+  expect(capSelectOptions(small, { max: 5, fixedHead: head, fixedTail: tail })).toEqual({
+    options: [head[0], small[0], small[1], tail[0]],
+    shown: 2,
+    total: 2,
+    isCapped: false,
+  })
+
+  const many = Array.from({ length: 100 }, (_, i) => ({ value: `m-${i}`, label: `Model ${i}` }))
+  const capped = capSelectOptions(many, { keep: 'm-90', fixedHead: head, fixedTail: tail })
+  expect(capped.options.length).toBe(64)
+  expect(capped.shown).toBe(62)
+  expect(capped.total).toBe(100)
+  expect(capped.isCapped).toBe(true)
+  expect(capped.options[0]).toEqual(head[0])
+  expect(capped.options.at(-1)).toEqual(tail[0])
+  expect(capped.options.some(o => o.value === 'm-90')).toBe(true)
+  expect(capped.options.slice(1, 62).map(o => o.value)).toEqual(many.slice(0, 61).map(o => o.value))
+  expect(capped.options[62]?.value).toBe('m-90')
+})
+
+test('settings draw cleanly when a harness has 100 models, capping model Selects to 64 with Other…', async ($, on) => {
+  mock.clock(on)
+  const models = Array.from({ length: 100 }, (_, i) => ({ id: `provider/model-${i}`, name: `Model ${i}` }))
+  const oc = { ...fromPreset(PRESETS.find(p => p.id === 'opencode')!), model: 'provider/model-90', models }
+  const store = memStore(on, {
+    harnesses: [oc],
+    'codex-enabled': false,
+    routing: { isOn: true, routes: [{ task: 'implement', target: 'opencode', model: 'provider/model-85' }] },
+  })
+  quietSession(on, 'sid-many-models')
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  // 1. Harness edit view: Select is capped at 64, keeps the selected model #90, and shows the hint.
+  const settings = await mountSettings($, 56)
+  await settings.press({ key: 'h-edit-opencode' } as never)
+  await settings.redraw()
+  const editPick = (await settings.find({ key: 'h-model-pick' })) as { props?: { options?: { value: string; label?: string }[]; value?: string } } | undefined
+  expect(editPick).toBeDefined()
+  expect(editPick?.props?.options?.length).toBeLessThanOrEqual(64)
+  expect(editPick?.props?.options?.length).toBe(64)
+  expect(editPick?.props?.value).toBe('provider/model-90')
+  expect(editPick?.props?.options?.some(o => o.value === 'provider/model-90')).toBe(true)
+  expect(editPick?.props?.options?.at(-1)).toEqual({ value: '__other__', label: 'Other…' })
+  expect(await settings.find({ text: /Showing 62 of 100 models/ })).toBeDefined()
+
+  // 2. Task routing card: Select is also capped at 64, keeps model #85, shows the hint, and Other… lets you type any id.
+  await settings.press({ key: 'h-cancel' } as never)
+  await settings.redraw()
+  await settings.press({ key: 's-tab-routing' } as never)
+  await settings.redraw()
+  const routePick = (await settings.find({ key: 'r-model-implement' })) as { props?: { options?: { value: string; label?: string }[]; value?: string } } | undefined
+  expect(routePick).toBeDefined()
+  expect(routePick?.props?.options?.length).toBeLessThanOrEqual(64)
+  expect(routePick?.props?.options?.length).toBe(64)
+  expect(routePick?.props?.value).toBe('provider/model-85')
+  expect(routePick?.props?.options?.some(o => o.value === 'provider/model-85')).toBe(true)
+  expect(routePick?.props?.options?.at(-1)).toEqual({ value: '__other__', label: 'Other…' })
+  expect(await settings.find({ text: /Showing 62 of 100 models/ })).toBeDefined()
+
+  await settings.select({ key: 'r-model-implement', value: '__other__' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-model-input-implement' })).toBeDefined()
+  await settings.input({ key: 'r-model-input-implement', text: 'provider/custom-999', kind: 'submit' })
+  await settings.redraw()
+  const saved = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(saved.routes.find(r => r.task === 'implement')?.model).toBe('provider/custom-999')
   await settings.unmount()
 })
 

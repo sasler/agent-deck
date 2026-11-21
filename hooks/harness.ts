@@ -190,6 +190,53 @@ export const routeModelChoices = (target: string, h: Harness | undefined, codexM
 /** One model a route offers: its display name as the label; its id and note, where they add something, as the detail. */
 export type RouteModelChoice = { value: string; label: string; detail?: string }
 
+/** Maximum options a Select control accepts in the engine (1 to 64). */
+export const MAX_SELECT_OPTIONS = 64
+
+export type SelectOption = { value: string; label: string }
+
+export type CappedSelect<T extends SelectOption> = {
+  options: T[]
+  shown: number
+  total: number
+  isCapped: boolean
+}
+
+/**
+ * Caps a Select's options to `max` (default 64): always keeps `fixedHead` (e.g. Default),
+ * `fixedTail` (e.g. Other…), and the currently selected value (`keep`) even when it falls
+ * past the cut, filling the remaining slots in original order.
+ */
+export const capSelectOptions = <T extends SelectOption>(
+  options: readonly T[],
+  opts: { max?: number; keep?: string; fixedHead?: readonly T[]; fixedTail?: readonly T[] } = {},
+): CappedSelect<T> => {
+  const max = Math.max(1, opts.max ?? MAX_SELECT_OPTIONS)
+  const head = opts.fixedHead ?? []
+  const tail = opts.fixedTail ?? []
+  const total = options.length
+  const budget = Math.max(0, max - head.length - tail.length)
+  if (total <= budget) {
+    return { options: [...head, ...options, ...tail].slice(0, max), shown: total, total, isCapped: false }
+  }
+  const taken = options.slice(0, budget)
+  if (
+    opts.keep !== undefined &&
+    !head.some(o => o.value === opts.keep) &&
+    !tail.some(o => o.value === opts.keep) &&
+    !taken.some(o => o.value === opts.keep)
+  ) {
+    const kept = options.find(o => o.value === opts.keep)
+    if (kept && budget > 0) taken[budget - 1] = kept
+  }
+  return {
+    options: [...head, ...taken, ...tail].slice(0, max),
+    shown: taken.length,
+    total,
+    isCapped: true,
+  }
+}
+
 const routeChoice = (m: HarnessModel): RouteModelChoice => {
   const label = m.name || m.id
   const detail = [label !== m.id ? m.id : '', m.note ?? ''].filter(Boolean).join(' · ')

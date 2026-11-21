@@ -9,6 +9,7 @@ import {
   shownWindows,
   CARD_STALE_MS,
   METER_PROVIDERS,
+  capSelectOptions,
   cardModelName,
   effortProblem,
   fmtSpan,
@@ -104,6 +105,7 @@ const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { m
 const settingsSectionAtom = atom({ plugin: 'agent-deck', key: 'settingsSection' } as const, 'harnesses' as SettingsSection)
 const settingsInlineAtom = atom({ plugin: 'agent-deck', key: 'settingsInline' } as const, false)
 const taskDraftAtom = atom({ plugin: 'agent-deck', key: 'taskDraft' } as const, '')
+const routeTypingAtom = atom({ plugin: 'agent-deck', key: 'routeTyping' } as const, [] as string[])
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
@@ -2334,6 +2336,7 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
   const meters = await read($, metersAtom)
   const routingState = await read($, routingAtom)
   const taskDraft = await read($, taskDraftAtom)
+  const routeTyping = await read($, routeTypingAtom)
   const { hasReading } = meterReadings(list, hs, lim, isCodexOn)
   const cols = Math.max(24, e.props.bodyColumns || e.viewport?.columns || 60)
   // A field's least width: it wraps to the next line below that, and never asks for more than a card holds.
@@ -2607,11 +2610,14 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
       <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
     )
     if (known.length && Select) {
-      const options = [
-        { value: '', label: "Default (the CLI's choice)" },
-        ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
-        { value: OTHER_MODEL, label: 'Other…' },
-      ]
+      const capped = capSelectOptions(
+        known.map(m => ({ value: m.id, label: modelLabel(m) })),
+        {
+          keep: d.model,
+          fixedHead: [{ value: '', label: "Default (the CLI's choice)" }],
+          fixedTail: [{ value: OTHER_MODEL, label: 'Other…' }],
+        },
+      )
       const isTyping = v.isTypingModel || isCustom
       return (
         <Box key="h-models" flexDirection="column" gap={1}>
@@ -2619,7 +2625,7 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
             <Select
               key="h-model-pick"
               label="Model"
-              options={options}
+              options={capped.options}
               value={isTyping ? OTHER_MODEL : (d.model ?? '')}
               onSelect={s =>
                 void update($, viewAtom, cur =>
@@ -2633,6 +2639,9 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
             />
             {isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻')}
           </Box>
+          {capped.isCapped && (
+            <Text dimColor wrap="wrap">{`Showing ${capped.shown} of ${capped.total} models · pick Other… to type any id`}</Text>
+          )}
           {isTyping && typed('Model id')}
           {st && st !== 'loading' && (
             <Text color="error" wrap="wrap">
@@ -2786,7 +2795,10 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
   const setRoute = (task: string, patch: Partial<TaskRoute>) =>
     saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
 
-  /** The route's model: a picker of what its agent reports, with ↻ to ask again, or a field to type the id. */
+  const setRouteTyping = (task: string, on: boolean) =>
+    update($, routeTypingAtom, cur => (on ? (cur.includes(task) ? cur : [...cur, task]) : cur.filter(t => t !== task)))
+
+  /** The route's model: a picker of what its agent reports (capped to 64 with Other…), with ↻ to ask again, or a field to type the id. */
   const routeModelField = (r: TaskRoute) => {
     const target = hs.find(x => x.id === r.target)
     const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
@@ -2797,20 +2809,52 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
       <Button key={`r-refresh-${r.task}`} label="↻" plain dimColor onPress={() => void refreshRoutedModels($, { only: r.target, force: true })} />
     )
     const picked = known.find(k => k.value === r.model)
+    const isCustom = !!r.model && !picked
     const note = r.model ? picked?.detail : defaultModel && r.target !== 'claude' ? `default: ${defaultModel}` : undefined
     let control: RenderElement | undefined
     if (Select && known.length) {
-      const options = [
-        { value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' },
+      const isTyping = !!Input && (routeTyping.includes(r.task) || isCustom)
+      const middle = [
         ...known.map(k => ({ value: k.value, label: k.label })),
-        ...(r.model && !picked ? [{ value: r.model, label: r.model }] : []),
+        ...(!Input && isCustom ? [{ value: r.model!, label: r.model! }] : []),
       ]
+      const capped = capSelectOptions(middle, {
+        keep: isTyping ? undefined : r.model,
+        fixedHead: [{ value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' }],
+        fixedTail: Input ? [{ value: OTHER_MODEL, label: 'Other…' }] : [],
+      })
       control = (
-        <Box flexDirection="row" columnGap={1} alignItems="center">
-          <Box flexGrow={1} flexShrink={1} minWidth={0}>
-            <Select key={`r-model-${r.task}`} options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
+        <Box flexDirection="column" gap={0}>
+          <Box flexDirection="row" columnGap={1} alignItems="center">
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Select
+                key={`r-model-${r.task}`}
+                options={capped.options}
+                value={isTyping ? OTHER_MODEL : (r.model ?? '')}
+                onSelect={v => {
+                  if (v === OTHER_MODEL) void setRouteTyping(r.task, true)
+                  else void setRouteTyping(r.task, false).then(() => setRoute(r.task, { model: v || undefined }))
+                }}
+              />
+            </Box>
+            {refreshButton}
           </Box>
-          {refreshButton}
+          {capped.isCapped && (
+            <Text dimColor wrap="wrap">{`Showing ${capped.shown} of ${capped.total} models · pick Other… to type any id`}</Text>
+          )}
+          {isTyping && Input && (
+            <Input
+              key={`r-model-input-${r.task}`}
+              value={r.model ?? ''}
+              placeholder={defaultModel ?? 'model id'}
+              submitLabel="keep"
+              onSubmit={v => {
+                const clean = v.trim() || undefined
+                const isKnown = !clean || known.some(k => k.value === clean)
+                void setRouteTyping(r.task, !isKnown).then(() => setRoute(r.task, { model: clean }))
+              }}
+            />
+          )}
         </Box>
       )
     } else if (Input) {
@@ -2900,7 +2944,11 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
                 key={`r-target-${r.task}`}
                 options={targets}
                 value={r.target}
-                onSelect={v => void setRoute(r.task, { target: v, model: undefined, effort: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))}
+                onSelect={v =>
+                  void setRouteTyping(r.task, false)
+                    .then(() => setRoute(r.task, { target: v, model: undefined, effort: undefined }))
+                    .then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))
+                }
               />,
               r.target ? undefined : 'Pick one to choose its model and effort.',
             )}

@@ -267,6 +267,8 @@ declare module 'claude-code' {
       settingsInline: boolean
       /** What is typed in Task routing's Add a task field. */
       taskDraft: string
+      /** Task names whose routing Model field is typing a custom id via Other…. */
+      routeTyping: string[]
       /** Harness id → whether its command was found on PATH. */
       found: Record<string, boolean>
       /** Whether the built-in Codex (codex tools, live view, usage meters) is on. */
