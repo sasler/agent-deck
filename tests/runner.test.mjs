@@ -12,6 +12,7 @@ import { launchEnv } from '../bin/launch.mjs'
 
 const runner = fileURLToPath(new URL('../bin/run.mjs', import.meta.url))
 const modelLister = fileURLToPath(new URL('../bin/models.mjs', import.meta.url))
+const watcher = fileURLToPath(new URL('../bin/watch.mjs', import.meta.url))
 const fixture = `
 import fs from 'node:fs'
 if (process.env.COPILOT_PROVIDER_API_KEY !== 'fixture-key' || process.env.COPILOT_PROVIDER_API_KEY_COMMAND) {
@@ -248,4 +249,76 @@ test('runner says a missing working folder is missing, not that the program is',
   const stderr = fs.readFileSync(path.join(dir, 'stderr.log'), 'utf8')
   assert.match(stderr, /the working folder .*no-such-folder does not exist/)
   assert.doesNotMatch(stderr, /ENOENT/)
+})
+
+const runWatch = async (t, rollouts, projectCwd) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-watch-test-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = new Date()
+  const sessionsDir = path.join(root, 'sessions')
+  const dayDir = path.join(
+    sessionsDir,
+    String(now.getFullYear()),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  )
+  fs.mkdirSync(dayDir, { recursive: true })
+  const ts = now.toISOString()
+  for (const r of rollouts) {
+    const line = JSON.stringify({ type: 'session_meta', timestamp: ts, payload: { id: r.id, cwd: r.cwd, timestamp: ts } })
+    fs.writeFileSync(path.join(dayDir, `${r.id}.jsonl`), `${line}\n`)
+  }
+  // A sentinel run folder lets the test stop right after the watcher finishes its first scan.
+  const runsDir = path.join(root, 'runs')
+  fs.mkdirSync(path.join(runsDir, 'sentinel'), { recursive: true })
+  fs.writeFileSync(path.join(runsDir, 'sentinel', 'events.jsonl'), '{"type":"thread.started","thread_id":"sentinel-thread"}\n')
+
+  const child = spawn(process.execPath, [watcher, sessionsDir, runsDir, projectCwd, String(Date.now() - 60_000)], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  t.after(() => child.kill())
+
+  const events = []
+  let buffer = ''
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('watcher timed out before finishing initial scan')), 10_000)
+    child.on('error', err => { clearTimeout(timer); reject(err) })
+    child.on('exit', code => {
+      clearTimeout(timer)
+      if (!events.some(e => e.t === 'run' && e.run === 'sentinel')) reject(new Error(`watcher exited early (${code})`))
+      else resolve()
+    })
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      buffer += chunk
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.startsWith('{')) continue
+        const ev = JSON.parse(line)
+        events.push(ev)
+        if (ev.t === 'run' && ev.run === 'sentinel') {
+          clearTimeout(timer)
+          child.kill()
+          resolve()
+        }
+      }
+    })
+  })
+  return events.filter(e => e.t === 'meta').map(e => e.f).sort()
+}
+
+test('watcher matches MSYS paths, trailing slashes, subfolders and scratchpads, and ignores sibling folders', async t => {
+  const rollouts = [
+    { id: 'th-root', cwd: 'C:\\src\\proj' },
+    { id: 'th-sub', cwd: 'C:\\src\\proj\\packages\\app' },
+    { id: 'th-msys-sub', cwd: '/c/src/proj/tools' },
+    { id: 'th-scratch', cwd: 'C:\\Users\\me\\AppData\\Local\\Temp\\claude\\C--src-proj\\work' },
+    { id: 'th-sibling-prefix', cwd: 'C:\\src\\proj-other' },
+    { id: 'th-sibling', cwd: 'C:\\src\\other' },
+  ]
+  const expected = ['th-msys-sub', 'th-root', 'th-scratch', 'th-sub']
+  assert.deepEqual(await runWatch(t, rollouts, '/c/src/proj'), expected)
+  assert.deepEqual(await runWatch(t, rollouts, 'C:\\src\\proj\\'), expected)
+  assert.deepEqual(await runWatch(t, rollouts, 'C:\\src\\proj'), expected)
 })

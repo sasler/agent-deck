@@ -18,10 +18,11 @@ const norm = p =>
   String(p ?? '')
     .replace(/^file:\/\/\/?/i, '')
     .replace(/\\/g, '/')
+    .replace(/^\/([a-zA-Z])(?=\/|$)/, '$1:')
     .replace(/\/+$/, '')
     .toLowerCase()
 const project = norm(projectCwd)
-const slug = String(projectCwd ?? '').replace(/[^A-Za-z0-9]/g, '-').toLowerCase()
+const slug = project.replace(/[^a-z0-9]/g, '-')
 const isOurs = cwd => {
   const c = norm(cwd)
   return (project && (c === project || c.startsWith(project + '/'))) || (slug && c.includes(`/claude/${slug}/`))

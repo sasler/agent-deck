@@ -1374,7 +1374,7 @@ const startCodexWatcher = async ($: $T) => {
   const root = await runsRoot($)
   if (!home || !root) return
   const since = (await $.clock.now()) - 30 * 60_000
-  startWatcher($, [`${home}/sessions`, root, await $.session.cwd(), String(since)])
+  startWatcher($, [`${home}/sessions`, root, await $.session.root(), String(since)])
 }
 
 /** The stored switch; on first use, on when `codex` is on PATH. */

@@ -1707,3 +1707,31 @@ test('restored harness run cards are not duplicated when loadHarnessRuns reloads
   expect(await ui.find({ text: /Fresh from disk/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('the Codex watcher starts with the session project root, not the shell cwd', async ($, on) => {
+  mock.clock(on, { now: 60 * 60_000 })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-watch-root' }))
+  on('session.root', () => ({ value: 'C:\\src\\JumpInn' }))
+  on('session.cwd', () => ({ value: 'C:\\src\\JumpInn\\test-results\\crown-walk' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const spawned: (readonly string[])[] = []
+  on('process.spawn', async function* (_$, e) {
+    spawned.push(e.argv)
+    return { value: { exitCode: 0 } }
+  })
+
+  await $.session.start({ cwd: 'C:\\src\\JumpInn\\test-results\\crown-walk', surface: 'desktop', isInteractive: true })
+
+  const watchArgv = spawned.find(argv => argv.some(a => a.endsWith('/bin/watch.mjs')))
+  expect(watchArgv).toBeDefined()
+  expect(watchArgv?.[4]).toBe('C:\\src\\JumpInn')
+})
