@@ -691,7 +691,7 @@ export const parseModels = (stdout: string): { models: HarnessModel[] } | { erro
   }
 }
 
-/** Fusion selections also remain compatible with harnesses saved with the old virtual model ids. */
+/** Fusion models offered alongside Auto in the Copilot picker; they run directly as --model <id>. */
 const COPILOT_FUSION: HarnessModel[] = [
   { id: 'hydrafusion', name: 'Copilot Fusion Standard', note: 'picks models per prompt' },
   { id: 'hydrafusion-max', name: 'Copilot Fusion Max', note: 'picks models per prompt' },
@@ -830,11 +830,12 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
 
 export type CopilotRunOptions = { model?: string; autoTier?: string; maxAiCredits?: number }
 
-const isFusionModel = (model: string | undefined) => COPILOT_FUSION.some(f => f.id === model)
+export const isFusionModel = (model: string | undefined): boolean =>
+  !!model && (COPILOT_FUSION.some(f => f.id === model) || /^hydrafusion(?:$|[-_])/.test(model))
 
 const copilotRouting = (h: Harness, v: CopilotRunOptions) => {
   const model = v.autoTier && !v.model ? 'auto' : (v.model ?? h.model)
-  const tier = v.autoTier ?? (isFusionModel(model) ? model : v.model && v.model !== 'auto' ? undefined : h.autoTier)
+  const tier = v.autoTier ?? (v.model && v.model !== 'auto' ? undefined : isFusionModel(model) ? undefined : h.autoTier)
   return { model, tier }
 }
 
@@ -848,7 +849,7 @@ export const copilotOptionsError = (h: Harness, v: CopilotRunOptions = {}): stri
   const { model, tier } = copilotRouting(h, v)
   if (tier !== undefined && (!tier.trim() || /\s/.test(tier))) return 'Give an Auto routing profile id without spaces.'
   if (h.provider && (tier || model === 'auto' || isFusionModel(model))) return 'Auto and Fusion use GitHub models, not your own API.'
-  if (tier && model && model !== 'auto' && !isFusionModel(model)) return 'Pick Auto to use an Auto routing profile.'
+  if (tier && model && model !== 'auto') return 'Pick Auto to use an Auto routing profile.'
   if (limit !== undefined && (!Number.isFinite(limit) || limit < 30)) return 'The AI credit limit must be at least 30.'
   return undefined
 }
@@ -928,9 +929,9 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
       for (let i = args.length - 1; i >= 0; i--) if (args[i] === '--no-experimental') args.splice(i, 1)
       if (!args.includes('--experimental')) args.push('--experimental')
     }
-  } else if (v.model) {
-    setArg(args, '--model', v.model)
-    if (v.model !== 'auto') removeArg(args, '--auto-tier')
+  } else if (v.model || isFusionModel(model)) {
+    if (model) setArg(args, '--model', model)
+    if (model !== 'auto') removeArg(args, '--auto-tier')
   }
   const limit = v.maxAiCredits ?? h.maxAiCredits
   if (limit !== undefined) setArg(args, '--max-ai-credits', String(limit))
@@ -1790,7 +1791,12 @@ export const resolveRun = (
   }
   const isSame = !input.harness || input.harness === r.target
   const model = input.model ?? (isSame ? r.model?.trim() || undefined : undefined)
-  const effort = input.effort ?? (isSame ? routeEffort(r, harnesses) : undefined)
+  const targetHarness = harnesses.find(h => h.id === (input.harness ?? r.target))
+  const effectiveModel = model ?? targetHarness?.model
+  // Plans may restrict Copilot Fusion effort to the CLI's default, so don't inherit a route's effort onto Fusion unless set explicitly.
+  const inheritedEffort =
+    isSame && !(targetHarness?.parser === 'copilot' && isFusionModel(effectiveModel)) ? routeEffort(r, harnesses) : undefined
+  const effort = input.effort ?? inheritedEffort
   if (input.harness) return { harness: input.harness, model, effort }
   const problem = routeProblem(r, harnesses, isCodexOn)
   if (problem) return { error: `The "${task}" route can't run: ${problem}. Tell the person, and ask before using another agent.` }
@@ -2124,17 +2130,39 @@ export const summarizeStderr = (stderr: string, maxChars = STDERR_SUMMARY_MAX): 
 }
 
 const BARE_EXIT_RE = /^.+\s+exited\s+(?:-?\d+|\?)$/i
+const COPILOT_PLAN_UNAVAILABLE_RE = /not available for the user's copilot plan|is disabled/i
+
+export const COPILOT_MODEL_HINT = 'Pick another Copilot model in ⚙ Settings → Harnesses → Copilot.'
+
+/** Plain next-step hint when a Copilot error says the chosen model or profile is disabled on the user's plan. */
+export const copilotFailureHint = (parser: HarnessParser | undefined, message: string): string | undefined =>
+  parser === 'copilot' && COPILOT_PLAN_UNAVAILABLE_RE.test(message) && !message.includes(COPILOT_MODEL_HINT)
+    ? COPILOT_MODEL_HINT
+    : undefined
 
 /**
  * The error line for a failed harness run: its parsed event error when the events carried one,
  * otherwise "<name> exited <code>" followed by the summarized stderr.log when present.
  */
-export const harnessFailure = (name: string, code: number | undefined, eventError: string | undefined, stderr: string): string => {
+export const harnessFailure = (
+  name: string,
+  code: number | undefined,
+  eventError: string | undefined,
+  stderr: string,
+  parser?: HarnessParser,
+): string => {
   const cleaned = eventError ? redactSecrets(stripAnsi(eventError)).trim() : ''
-  if (cleaned && !BARE_EXIT_RE.test(cleaned)) return cleaned
-  const base = cleaned || `${name} exited ${code !== undefined && !Number.isNaN(code) ? code : '?'}`
-  const detail = summarizeStderr(stderr)
-  return detail ? `${base}: ${detail}` : base
+  let message: string
+  if (cleaned && !BARE_EXIT_RE.test(cleaned)) {
+    message = cleaned
+  } else {
+    const base = cleaned || `${name} exited ${code !== undefined && !Number.isNaN(code) ? code : '?'}`
+    const detail = summarizeStderr(stderr)
+    message = detail ? `${base}: ${detail}` : base
+  }
+  const hint = copilotFailureHint(parser, message)
+  if (!hint) return message
+  return /[.!?]$/.test(message) ? `${message} ${hint}` : `${message}. ${hint}`
 }
 
 /** A Codex error message, unwrapped when it is the API's JSON error body: "message (code)". */

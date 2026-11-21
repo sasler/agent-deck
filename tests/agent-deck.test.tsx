@@ -25,7 +25,7 @@ import {
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
 import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, buildModelTree, capSelectOptions, cardModelName, codexLiveError, effortLabel, filterModels, groupModels, orderWindows, parseCodexLimitsOutput, pickerLevels, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
-import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, harnessFailure, modelQuery, parseLine, parseModels, providerEnv, redactSecrets, slugId, stripAnsi, summarizeStderr, tokenizeArgs, withFusion } from '../hooks/harness'
+import { CARD_STALE_MS, CARD_TTL_MS, COPILOT_MODEL_HINT, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotFailureHint, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, harnessFailure, isFusionModel, modelQuery, parseLine, parseModels, providerEnv, redactSecrets, slugId, stripAnsi, summarizeStderr, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -353,8 +353,15 @@ test('harness edits are checked', () => {
 
 test('Copilot routing and limits use current flags, also with old saved templates', () => {
   const h = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
+  // Fusion model ids pass straight through as --model <id>, with no --auto-tier and no --experimental.
   expect(harnessArgs(h, { prompt: 'fix %PATH% and "$x"', model: 'hydrafusion' })).toEqual([
-    '-p', 'fix %PATH% and "$x"', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'hydrafusion', '--experimental', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+    '-p', 'fix %PATH% and "$x"', '--output-format', 'json', '--allow-all-tools', '--model', 'hydrafusion', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, model: 'hydrafusion' }, { prompt: 'hello' })).toEqual([
+    '-p', 'hello', '--output-format', 'json', '--allow-all-tools', '--model', 'hydrafusion', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, args: '-p {prompt}', model: 'hydrafusion-max' }, { prompt: 'hello' })).toEqual([
+    '-p', 'hello', '--model', 'hydrafusion-max', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
   ])
   expect(harnessArgs({ ...h, model: 'auto', autoTier: 'balance', maxAiCredits: 30 }, { prompt: 'x', autoTier: 'intelligence', maxAiCredits: 60 })).toEqual([
     '-p', 'x', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'intelligence', '--max-ai-credits', '60', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
@@ -367,6 +374,7 @@ test('Copilot routing and limits use current flags, also with old saved template
   expect(copilotOptionsError(h, { maxAiCredits: Infinity })).toMatch(/at least 30/)
   expect(copilotOptionsError(h, { autoTier: 'two words' })).toMatch(/without spaces/)
   expect(copilotOptionsError({ ...h, model: 'gpt-5.4', autoTier: 'balance' })).toMatch(/Pick Auto/)
+  expect(copilotOptionsError(h, { model: 'hydrafusion', autoTier: 'balance' })).toMatch(/Pick Auto/)
   expect(copilotOptionsError({ ...h, parser: 'claude' }, { autoTier: 'balance' })).toMatch(/Copilot harness/)
   expect(copilotOptionsError({ ...h, provider: { type: 'openai', baseUrl: 'http://localhost/v1' } }, { model: 'auto' })).toMatch(/not your own API/)
   expect(copilotOptionsError(h, { autoTier: 'future-profile', maxAiCredits: 30.5 })).toBeUndefined()
@@ -3240,9 +3248,9 @@ test('a failed harness run shows stderr in its card and report, marks delivered.
   await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
   for (let i = 0; i < 8; i++) await clock.advance(500)
 
-  // Delivered exactly once with the real stderr reason and redacted token.
+  // Delivered exactly once with the real stderr reason, redacted token, and plain Copilot model hint.
   expect(submits.length).toBe(1)
-  expect(submits[0]).toContain(`Copilot exited 1: ${stderrReason} (token [redacted])`)
+  expect(submits[0]).toContain(`Copilot exited 1: ${stderrReason} (token [redacted]). ${COPILOT_MODEL_HINT}`)
   expect(submits[0]).not.toContain('ghp_1234567890')
   expect(submits[0]).not.toContain('\x1b[')
 
@@ -3252,14 +3260,14 @@ test('a failed harness run shows stderr in its card and report, marks delivered.
   expect(readDeliveryMark(deliveredRaw)).toEqual({ state: 'delivered' })
   expect(isDeliveryTaken(readDeliveryMark(deliveredRaw), start + 11 * 60_000)).toBe(true)
 
-  // agent_result and the card's error line show the exact same reason.
+  // agent_result and the card's error line show the exact same reason and hint.
   const res = (await $.tool.call({ tool: 'mcp__agent-deck__agent_result', tool_use_id: 'res-fail', id: 'run-fail' })) as { result?: string }
-  expect(res.result).toContain(`Copilot run run-fail failed: Copilot exited 1: ${stderrReason} (token [redacted])`)
+  expect(res.result).toContain(`Copilot run run-fail failed: Copilot exited 1: ${stderrReason} (token [redacted]). ${COPILOT_MODEL_HINT}`)
 
   const ui = await mountPane($, 80)
   await ui.press({ key: 't-h-run-run-fail' } as never)
   await ui.redraw()
-  expect(await ui.find({ text: /Copilot exited 1: Error executing prompt:.*choose an enabled Auto preference or another model/ })).toBeDefined()
+  expect(await ui.find({ text: /Copilot exited 1: Error executing prompt:.*Pick another Copilot model in ⚙ Settings → Harnesses → Copilot\./ })).toBeDefined()
   await ui.unmount()
 
   // Advance 11 minutes (past the 10-minute claim TTL) and poll/reload again: nothing is delivered a second time.
@@ -3431,4 +3439,111 @@ test('a slow prompt.submit for one run does not leave another claimed run stuck 
   for (let i = 0; i < 4; i++) await clock.advance(500)
   expect(files.get(`${root}/run-slow/delivered.txt`)).toMatch(/^\d+$/)
   expect(submits.length).toBe(2)
+})
+
+test('Copilot Fusion runs as --model without --auto-tier, skips inherited route effort, and plan-disabled errors add a plain hint', () => {
+  const copilot = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
+  expect(isFusionModel('hydrafusion')).toBe(true)
+  expect(isFusionModel('hydrafusion-max')).toBe(true)
+  expect(isFusionModel('auto')).toBe(false)
+
+  // Direct Fusion model: --model hydrafusion, no --auto-tier, no --experimental, no --reasoning-effort.
+  const direct = harnessArgs(copilot, { prompt: 'Hello', model: 'hydrafusion' })
+  expect(direct).toContain('--model')
+  expect(direct[direct.indexOf('--model') + 1]).toBe('hydrafusion')
+  expect(direct).not.toContain('--auto-tier')
+  expect(direct).not.toContain('--experimental')
+  expect(direct).not.toContain('--reasoning-effort')
+
+  // Explicit effort still passes through when asked directly.
+  const withEffort = harnessArgs(copilot, { prompt: 'Hello', model: 'hydrafusion', effort: 'low' })
+  expect(withEffort.slice(0, 2)).toEqual(['--reasoning-effort', 'low'])
+  expect(withEffort).not.toContain('--auto-tier')
+
+  // Task routing does not inherit a route's effort onto a Copilot Fusion model unless passed explicitly.
+  const hs = [{ ...copilot, model: 'hydrafusion' }]
+  const routing = {
+    isOn: true,
+    routes: [
+      { task: 'review', target: 'copilot', effort: 'high' },
+      { task: 'implement', target: 'copilot', model: 'gpt-6-luna', effort: 'high' },
+    ],
+  }
+  expect(resolveRun({ task: 'review' }, routing, hs, false)).toEqual({ harness: 'copilot', model: undefined, effort: undefined })
+  expect(resolveRun({ task: 'review', effort: 'low' }, routing, hs, false)).toEqual({ harness: 'copilot', model: undefined, effort: 'low' })
+  expect(resolveRun({ task: 'implement', model: 'hydrafusion' }, routing, hs, false)).toEqual({ harness: 'copilot', model: 'hydrafusion', effort: undefined })
+  expect(resolveRun({ task: 'implement' }, routing, hs, false)).toEqual({ harness: 'copilot', model: 'gpt-6-luna', effort: 'high' })
+
+  // Plan-disabled / unavailable Copilot errors get a plain hint; other parsers and unrelated errors do not.
+  expect(copilotFailureHint('copilot', 'This tier is not available for the user\'s Copilot plan.')).toBe(COPILOT_MODEL_HINT)
+  expect(copilotFailureHint('copilot', 'Auto preference "hydrafusion" is disabled')).toBe(COPILOT_MODEL_HINT)
+  expect(copilotFailureHint('copilot', 'network timed out')).toBeUndefined()
+  expect(copilotFailureHint('opencode', 'feature is disabled')).toBeUndefined()
+  expect(harnessFailure('Copilot', 1, 'Copilot exited 1', 'Model hydrafusion-max is disabled', 'copilot')).toBe(
+    `Copilot exited 1: Model hydrafusion-max is disabled. ${COPILOT_MODEL_HINT}`,
+  )
+  expect(harnessFailure('OpenCode', 1, undefined, 'feature is disabled', 'opencode')).toBe('OpenCode exited 1: feature is disabled')
+})
+
+test('session.end releases unsent delivery claims so a replacement copy delivers right away without waiting 10 minutes', async ($, on) => {
+  const start = 400_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-reload-claim' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', () => ({ sessionId: 'sid-reload-claim' }) as never)
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>([
+    [
+      `${root}/run-claim/meta.json`,
+      JSON.stringify({ id: 'run-claim', harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: 'Smoke test', cwd: 'project', sessionId: 'sid-reload-claim', startedAt: start - 5000 }),
+    ],
+    [`${root}/run-claim/exit.txt`, '0'],
+    [`${root}/run-claim/events.jsonl`, '{"event":"result","result":{"status":"SUCCESS","response":"0.17.5"}}\n'],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? [{ name: 'run-claim', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  // Poll 1 writes the claim, before Poll 2 submits.
+  await clock.advance(1000)
+  expect(files.get(`${root}/run-claim/delivered.txt`)).toMatch(/^claim \S+ \d+$/)
+  expect(submits.length).toBe(0)
+
+  // A reload/end before Poll 2 releases the unsent claim immediately.
+  await $.session.end({ reason: 'other' } as never)
+  expect(files.get(`${root}/run-claim/delivered.txt`)).toBe('')
+
+  // Next copy starts 2 seconds later and delivers right away (no 10-minute wait).
+  await clock.advance(2000)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+  expect(submits.length).toBe(1)
+  expect(files.get(`${root}/run-claim/delivered.txt`)).toMatch(/^\d+$/)
 })

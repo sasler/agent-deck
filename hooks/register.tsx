@@ -921,6 +921,21 @@ const sendReport = async ($: $T, dir: string, what: string, text: string, d: Del
   }
 }
 
+/** Releases claims this copy wrote but has not yet submitted, so a replacement copy delivers them right away instead of waiting out the claim TTL. */
+const releaseUnsentClaims = async ($: $T) => {
+  for (const [dir, d] of deliveries) {
+    if (!d.claim || d.isSending || d.deliveredAt !== undefined) continue
+    const token = d.claim
+    d.claim = undefined
+    d.claimAt = undefined
+    const file = `${dir}/delivered.txt`
+    const mark = readDeliveryMark(await readText($, file))
+    if (mark.state === 'claimed' && mark.token === token) {
+      await $.fs.write(file, '').catch(() => undefined)
+    }
+  }
+}
+
 /**
  * Hands a finished run's report to the model as a new turn, once. Another copy of agent-deck
  * can be watching the same run folder: the copy a reload replaced, still finishing its poll, or
@@ -1234,10 +1249,10 @@ const finishHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard, code: n
     card.status = isOk ? 'done' : 'error'
     card.endedAt = await $.clock.now()
     card.isThinking = false
-    if (!isOk) card.error = harnessFailure(run.name, exitCode, card.error, stderr)
+    if (!isOk) card.error = harnessFailure(run.name, exitCode, card.error, stderr, run.parser)
     schedule($)
   } else if (card.status === 'error') {
-    const nextError = harnessFailure(run.name, exitCode, card.error, stderr)
+    const nextError = harnessFailure(run.name, exitCode, card.error, stderr, run.parser)
     if (nextError !== card.error) {
       card.error = nextError
       schedule($)
@@ -3511,6 +3526,7 @@ export const register: Register = on => {
 
   on('session.end', async ($, e, next) => {
     if (flushPending) await persist($)
+    await releaseUnsentClaims($).catch(() => undefined)
     cacheTicker?.cancel()
     cacheSessionEnd()
     strataTimer?.cancel()
