@@ -177,6 +177,8 @@ export type Limits = {
   codexPlan?: string
   /** Where Codex's reading came from: live from `codex app-server`, or a fallback session file. */
   codexSource?: CodexLimitSource
+  /** Why the last live Codex limits read failed; absent once a live read succeeds. */
+  codexError?: string
   /** Copilot's monthly AI credits, read with `gh api copilot_internal/user`. */
   copilot?: LimitWindow[]
   copilotPlan?: string

@@ -14,6 +14,8 @@ import {
   fmtSpan,
   isResetPast,
   limitSummary,
+  codexLiveError,
+  parseCodexLimitsOutput,
   readingAge,
   resetNote,
   routeEffortChoices,
@@ -487,20 +489,27 @@ const refreshClaudeLimits = async ($: $T) => {
 }
 
 /** Codex's reading, unless a newer one is already shown; a live reading beats a rollout fallback at the same timestamp. */
-const setCodexLimits = async ($: $T, ts: number, reading: WatchLimits, source?: CodexLimitSource) => {
+const setCodexLimits = async ($: $T, ts: number, reading: WatchLimits, source?: CodexLimitSource, liveError?: string) => {
   const codex = toLimitWindows(reading)
   if (!codex.length) return
-  await setLimits($, l =>
-    !shouldTakeCodexLimits(l.readAt?.codex, l.codexSource, ts, source)
-      ? l
-      : {
-          ...l,
-          codex,
-          codexPlan: reading.plan,
-          codexSource: source ?? l.codexSource ?? 'rollout',
-          readAt: { ...l.readAt, codex: ts },
-        },
-  )
+  await setLimits($, l => {
+    const nextError = source === 'live' ? undefined : liveError !== undefined ? liveError : l.codexError
+    if (!shouldTakeCodexLimits(l.readAt?.codex, l.codexSource, ts, source)) {
+      return nextError === l.codexError ? l : { ...l, codexError: nextError }
+    }
+    return {
+      ...l,
+      codex,
+      codexPlan: reading.plan,
+      codexSource: source ?? l.codexSource ?? 'rollout',
+      codexError: nextError,
+      readAt: { ...l.readAt, codex: ts },
+    }
+  })
+}
+
+const setCodexError = async ($: $T, error: string) => {
+  await setLimits($, l => (l.codexError === error ? l : { ...l, codexError: error }))
 }
 
 let version: string | undefined
@@ -1447,37 +1456,66 @@ const readAgyLimits = async ($: $T, h: Harness): Promise<boolean> => {
   return true
 }
 
+const CODEX_LIMITS_DEADLINE_MS = 25_000
 let codexLimitsPoller: { cancel: () => void } | undefined
 let codexLimitsCheck: Promise<boolean> | undefined
 
-/** The Codex CLI to ask for live limits: the configured override, else the newest installed, else `codex` on PATH. */
+/** The Codex CLI to ask for live limits without waiting on a slow discovery: override, else cached find, else `codex`. */
 const codexLimitsCommand = async ($: $T): Promise<string> => {
   const override = await codexOverride($)
   if (override) return override
-  const found = await findCodex($).catch(() => undefined)
-  return found?.chosen?.path ?? 'codex'
+  if (codexFound?.chosen?.path) return codexFound.chosen.path
+  void findCodex($).catch(() => undefined)
+  return 'codex'
 }
 
 /** Reads Codex's limits live via `codex app-server` (bin/codex-limits.mjs), falling back to its newest session file. */
 const refreshCodexLimits = ($: $T): Promise<boolean> => {
-  if (!codexOn) return Promise.resolve(false)
-  codexLimitsCheck ??= readCodexLimits($).finally(() => {
+  codexLimitsCheck ??= (async () => {
+    if (!codexOn && !(await read($, codexAtom))) return false
+    return await readCodexLimits($)
+  })().finally(() => {
     codexLimitsCheck = undefined
   })
   return codexLimitsCheck
 }
 
 const readCodexLimits = async ($: $T): Promise<boolean> => {
-  const [home, command] = await Promise.all([codexHome($), codexLimitsCommand($)])
-  const r = await $.process.run(['node', `${$.plugin.root}/bin/codex-limits.mjs`, home ? `${home}/sessions` : '', command], { timeoutMs: 30_000 }).catch(() => undefined)
-  let found: { ts?: unknown; limits?: WatchLimits; source?: unknown } = {}
-  try {
-    found = JSON.parse(r?.stdout ?? '')
-  } catch {}
-  if (typeof found.ts !== 'number' || !Array.isArray(found.limits?.windows)) return false
-  const source: CodexLimitSource = found.source === 'rollout' ? 'rollout' : 'live'
-  await setCodexLimits($, found.ts, found.limits!, source)
-  return true
+  let timedOut = false
+  let timer: { cancel: () => void } | undefined
+  const timeout = new Promise<'timeout'>(resolve => {
+    timer = $.clock.after(CODEX_LIMITS_DEADLINE_MS, () => {
+      timedOut = true
+      resolve('timeout')
+    })
+  })
+  const run = (async (): Promise<{ ok: boolean; error?: string }> => {
+    const [home, command] = await Promise.all([codexHome($), codexLimitsCommand($)])
+    if (timedOut) return { ok: false }
+    let r: { exitCode: number; stdout: string; stderr: string } | undefined
+    let runError: string | undefined
+    try {
+      r = await $.process.run(['node', `${$.plugin.root}/bin/codex-limits.mjs`, home ? `${home}/sessions` : '', command], { timeoutMs: 22_000 })
+    } catch (err) {
+      runError = codexLiveError(String((err as Error)?.message ?? err))
+    }
+    if (timedOut) return { ok: false }
+    if (!r) return { ok: false, error: runError ?? 'could not read live' }
+    const parsed = parseCodexLimitsOutput(r.stdout, r.exitCode, r.stderr)
+    if (parsed.reading) {
+      await setCodexLimits($, parsed.reading.ts, parsed.reading.limits, parsed.reading.source, parsed.liveError)
+      return { ok: parsed.reading.source === 'live' }
+    }
+    return { ok: false, error: parsed.liveError ?? 'no answer from Codex' }
+  })()
+  const outcome = await Promise.race([run, timeout])
+  timer?.cancel()
+  if (outcome === 'timeout') {
+    await setCodexError($, 'timed out')
+    return false
+  }
+  if (!outcome.ok && outcome.error) await setCodexError($, outcome.error)
+  return outcome.ok
 }
 
 /** Reads Codex's limits now and every ten minutes, while the built-in Codex is switched on. */
@@ -1585,7 +1623,7 @@ async function setCodexEnabled($: $T, on: boolean) {
   } else {
     stopWatcher()
     startCodexLimits($)
-    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined, codexSource: undefined, readAt: { ...l.readAt, codex: undefined } }))
+    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined, codexSource: undefined, codexError: undefined, readAt: { ...l.readAt, codex: undefined } }))
   }
 }
 
@@ -3613,20 +3651,24 @@ export const register: Register = on => {
     const maxWindows = Math.max(1, lim.codex.length, lim.claude.length)
     const isSideBySide = glyph === 1 && cols >= 7 + maxWindows * windowCols + (maxWindows - 1) * 2 + 2
 
-    const limitWindow = (name: string, w: LimitWindow) => (
-      <Box key={`${name}-${w.label}`} flexDirection="row" gap={1} flexShrink={0}>
-        <Box width={Math.max(2, w.label.length)} flexShrink={0}>
-          <Text dimColor>{w.label}</Text>
+    const limitWindow = (name: string, w: LimitWindow) => {
+      const isPast = isResetPast(w, now)
+      const shownPercent = isPast ? 0 : w.percent
+      return (
+        <Box key={`${name}-${w.label}`} flexDirection="row" gap={1} flexShrink={0}>
+          <Box width={Math.max(2, w.label.length)} flexShrink={0}>
+            <Text dimColor>{w.label}</Text>
+          </Box>
+          {meter(`${name}-${w.label}-m`, shownPercent, limitColor(shownPercent))}
+          <Box width={5} flexShrink={0} justifyContent="flex-end">
+            <Text bold={!isPast} color={isPast ? undefined : limitColor(shownPercent)} dimColor={isPast}>
+              {`${Math.round(shownPercent)}%`}
+            </Text>
+          </Box>
+          {w.resetsAt !== undefined && <Text dimColor>{isPast ? 'reset since this reading' : `↻${fmtSpan(w.resetsAt - now)}`}</Text>}
         </Box>
-        {meter(`${name}-${w.label}-m`, w.percent, limitColor(w.percent))}
-        <Box width={5} flexShrink={0} justifyContent="flex-end">
-          <Text bold color={limitColor(w.percent)}>
-            {`${Math.round(w.percent)}%`}
-          </Text>
-        </Box>
-        {w.resetsAt !== undefined && (isResetPast(w, now) ? <Text color="warning">out of date</Text> : <Text dimColor>{`↻${fmtSpan(w.resetsAt - now)}`}</Text>)}
-      </Box>
-    )
+      )
+    }
 
     // A fixed-width name column keeps the meters aligned in a proportional font too.
     const nameCell = (name: string, color: string, isShown: boolean) => (
@@ -3652,7 +3694,7 @@ export const register: Register = on => {
         </Text>
       )
       return (
-        <Box key={`lim-${name}`} flexDirection="column" marginBottom={1}>
+        <Box key={`lim-${name}`} flexDirection="column">
           {control ? (
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
               <Box flexShrink={1} minWidth={0}>
@@ -3666,18 +3708,19 @@ export const register: Register = on => {
           {ws.length === 0 && <Text dimColor>{empty}</Text>}
           {ws.map(w => {
             const isPast = isResetPast(w, now)
+            const shownPercent = isPast ? 0 : w.percent
             return (
               <Box key={`${name}-${w.label}`} flexDirection="column">
                 <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
                   <Text wrap="truncate-end">{windowName(w)}</Text>
                   <Box flexDirection="row" columnGap={1} flexShrink={0}>
-                    {w.resetsAt !== undefined && <Text dimColor={!isPast} color={isPast ? 'warning' : undefined}>{resetNote(w, now)}</Text>}
-                    <Text bold color={isPast ? undefined : limitColor(w.percent)} dimColor={isPast}>
-                      {`${Math.round(w.percent)}%`}
+                    {w.resetsAt !== undefined && <Text dimColor>{resetNote(w, now)}</Text>}
+                    <Text bold={!isPast} color={isPast ? undefined : limitColor(shownPercent)} dimColor={isPast}>
+                      {`${Math.round(shownPercent)}%`}
                     </Text>
                   </Box>
                 </Box>
-                {bar(`${name}-${w.label}-bar`, w.percent, isPast ? '#8B949E' : SVG_COLORS[limitColor(w.percent)])}
+                {bar(`${name}-${w.label}-bar`, shownPercent, isPast ? '#8B949E' : SVG_COLORS[limitColor(shownPercent)])}
               </Box>
             )
           })}
@@ -3688,16 +3731,16 @@ export const register: Register = on => {
     /** A provider's meters, with how old the reading is once that matters. */
     const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string, control?: RenderElement, empty?: string) => {
       const hasPast = ws.some(w => isResetPast(w, now))
-      const isCodexFallback = p === 'codex' && lim.codexSource === 'rollout'
-      const extra =
-        [plan, isCodexFallback ? 'from last session' : undefined, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
+      const codexError = p === 'codex' ? lim.codexError : undefined
+      const extra = [plan, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
       return (
-        <Box key={`lim-row-${p}`} flexDirection="column">
+        <Box key={`lim-row-${p}`} flexDirection="column" marginBottom={Svg ? 1 : 0}>
           {Svg ? limitBars(name, color, ws, extra, control, empty) : limitText(name, color, ws, extra, control, empty)}
-          {isCodexFallback && hasPast && (
-            <Text dimColor wrap="wrap">
-              Could not read Codex's limits live, so this is from its last session file. Press Refresh to try again, or run Codex.
-            </Text>
+          {codexError && (
+            <Box key="lim-codex-err" flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
+              <Text dimColor wrap="wrap">{`Live reading failed: ${codexError}`}</Text>
+              <Button key="lim-codex-retry" label="Retry" plain dimColor onPress={() => void refreshCodexLimits($)} />
+            </Box>
           )}
         </Box>
       )
@@ -4083,7 +4126,7 @@ export const register: Register = on => {
                   {i > 0 && <Text dimColor> · </Text>}
                   <Text dimColor>{x.name} </Text>
                   {x.percent === undefined ? (
-                    <Text color="warning">out of date</Text>
+                    <Text dimColor>0%</Text>
                   ) : (
                     <Text bold color={limitColor(x.percent)}>{`${Math.round(x.percent)}%`}</Text>
                   )}

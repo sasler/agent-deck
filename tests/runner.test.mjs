@@ -477,6 +477,7 @@ rl.on('line', line => {
   assert.equal(result.status, 0, result.stderr)
   const out = JSON.parse(result.stdout)
   assert.equal(out.source, 'rollout')
+  assert.equal(out.liveError, 'not logged in')
   assert.equal(out.ts, Date.parse(tsIso))
   assert.deepEqual(out.limits, {
     windows: [
@@ -487,6 +488,110 @@ rl.on('line', line => {
   })
   assert.equal(result.stdout.includes('raw-secret-value'), false)
   assert.equal(result.stderr.includes('raw-secret-value'), false)
+})
+
+test('Codex limits exits and closes stdout even when app-server leaves a child process running', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-codex-tree-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pidFile = path.join(root, 'grandchild.pid')
+  const sleeper = path.join(root, 'sleeper.mjs')
+  fs.writeFileSync(
+    sleeper,
+    `import fs from 'node:fs'\nfs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))\nsetInterval(() => {}, 60_000)\n`,
+  )
+  const fakeCodex = makeFakeCodex(
+    root,
+    `
+import { spawn } from 'node:child_process'
+import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+let child
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id === 1) {
+    child = spawn(process.execPath, [${JSON.stringify(sleeper)}], { stdio: 'inherit', windowsHide: true })
+    process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n')
+  } else if (msg.id === 2) {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({
+        id: 2,
+        result: { rateLimits: { primary: { usedPercent: 18, windowDurationMins: 300, resetsAt: 1_800_000_000 }, planType: 'plus' } },
+      }) + '\\n')
+    }, 150)
+  }
+})
+`,
+  )
+  const started = Date.now()
+  const proc = spawn(process.execPath, [codexLimitsScript, path.join(root, 'empty-sessions'), fakeCodex], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+    shell: false,
+  })
+  proc.stdin.end()
+  let stdout = ''
+  let stderr = ''
+  proc.stdout.setEncoding('utf8')
+  proc.stderr.setEncoding('utf8')
+  proc.stdout.on('data', chunk => { stdout += chunk })
+  proc.stderr.on('data', chunk => { stderr += chunk })
+  const [code] = await Promise.race([
+    once(proc, 'close'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('codex-limits.mjs did not close stdout within 5s')), 5_000)),
+  ])
+  const elapsed = Date.now() - started
+  assert.equal(code, 0, stderr)
+  assert.ok(elapsed < 5_000, `expected prompt exit, took ${elapsed}ms`)
+  const out = JSON.parse(stdout)
+  assert.equal(out.source, 'live')
+  assert.equal(out.limits.windows[0].percent, 18)
+  if (fs.existsSync(pidFile)) {
+    const grandchildPid = Number(fs.readFileSync(pidFile, 'utf8').trim())
+    if (grandchildPid > 0) {
+      let alive = true
+      try {
+        process.kill(grandchildPid, 0)
+      } catch {
+        alive = false
+      }
+      if (alive) {
+        try { process.kill(grandchildPid, 'SIGKILL') } catch {}
+      }
+      assert.equal(alive, false, `grandchild process ${grandchildPid} was left running`)
+    }
+  }
+})
+
+test('Codex limits runs when invoked through a directory junction or symlink', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-codex-link-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const fakeCodex = makeFakeCodex(
+    root,
+    `
+import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id === 1) process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n')
+  else if (msg.id === 2) process.stdout.write(JSON.stringify({
+    id: 2,
+    result: { rateLimits: { primary: { usedPercent: 7, windowDurationMins: 300, resetsAt: 1_800_000_000 }, planType: 'plus' } },
+  }) + '\\n')
+})
+`,
+  )
+  const linkDir = path.join(root, 'linked-plugin')
+  const repoRoot = path.resolve(path.dirname(codexLimitsScript), '..')
+  fs.symlinkSync(repoRoot, linkDir, process.platform === 'win32' ? 'junction' : 'dir')
+  const result = spawnSync(process.execPath, [path.join(linkDir, 'bin', 'codex-limits.mjs'), path.join(root, 'empty'), fakeCodex], {
+    encoding: 'utf8',
+    timeout: 10_000,
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  const out = JSON.parse(result.stdout)
+  assert.equal(out.source, 'live')
+  assert.equal(out.limits.windows[0].percent, 7)
 })
 
 test('watcher matches MSYS paths, trailing slashes, subfolders and scratchpads, and ignores sibling folders', async t => {

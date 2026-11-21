@@ -4,21 +4,24 @@
 //   node codex-limits.mjs <codexSessionsDir> [codexCommand]
 //
 // Starts `codex app-server` without a shell (via launch.mjs), initializes it,
-// calls `account/rateLimits/read`, and kills it as soon as it answers. On any
-// failure (missing CLI, not signed in, error, old CLI, timeout), falls back to
-// the newest rollout file that has a `rate_limits` reading. Prints
-// {"ts": <epoch ms>, "limits": {...}, "source": "live"|"rollout"} on one line,
-// or {"error": "..."}. Never logs raw responses.
-import { spawn } from 'node:child_process'
+// calls `account/rateLimits/read`, and kills its whole process tree as soon as
+// it answers. On any failure (missing CLI, not signed in, error, old CLI,
+// timeout), falls back to the newest rollout file that has a `rate_limits`
+// reading, recording a short safe reason in `liveError`. Prints
+// {"ts": <epoch ms>, "limits": {...}, "source": "live"|"rollout", "liveError"?: "..."}
+// on one line, or {"error": "..."}. Never logs raw responses or tokens.
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { launchArgv } from './launch.mjs'
 
+const isWindows = process.platform === 'win32'
 const TAIL_BYTES = 262_144
 const MAX_FILES = 8
 const LIVE_TIMEOUT_MS = 20_000
+const MAX_REASON = 80
 
 const pluginVersion = () => {
   try {
@@ -27,6 +30,89 @@ const pluginVersion = () => {
   } catch {
     return '0.0.0'
   }
+}
+
+const clipReason = text => {
+  const clean = String(text ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!clean) return 'could not read live'
+  return clean.length <= MAX_REASON ? clean : `${clean.slice(0, MAX_REASON - 1).trimEnd()}…`
+}
+
+/** Maps a JSON-RPC error from `codex app-server` to a short fixed category so raw messages/tokens never leak. */
+const rpcReason = (rpcError, fallback) => {
+  const code = typeof rpcError?.code === 'number' ? rpcError.code : undefined
+  const msg = typeof rpcError?.message === 'string' ? rpcError.message : ''
+  if (code === -32601 || /method not found|unknown method|unimplemented/i.test(msg)) return 'Codex CLI too old'
+  if (/not logged in|not signed in|unauthenticated|unauthorized|login required|sign in|missing auth|no auth|\bauth\b/i.test(msg)) {
+    return 'not logged in'
+  }
+  if (/rate.?limit|too many requests|\b429\b/i.test(msg)) return 'rate limited'
+  if (/timed? ?out/i.test(msg)) return 'timed out'
+  if (/network|econn|enotfound|dns|fetch|socket|offline/i.test(msg)) return 'network error'
+  return fallback
+}
+
+/** Short, safe reason for a live read failure (max 80 chars, no raw responses or tokens). */
+export const liveErrorReason = err => {
+  if (!err) return 'could not read live'
+  if (typeof err === 'object' && err.safeReason) return clipReason(err.safeReason)
+  const code = typeof err === 'object' ? err.code : undefined
+  if (code === 'ENOENT') return 'no codex CLI found'
+  if (code === 'EACCES' || code === 'EPERM') return 'codex not executable'
+  if (typeof code === 'string' && code) return clipReason(`could not start codex (${code})`)
+  const msg = String(err?.message ?? err)
+  if (/cannot start safely without a shell/i.test(msg)) return 'unsupported Codex script'
+  if (/no answer within/i.test(msg) || /timed? ?out/i.test(msg)) return 'timed out'
+  if (/exited \S+ before answering/i.test(msg)) {
+    const m = /exited (\S+) before answering/.exec(msg)
+    return clipReason(`codex exited ${m ? m[1] : '?'}`)
+  }
+  return 'could not read live'
+}
+
+const safeError = reason => {
+  const err = new Error(reason)
+  err.safeReason = reason
+  return err
+}
+
+const closeStdio = child => {
+  for (const stream of [child?.stdin, child?.stdout, child?.stderr]) {
+    try {
+      stream?.destroy()
+    } catch {}
+  }
+}
+
+/** Kills `child` and every descendant it started, without a shell, then closes its stdio pipes. */
+const killTree = child => {
+  const pid = child?.pid
+  if (pid) {
+    if (isWindows) {
+      try {
+        const taskkill = process.env.SystemRoot
+          ? path.join(process.env.SystemRoot, 'System32', 'taskkill.exe')
+          : 'taskkill'
+        spawnSync(taskkill, ['/PID', String(pid), '/T', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+          shell: false,
+          timeout: 3_000,
+        })
+      } catch {}
+    } else {
+      try {
+        process.kill(-pid, 'SIGKILL')
+      } catch {}
+    }
+  }
+  try {
+    child?.kill('SIGKILL')
+  } catch {}
+  closeStdio(child)
 }
 
 /** A token_count's rate_limits as the meters read them: used percent per window, reset time in ms. */
@@ -75,7 +161,7 @@ const liveLimitsFromResult = result => {
   return undefined
 }
 
-/** Asks `codex app-server` for the current rate limits over stdio JSON lines, then kills it. */
+/** Asks `codex app-server` for the current rate limits over stdio JSON lines, then kills its whole tree. */
 export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS, version = pluginVersion(), now = () => Date.now() } = {}) =>
   new Promise((resolve, reject) => {
     let argv
@@ -86,7 +172,12 @@ export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS,
     }
     let child
     try {
-      child = spawn(argv[0], argv.slice(1), { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true, shell: false })
+      child = spawn(argv[0], argv.slice(1), {
+        stdio: ['pipe', 'pipe', 'ignore'],
+        detached: !isWindows,
+        windowsHide: true,
+        shell: false,
+      })
     } catch (err) {
       return reject(err)
     }
@@ -97,15 +188,10 @@ export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS,
       if (settled) return
       settled = true
       clearTimeout(timer)
-      try {
-        child.stdin?.end()
-      } catch {}
-      try {
-        child.kill()
-      } catch {}
+      killTree(child)
       fn(value)
     }
-    const timer = setTimeout(() => finish(reject, new Error(`no answer within ${timeoutMs / 1000}s`)), timeoutMs)
+    const timer = setTimeout(() => finish(reject, safeError('timed out')), timeoutMs)
     timer.unref()
     const send = msg => {
       if (settled) return
@@ -116,8 +202,9 @@ export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS,
       }
     }
     child.stdin.on('error', () => {})
+    child.stdout.on('error', () => {})
     child.on('error', err => finish(reject, err))
-    child.on('close', code => finish(reject, new Error(`codex app-server exited ${code ?? '?'} before answering`)))
+    child.on('close', code => finish(reject, safeError(`codex exited ${code ?? '?'}`)))
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', chunk => {
       if (settled) return
@@ -134,14 +221,14 @@ export const readLiveLimits = (command = 'codex', { timeoutMs = LIVE_TIMEOUT_MS,
           continue
         }
         if (msg.id === 1 && !isInitialized) {
-          if (msg.error) return finish(reject, new Error('initialize failed'))
+          if (msg.error) return finish(reject, safeError(rpcReason(msg.error, 'initialize failed')))
           isInitialized = true
           send({ method: 'initialized' })
           send({ id: 2, method: 'account/rateLimits/read' })
         } else if (msg.id === 2) {
-          if (msg.error) return finish(reject, new Error('rate limits read failed'))
+          if (msg.error) return finish(reject, safeError(rpcReason(msg.error, 'rate limits read failed')))
           const limits = liveLimitsFromResult(msg.result)
-          if (!limits) return finish(reject, new Error('no rate limits in response'))
+          if (!limits) return finish(reject, safeError('no rate limits in response'))
           return finish(resolve, { ts: now(), limits, source: 'live' })
         }
       }
@@ -213,29 +300,43 @@ export const newestLimits = (sessionsDir, { now = Date.now(), days = 7 } = {}) =
   return undefined
 }
 
-/** Tries `codex app-server` live first; on any failure falls back to the newest rollout file. */
+/** Tries `codex app-server` live first; on any failure falls back to the newest rollout file with `liveError`. */
 export const readCodexLimits = async (sessionsDir, { command = 'codex', timeoutMs = LIVE_TIMEOUT_MS, now } = {}) => {
+  let liveError
   if (command) {
     try {
       return await readLiveLimits(command, { timeoutMs, ...(now ? { now: () => now } : {}) })
-    } catch {}
+    } catch (err) {
+      liveError = liveErrorReason(err)
+    }
+  } else {
+    liveError = 'no codex CLI found'
   }
   const found = sessionsDir ? newestLimits(sessionsDir, now ? { now } : undefined) : undefined
-  return found ? { ...found, source: 'rollout' } : undefined
+  return found ? { ...found, source: 'rollout', liveError } : { error: liveError }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+const realPath = p => {
+  const resolved = path.resolve(p)
+  try {
+    return fs.realpathSync(resolved)
+  } catch {
+    return resolved
+  }
+}
+
+/** True when this file was invoked directly, also through a symlink or Windows directory junction. */
+const isMain = () => {
+  if (!process.argv[1]) return false
+  const a = realPath(process.argv[1])
+  const b = realPath(fileURLToPath(import.meta.url))
+  return isWindows ? a.toLowerCase() === b.toLowerCase() : a === b
+}
+
+if (isMain()) {
   const [, , sessionsDir, codexCommand] = process.argv
   const out = obj => process.stdout.write(JSON.stringify(obj) + '\n', () => process.exit(0))
   readCodexLimits(sessionsDir, { command: codexCommand || 'codex' })
-    .then(found =>
-      out(
-        found ?? {
-          error: sessionsDir
-            ? 'Could not read Codex usage limits live, and no Codex session file has a reading yet.'
-            : 'Could not read Codex usage limits.',
-        },
-      ),
-    )
-    .catch(() => out({ error: 'Could not read Codex usage limits.' }))
+    .then(found => out(found ?? { error: 'could not read live' }))
+    .catch(err => out({ error: liveErrorReason(err) }))
 }

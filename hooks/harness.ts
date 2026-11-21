@@ -1371,9 +1371,9 @@ export const readingAge = (at: number | undefined, now: number, isAlways = false
 /** Whether a window's reset time has passed: the reading predates the reset, so it no longer says how much is used. */
 export const isResetPast = (w: LimitWindow, now: number): boolean => w.resetsAt !== undefined && w.resetsAt <= now
 
-/** What a window says about its reset: when it comes, or, once that time has passed, that the reading is out of date. */
+/** What a window says about its reset: when it comes, or, once that time has passed, that it reset since this reading. */
 export const resetNote = (w: LimitWindow, now: number): string | undefined =>
-  w.resetsAt === undefined ? undefined : isResetPast(w, now) ? 'out of date' : `resets in ${fmtSpan(w.resetsAt - now)}`
+  w.resetsAt === undefined ? undefined : isResetPast(w, now) ? 'reset since this reading' : `resets in ${fmtSpan(w.resetsAt - now)}`
 
 /** Each provider's highest percent, for the one-line view of collapsed usage limits; a window past its reset doesn't count. */
 export const limitSummary = (rows: readonly { name: string; windows: readonly LimitWindow[] }[], now: number): { name: string; percent?: number }[] =>
@@ -1456,6 +1456,64 @@ export const shouldTakeCodexLimits = (
   if (currentAt === undefined) return true
   if (incomingAt !== currentAt) return incomingAt > currentAt
   return !(currentSource === 'live' && incomingSource === 'rollout')
+}
+
+const CODEX_ERROR_MAX = 80
+
+/** Short, safe reason for a failed live Codex limits read: max 80 chars, no raw responses or tokens. */
+export const codexLiveError = (raw: string | undefined): string => {
+  const s = (raw ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\bBearer\s+\S+/gi, '[redacted]')
+    .replace(/\b(?:sk|ghp|gho|github_pat|eyJ)[A-Za-z0-9._-]{8,}\b/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!s) return 'could not read live'
+  if (/timed? ?out|timeout/i.test(s)) return 'timed out'
+  if (/enoent|not found|no such file/i.test(s)) return 'no codex CLI found'
+  if (/not logged in|not signed in|unauthenticated|unauthorized/i.test(s)) return 'not logged in'
+  return s.length <= CODEX_ERROR_MAX ? s : `${s.slice(0, CODEX_ERROR_MAX - 1).trimEnd()}…`
+}
+
+export type ParsedCodexLimits = {
+  reading?: {
+    ts: number
+    limits: { windows: { minutes?: number; percent: number; resetsAt?: number }[]; plan?: string }
+    source: CodexLimitSource
+  }
+  liveError?: string
+}
+
+/** Reads `bin/codex-limits.mjs`'s stdout and exit code into a reading and/or a short live failure reason. */
+export const parseCodexLimitsOutput = (stdout: string, exitCode?: number, stderr?: string): ParsedCodexLimits => {
+  try {
+    const j = JSON.parse(stdout) as {
+      ts?: unknown
+      limits?: { windows?: unknown; plan?: string }
+      source?: unknown
+      liveError?: unknown
+      error?: unknown
+    }
+    if (typeof j.ts === 'number' && Array.isArray(j.limits?.windows)) {
+      const source: CodexLimitSource = j.source === 'rollout' ? 'rollout' : 'live'
+      return {
+        reading: {
+          ts: j.ts,
+          limits: j.limits as { windows: { minutes?: number; percent: number; resetsAt?: number }[]; plan?: string },
+          source,
+        },
+        liveError: source === 'rollout' ? codexLiveError(str(j.liveError) ?? 'could not read live') : undefined,
+      }
+    }
+    if (typeof j.error === 'string' && j.error.trim()) {
+      return { liveError: codexLiveError(j.error) }
+    }
+  } catch {}
+  if (typeof exitCode === 'number' && exitCode !== 0) {
+    if (stderr && /enoent|not found/i.test(stderr)) return { liveError: 'no codex CLI found' }
+    return { liveError: `reader exited ${exitCode}` }
+  }
+  return { liveError: 'no answer from Codex' }
 }
 
 // ---------- handing a finished run's report over, once ----------

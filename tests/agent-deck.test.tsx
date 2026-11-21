@@ -24,7 +24,7 @@ import {
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
-import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, cardModelName, effortLabel, orderWindows, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
+import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, cardModelName, codexLiveError, effortLabel, orderWindows, parseCodexLimitsOutput, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
 import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -2015,7 +2015,7 @@ test('a card shows its model by the name the model pickers use', () => {
   expect(cardModelName({ provider: 'codex', model: 'gpt-6.1-sol' }, [agy])).toBe('gpt-6.1-sol')
 })
 
-test('a usage reading says how old it is, and a window past its reset is out of date', () => {
+test('a usage reading says how old it is, a window past its reset says reset since this reading, and live errors stay short and safe', () => {
   const now = 10 * 3_600_000
   expect(readingAge(undefined, now)).toBeUndefined()
   expect(readingAge(now - 5 * 60_000, now)).toBeUndefined()
@@ -2024,13 +2024,31 @@ test('a usage reading says how old it is, and a window past its reset is out of 
   const past = { label: '5h', percent: 14, resetsAt: now - 60_000 }
   const live = { label: '7d', percent: 80, resetsAt: now + 2 * 3_600_000 }
   expect(isResetPast(past, now)).toBe(true)
-  expect(resetNote(past, now)).toBe('out of date')
+  expect(resetNote(past, now)).toBe('reset since this reading')
   expect(resetNote(live, now)).toBe('resets in 2h')
   expect(resetNote({ label: 'x', percent: 1 }, now)).toBeUndefined()
   expect(limitSummary([{ name: 'Codex', windows: [past, live] }, { name: 'Copilot', windows: [past] }], now)).toEqual([
     { name: 'Codex', percent: 80 },
     { name: 'Copilot', percent: undefined },
   ])
+
+  expect(codexLiveError('request timed out after 20s')).toBe('timed out')
+  expect(codexLiveError('ENOENT codex')).toBe('no codex CLI found')
+  expect(codexLiveError('not logged in Bearer secret-token-12345')).toBe('not logged in')
+  const longErr = codexLiveError(`bad gateway Bearer abcdefghij123456 sk-secretkey1234567890 ${'x'.repeat(120)}`)
+  expect(longErr.length).toBeLessThanOrEqual(80)
+  expect(longErr.includes('abcdefghij')).toBe(false)
+  expect(longErr.includes('sk-secretkey')).toBe(false)
+
+  expect(parseCodexLimitsOutput('', 0, '')).toEqual({ liveError: 'no answer from Codex' })
+  expect(parseCodexLimitsOutput(JSON.stringify({ error: 'not logged in' }), 0, '')).toEqual({ liveError: 'not logged in' })
+  const parsedFallback = parseCodexLimitsOutput(
+    JSON.stringify({ ts: 1000, source: 'rollout', liveError: 'timed out', limits: { windows: [{ minutes: 300, percent: 10 }] } }),
+    0,
+    '',
+  )
+  expect(parsedFallback.reading?.source).toBe('rollout')
+  expect(parsedFallback.liveError).toBe('timed out')
 })
 
 test('usage meters put Claude first, then the rest alphabetically, and newer Codex readings win', () => {
@@ -2114,7 +2132,7 @@ test('usage limits fold into one line, switch views, and Refresh reads them live
     if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) {
       asked.push(argv.slice(2))
       if (!liveReady) {
-        return { value: { exitCode: 0, stdout: JSON.stringify({ ts: oldTs, limits: old, source: 'rollout' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ts: oldTs, limits: old, source: 'rollout', liveError: 'not logged in' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
       await clock.sleep(1000)
       const fresh = { windows: [{ minutes: 300, percent: 30, resetsAt: now + 4 * 3_600_000 }, { minutes: 10080, percent: 81, resetsAt: now + 86_400_000 }], plan: 'plus' }
@@ -2125,15 +2143,27 @@ test('usage limits fold into one line, switch views, and Refresh reads them live
   await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
   await clock.settle()
   const ui = await mountPane($)
-  // Fallback case: shows source ("from last session"), age, out of date, and plain-words fallback hint.
+  // Fallback case: shows age without "from last session", past window shows 0% dimmed with "reset since this reading", and one failure line with Retry.
   expect(asked.length).toBe(1)
   expect(asked[0]).toEqual(['C:\\Users\\me/.codex/sessions', 'codex'])
-  expect(await ui.find({ text: /Codex · plus · from last session · updated 3h ago/ })).toBeDefined()
-  expect(await ui.find({ text: 'out of date' })).toBeDefined()
+  expect(await ui.find({ text: /Codex · plus · updated 3h ago/ })).toBeDefined()
+  expect(await ui.find({ text: /from last session/ })).toBeUndefined()
+  const resetEl = await ui.find({ type: 'Text', text: 'reset since this reading' })
+  expect(resetEl).toBeDefined()
+  expect((resetEl as { props?: { dimColor?: boolean; color?: string } } | undefined)?.props?.dimColor).toBe(true)
+  expect((resetEl as { props?: { color?: string } } | undefined)?.props?.color).toBeUndefined()
+  const zeroEl = await ui.find({ type: 'Text', text: /^0%$/ })
+  expect(zeroEl).toBeDefined()
+  expect((zeroEl as { props?: { dimColor?: boolean; color?: string } } | undefined)?.props?.dimColor).toBe(true)
+  expect((zeroEl as { props?: { color?: string } } | undefined)?.props?.color).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^14%$/ })).toBeUndefined()
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
   expect(await ui.find({ text: /resets in 0m/ })).toBeUndefined()
-  expect(await ui.find({ text: /Could not read Codex's limits live/ })).toBeDefined()
+  expect(await ui.find({ text: /Could not read Codex's limits live/ })).toBeUndefined()
+  expect(await ui.find({ text: 'Live reading failed: not logged in' })).toBeDefined()
+  expect((await ui.find({ key: 'lim-codex-retry' }))?.text).toBe('Retry')
 
-  // Live read via Refresh: replaces the older rollout reading, drops the fallback label and hint.
+  // Live read via Refresh: replaces the older rollout reading, drops the age and failure line.
   liveReady = true
   claudePercent = 55
   await ui.press({ key: 'lim-refresh' } as never)
@@ -2143,10 +2173,12 @@ test('usage limits fold into one line, switch views, and Refresh reads them live
   await ui.redraw()
   expect((await ui.find({ key: 'lim-refresh' }))?.text).toBe('↻ Refresh')
   expect(asked.length).toBe(2)
+  expect(await ui.find({ text: 'reset since this reading' })).toBeUndefined()
   expect(await ui.find({ text: 'out of date' })).toBeUndefined()
   expect(await ui.find({ text: /updated 3h ago/ })).toBeUndefined()
   expect(await ui.find({ text: /from last session/ })).toBeUndefined()
-  expect(await ui.find({ text: /Could not read Codex's limits live/ })).toBeUndefined()
+  expect(await ui.find({ text: /Live reading failed/ })).toBeUndefined()
+  expect(await ui.find({ key: 'lim-codex-retry' })).toBeUndefined()
   expect(await ui.find({ text: 'resets in 4h' })).toBeDefined()
   expect(await ui.find({ text: '55%' })).toBeDefined()
 
@@ -2176,6 +2208,127 @@ test('usage limits fold into one line, switch views, and Refresh reads them live
   await ui.press({ key: 'h-done' } as never)
   await ui.redraw()
   expect(((await ui.find({ key: 'lim-view' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('session')
+  await ui.unmount()
+})
+
+test('a hung first Codex limits read times out and does not block Refresh or Retry, and never waits on codex-find', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  const clock = mock.clock(on, { now })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-stuck-codex' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: { startedAt: now, context: { tokens: 0 }, rateLimits: [] } as never,
+  }))
+  // Both windows of the 16-hour-old rollout reading have passed their reset time.
+  const old = {
+    windows: [
+      { minutes: 300, percent: 14, resetsAt: now - 11 * 3_600_000 },
+      { minutes: 10080, percent: 80, resetsAt: now - 3_600_000 },
+    ],
+    plan: 'plus',
+  }
+  const oldTs = now - 16 * 3_600_000
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout', text: `${JSON.stringify({ t: 'limits', ts: oldTs, limits: old, source: 'rollout' })}\n` } as never
+    return { value: { exitCode: 0 } } as never
+  })
+
+  let codexCalls = 0
+  let mode: 'hang' | 'fail' | 'live' = 'hang'
+  on('process.run', async (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    // Simulate a slow/hung codex-find.mjs: readCodexLimits must NOT block on it.
+    if (argv.some(a => a.endsWith('/bin/codex-find.mjs'))) {
+      return await new Promise(() => {})
+    }
+    if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) {
+      codexCalls++
+      if (mode === 'hang') return await new Promise(() => {})
+      if (mode === 'fail') {
+        return {
+          value: {
+            exitCode: 0,
+            stdout: JSON.stringify({ ts: oldTs, limits: old, source: 'rollout', liveError: 'not logged in' }),
+            stderr: '',
+            isStdoutTruncated: false,
+            isStderrTruncated: false,
+          },
+        }
+      }
+      const fresh = {
+        windows: [
+          { minutes: 300, percent: 22, resetsAt: now + 4 * 3_600_000 },
+          { minutes: 10080, percent: 35, resetsAt: now + 5 * 86_400_000 },
+        ],
+        plan: 'plus',
+      }
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({ ts: now + 60_000, limits: fresh, source: 'live' }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  // The first codex-limits call started immediately without waiting on codex-find.
+  expect(codexCalls).toBe(1)
+
+  // Advance past the 25s overall deadline so the hung first read settles and clears codexLimitsCheck.
+  await clock.advance(25_000)
+  const ui = await mountPane($)
+  expect(await ui.find({ text: /Codex · plus · updated 16h ago/ })).toBeDefined()
+  expect(await ui.find({ text: 'Live reading failed: timed out' })).toBeDefined()
+  expect((await ui.find({ key: 'lim-codex-retry' }))?.text).toBe('Retry')
+  // Both past-reset windows show 0% dimmed with "reset since this reading", not "out of date".
+  expect((await ui.findAll({ type: 'Text', text: /^reset since this reading$/ })).length).toBe(2)
+  expect((await ui.findAll({ type: 'Text', text: /^0%$/ })).length).toBe(2)
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
+
+  // Folded summary when all windows have reset shows 0% dimmed, not "out of date".
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^Codex 0%$/ })).toBeDefined()
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+
+  // Second Refresh is NOT blocked by the hung first promise; it runs a fresh read and shows the new reason.
+  mode = 'fail'
+  await ui.press({ key: 'lim-refresh' } as never)
+  await clock.settle()
+  await ui.redraw()
+  expect(codexCalls).toBe(2)
+  expect(await ui.find({ text: 'Live reading failed: not logged in' })).toBeDefined()
+
+  // Pressing Retry on the failure line triggers a fresh live read and clears the failure line.
+  mode = 'live'
+  await ui.press({ key: 'lim-codex-retry' } as never)
+  await clock.settle()
+  await ui.redraw()
+  expect(codexCalls).toBe(3)
+  expect(await ui.find({ text: /Live reading failed/ })).toBeUndefined()
+  expect(await ui.find({ key: 'lim-codex-retry' })).toBeUndefined()
+  expect(await ui.find({ text: '22%' })).toBeDefined()
+  expect(await ui.find({ text: '35%' })).toBeDefined()
   await ui.unmount()
 })
 
