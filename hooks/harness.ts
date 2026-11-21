@@ -1224,6 +1224,30 @@ export const resolveRun = (
   return { harness: r.target, model }
 }
 
+// ---------- handing a finished run's report over, once ----------
+
+/**
+ * What a run's delivered.txt says: nothing yet (missing or empty), delivered (a time, as every
+ * version has written it), or claimed by a copy of agent-deck that is handing the report over now.
+ */
+export type DeliveryMark = { state: 'none' } | { state: 'delivered' } | { state: 'claimed'; token: string; at: number }
+
+/** A claim older than this is from a copy that stopped mid-delivery: another copy may take it over. */
+export const DELIVERY_CLAIM_TTL_MS = 10 * 60_000
+
+export const deliveryClaim = (token: string, at: number) => `claim ${token} ${at}`
+
+export const readDeliveryMark = (text: string | undefined): DeliveryMark => {
+  const t = (text ?? '').trim()
+  if (!t) return { state: 'none' }
+  const m = t.match(/^claim (\S+) (\d+)$/)
+  return m ? { state: 'claimed', token: m[1]!, at: Number(m[2]) } : { state: 'delivered' }
+}
+
+/** Whether a copy should leave the report alone: it went out, or another copy is handing it over now. */
+export const isDeliveryTaken = (mark: DeliveryMark, now: number): boolean =>
+  mark.state === 'delivered' || (mark.state === 'claimed' && now - mark.at < DELIVERY_CLAIM_TTL_MS)
+
 export const AGENT_RESULT_SPEC: ToolSpec = {
   name: 'agent_result',
   description: "Read a background agent_run's report (when finished) or its progress so far. Without `id`, lists this session's runs.",

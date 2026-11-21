@@ -8,6 +8,9 @@ import {
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
+  deliveryClaim,
+  isDeliveryTaken,
+  readDeliveryMark,
   loadRouting,
   loadSessionCards,
   mergeSavedCards,
@@ -791,27 +794,50 @@ const footerOf = (run: Run, card: AgentCard | undefined) => {
 // ---------- delivering a finished run's report ----------
 
 const MAX_DELIVERY_TRIES = 5
-const deliveries = new Map<string, { tries: number; nextAt: number; isSending: boolean }>()
+/** How old this copy's claim must be before it hands the report over: a copy that claimed in the same moment has written by then. */
+const CLAIM_SETTLE_MS = 500
+const deliveries = new Map<string, { tries: number; nextAt: number; isSending: boolean; claim?: string }>()
 
 /**
- * Hands a finished run's report to the model as a new turn, once. The run's folder
- * records it only after the prompt entered; a refused or failed submit is tried again
- * later (30 s, 60 s, ...), five times at most. True once nothing is left to do.
+ * Hands a finished run's report to the model as a new turn, once. Another copy of agent-deck
+ * can be watching the same run folder: the copy a reload replaced, still finishing its poll, or
+ * the released plugin beside a dev copy. So one poll claims the folder's delivered.txt, and a
+ * later poll submits the report only if the claim there is still this copy's; a copy that finds
+ * another's claim leaves the report alone. A refused or failed submit lets the claim go and is
+ * tried again later (30 s, 60 s, ...), five times at most. True once nothing is left to do here.
  */
 const deliverReport = async ($: $T, dir: string, what: string, text: string): Promise<boolean> => {
   const d = deliveries.get(dir) ?? { tries: 0, nextAt: 0, isSending: false }
   deliveries.set(dir, d)
   if (d.isSending) return false
-  if (d.tries >= MAX_DELIVERY_TRIES || (await $.fs.exists(`${dir}/delivered.txt`))) return true
+  if (d.tries >= MAX_DELIVERY_TRIES) return true
+  const file = `${dir}/delivered.txt`
   const now = await $.clock.now()
-  if (now < d.nextAt) return false
+  const mark = readDeliveryMark(await readText($, file))
+  if (mark.state === 'delivered') return true
+  if (mark.state !== 'claimed' || mark.token !== d.claim) {
+    d.claim = undefined
+    // Another copy is handing it over now: look again on the next poll.
+    if (isDeliveryTaken(mark, now) || now < d.nextAt) return false
+    const token = `${now.toString(36)}-${Math.floor(Math.random() * 36 ** 6).toString(36)}`
+    d.claim = token
+    await $.fs.write(file, deliveryClaim(token, now)).catch(() => {
+      d.claim = undefined
+    })
+    return false
+  }
+  if (now - mark.at < CLAIM_SETTLE_MS) return false
   d.isSending = true
   try {
     const entered = await $.prompt.submit({ text })
     if (entered?.drop !== undefined) throw new Error(`refused: ${entered.drop}`)
-    await $.fs.write(`${dir}/delivered.txt`, String(now))
+    d.claim = undefined
+    await $.fs.write(file, String(now)).catch(() => undefined)
     return true
   } catch (err) {
+    // Let the claim go, so the next try, here or in another copy, can hand it over.
+    d.claim = undefined
+    await $.fs.write(file, '').catch(() => undefined)
     d.tries++
     d.nextAt = now + 30_000 * d.tries
     if (d.tries < MAX_DELIVERY_TRIES) return false
@@ -1003,9 +1029,9 @@ async function saveHarnesses($: $T, list: Harness[]) {
 
 /** The stored harnesses; on first use, the presets whose CLI is installed. */
 async function loadHarnesses($: $T) {
-  const stored = await $.store.get(KEY_HARNESSES)
-  if (Array.isArray(stored)) {
-    harnessList = (stored as Harness[]).map(h => h.models ? { ...h, models: withFusion(h, h.models) } : h)
+  const stored = storedHarnesses(await $.store.get(KEY_HARNESSES))
+  if (stored) {
+    harnessList = stored
     await update($, harnessesAtom, () => harnessList)
     await registerAgentTools($)
     void detectHarnesses($, harnessList)
@@ -1237,6 +1263,40 @@ let routingSent: string | undefined
 async function loadRoutingSetting($: $T) {
   routing = loadRouting(await $.store.get(KEY_ROUTING))
   await update($, routingAtom, () => routing)
+}
+
+const storedHarnesses = (stored: unknown): Harness[] | undefined =>
+  Array.isArray(stored) ? (stored as Harness[]).map(h => (h.models ? { ...h, models: withFusion(h, h.models) } : h)) : undefined
+
+/**
+ * Reads task routing, the harnesses and the Codex switch again from the store, where every
+ * change is written first. This module's own copies start at the defaults (routing off, no
+ * harnesses) each time the mod loads, and session.start fills them only after a moment; a
+ * tool call or prompt that comes in that moment, as it can right after a reload, would
+ * otherwise be answered from the defaults while the pane, drawn from state that outlives
+ * the reload, shows routing on.
+ */
+async function syncSettings($: $T) {
+  const [r, hs, cx] = await Promise.all([$.store.get(KEY_ROUTING), $.store.get(KEY_HARNESSES), $.store.get(KEY_CODEX)])
+  let isChanged = false
+  const nextRouting = loadRouting(r)
+  if (JSON.stringify(nextRouting) !== JSON.stringify(routing)) {
+    routing = nextRouting
+    isChanged = true
+    await update($, routingAtom, () => nextRouting)
+  }
+  const nextHarnesses = storedHarnesses(hs)
+  if (nextHarnesses && JSON.stringify(nextHarnesses) !== JSON.stringify(harnessList)) {
+    harnessList = nextHarnesses
+    isChanged = true
+    await update($, harnessesAtom, () => nextHarnesses)
+  }
+  if (typeof cx === 'boolean' && cx !== codexOn) {
+    codexOn = cx
+    isChanged = true
+    await update($, codexAtom, () => cx)
+  }
+  if (isChanged) await registerAgentTools($)
 }
 
 async function saveRouting($: $T, next: Routing) {
@@ -1962,6 +2022,7 @@ const registerCache = (on: On) => {
   // The guard: only the first character of the prompt is read, for a slash.
   // A prompt that goes through also carries the task-routing note when the model doesn't have it yet.
   on('prompt.submit', async ($, e, next) => {
+    await syncSettings($).catch(() => undefined)
     const want = currentRoutingNote()
     const extra = routingContext(want, routingSent)
     const pass = async () => {
@@ -2041,9 +2102,10 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     // Registered before next(e) so the tools are listed from the first turn.
+    // Routing first: it is a store read, while the Codex check starts a process.
+    await loadRoutingSetting($).catch(() => undefined)
     await loadCodexEnabled($).catch(() => undefined)
     if (codexOn) await registerCodexTools($)
-    await loadRoutingSetting($).catch(() => undefined)
     routingSent = undefined
     await loadHarnesses($).catch(err => $.ui.toast(`agent-deck: harnesses not loaded: ${String((err as Error)?.message ?? err)}`))
     const started = await next(e)
@@ -2071,6 +2133,13 @@ export const register: Register = on => {
       const toml = await readText($, `${home}/config.toml`)
       if (toml) codexDefaults = parseCodexConfig(toml)
     }
+    // A session started again in this copy of the module polls afresh.
+    runPoller?.cancel()
+    runPoller = undefined
+    harnessPoller?.cancel()
+    harnessPoller = undefined
+    isPollingRuns = false
+    isPollingHarness = false
     const root = await runsRoot($)
     if (root) await loadRuns($, root)
     await loadHarnessRuns($)
@@ -2100,8 +2169,11 @@ export const register: Register = on => {
     strataTimer?.cancel()
     poller?.cancel()
     ticker?.cancel()
+    ticker = undefined
     runPoller?.cancel()
+    runPoller = undefined
     harnessPoller?.cancel()
+    harnessPoller = undefined
     copilotPoller?.cancel()
     copilotPoller = undefined
     agyPoller?.cancel()
@@ -2316,6 +2388,7 @@ export const register: Register = on => {
   // ---- other harnesses ----
 
   on('tool.call', { tool: 'mcp__agent-deck__agent_run' }, async ($, e) => {
+    await syncSettings($).catch(() => undefined)
     const asked = e as unknown as AgentRunInput
     const resolved = resolveRun(asked, routing, harnessList, codexOn)
     if ('error' in resolved) return { deny: `agent-deck: ${resolved.error}` }

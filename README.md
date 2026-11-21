@@ -47,7 +47,7 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 - runs as its own detached process, so it survives a plugin reload or a dropped session;
 - streams into a card in the pane;
-- delivers its final report back to the conversation as a new message when it finishes.
+- delivers its final report back to the conversation as a new message when it finishes, once, even when agent-deck reloads meanwhile or a second copy of it (a dev copy beside the release) watches the same runs.
 
 `agent_result` reads a run on demand.
 
@@ -128,7 +128,7 @@ Set it up under ⚙ Settings → **Task routing**:
   Where there is no list, type the model id.
 - The **On/Off** button next to **Task routing**, or **Routing on/off** next to ⚙ Settings in the main view, switches routing on or off. `/agent-deck routing on`, `off` and `status` do the same from the prompt.
 
-When routing is on, Claude gets a short note with your picks along with your next message. The note says which agent gets each kind of task, and that Claude keeps quick questions and small edits itself. The note goes out again after a compaction or `/clear`, and again whenever you change a pick. When you switch routing off, Claude is told so with your next message. Claude starts a routed harness with `agent_run` and the task's name (`task: "review"`), and agent-deck fills in the harness and model. An explicit harness or model that Claude passes still wins.
+When routing is on, Claude gets a short note with your picks along with your next message. The note says which agent gets each kind of task, and that Claude keeps quick questions and small edits itself. The note goes out again after a compaction or `/clear`, and again whenever you change a pick. When you switch routing off, Claude is told so with your next message. Claude starts a routed harness with `agent_run` and the task's name (`task: "review"`), and agent-deck fills in the harness and model. An explicit harness or model that Claude passes still wins. `agent_run` reads your current picks each time it is called, so it follows them right after agent-deck reloads too.
 
 A task routed to an agent that is switched off or missing shows a warning in the table. If Claude tries it, the run doesn't start, and Claude is told to ask you before using another agent.
 

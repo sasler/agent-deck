@@ -23,6 +23,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
+import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
 import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -763,6 +764,7 @@ test('a reloaded Copilot run rebuilds its final per-model usage from events', as
   const files: Record<string, string> = {
     [`${dir}/meta.json`]: JSON.stringify({ id: 'run-reload', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Reloaded run', cwd: 'project', sessionId: 'reload-session', startedAt: 9000, model: 'auto' }),
     [`${dir}/exit.txt`]: '0',
+    [`${dir}/delivered.txt`]: '9500',
     [`${dir}/stderr.log`]: '',
     [`${dir}/events.jsonl`]: [
       JSON.stringify({ type: 'assistant.message', data: { content: 'Finished.' } }),
@@ -771,6 +773,7 @@ test('a reloaded Copilot run rebuilds its final per-model usage from events', as
     ].join('\n'),
     [`${missingDir}/meta.json`]: JSON.stringify({ id: 'run-missing', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Missing subtotal', cwd: 'project', sessionId: 'reload-session', startedAt: 9000, model: 'auto' }),
     [`${missingDir}/exit.txt`]: '0',
+    [`${missingDir}/delivered.txt`]: '9500',
     [`${missingDir}/stderr.log`]: '',
     [`${missingDir}/events.jsonl`]: [
       JSON.stringify({ type: 'assistant.message', data: { content: 'Finished without billing.' } }),
@@ -1675,6 +1678,7 @@ test('restored harness run cards are not duplicated when loadHarnessRuns reloads
   const files: Record<string, string> = {
     [`${dir}/meta.json`]: JSON.stringify({ id: 'run-1', harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: 'Agy research', cwd: 'project', sessionId: 'sid-mix', startedAt: 11_000, model: 'gemini' }),
     [`${dir}/exit.txt`]: '0',
+    [`${dir}/delivered.txt`]: '17000',
     [`${dir}/stderr.log`]: '',
     [`${dir}/events.jsonl`]: JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'Fresh from disk' } }) + '\n',
   }
@@ -1706,6 +1710,102 @@ test('restored harness run cards are not duplicated when loadHarnessRuns reloads
   await ui.redraw()
   expect(await ui.find({ text: /Fresh from disk/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('delivered.txt reads as nothing yet, delivered, or a claim another copy holds', () => {
+  expect(readDeliveryMark(undefined)).toEqual({ state: 'none' })
+  expect(readDeliveryMark('')).toEqual({ state: 'none' })
+  expect(readDeliveryMark('1763700000000')).toEqual({ state: 'delivered' })
+  expect(readDeliveryMark(deliveryClaim('abc-1', 5000))).toEqual({ state: 'claimed', token: 'abc-1', at: 5000 })
+  expect(isDeliveryTaken({ state: 'delivered' }, 0)).toBe(true)
+  expect(isDeliveryTaken({ state: 'none' }, 0)).toBe(false)
+  expect(isDeliveryTaken({ state: 'claimed', token: 'x', at: 1000 }, 1000 + DELIVERY_CLAIM_TTL_MS - 1)).toBe(true)
+  // A copy that stopped mid-delivery leaves an old claim: another may take it over.
+  expect(isDeliveryTaken({ state: 'claimed', token: 'x', at: 1000 }, 1000 + DELIVERY_CLAIM_TTL_MS)).toBe(false)
+})
+
+test("a finished run's report is claimed before it is handed over, and a run another copy claimed is left alone", async ($, on) => {
+  const start = 50_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-deliver' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>()
+  for (const id of ['run-a', 'run-b', 'run-c']) {
+    files.set(`${root}/${id}/meta.json`, JSON.stringify({ id, harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: `job ${id}`, cwd: 'project', sessionId: 'sid-deliver', startedAt: start - 5000 }))
+    files.set(`${root}/${id}/exit.txt`, '0')
+    files.set(`${root}/${id}/events.jsonl`, JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: `report of ${id}` } }) + '\n')
+  }
+  // run-b: another copy of agent-deck is handing it over right now.
+  files.set(`${root}/run-b/delivered.txt`, deliveryClaim('other-copy', start))
+  // The kit hands paths over absolute: a file is known by the end of its path.
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? ['run-a', 'run-b', 'run-c'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    const path = key(e.path)
+    // run-c: another copy claims it in the same moment as this one.
+    files.set(path, path.endsWith('run-c/delivered.txt') && e.text.startsWith('claim ') ? deliveryClaim('other-copy', start) : e.text)
+    return { value: undefined }
+  })
+  const submits: { text: string; mark?: string }[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push({ text: e.text, mark: files.get(`${root}/run-a/delivered.txt`) })
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 10; i++) await clock.advance(500)
+
+
+  expect(submits.map(s => s.text.match(/run (run-\w)/)?.[1])).toEqual(['run-a'])
+  // The claim was on disk while the report went in, so another copy would have left it alone.
+  expect(submits[0]?.mark).toMatch(/^claim \S+ \d+$/)
+  expect(readDeliveryMark(files.get(`${root}/run-a/delivered.txt`))).toEqual({ state: 'delivered' })
+
+  // The other copies finish handing theirs over; nothing goes out a second time.
+  files.set(`${root}/run-b/delivered.txt`, String(start + 1000))
+  files.set(`${root}/run-c/delivered.txt`, String(start + 1000))
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+  expect(submits.length).toBe(1)
+})
+
+test('agent_run with a task reads the stored routing, also before session.start has loaded it', async ($, on) => {
+  mock.clock(on, { now: 70_000 })
+  mock.store(on, { harnesses: [routedCopilot()], 'codex-enabled': false, routing: { isOn: true, routes: [{ task: 'review', target: 'copilot', model: 'claude-opus-5-5' }] } })
+  on('session.id', () => ({ value: 'sid-reload' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.exists', () => ({ value: false }))
+  const started: string[][] = []
+  on('process.run', (_$, e) => {
+    started.push([...((e as { argv?: string[] }).argv ?? [])])
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  // No session.start: a reloaded copy of the mod can get the call before it has read its settings.
+  const r = JSON.stringify(await $.tool.call({ tool: 'mcp__agent-deck__agent_run', tool_use_id: 'route-1', task: 'review', prompt: 'review the branch' } as never))
+  expect(r).not.toMatch(/routing is off/)
+  expect(r).toMatch(/Copilot run \S+ started in the background \(model claude-opus-5-5\)/)
+  expect(started.some(argv => argv.some(a => a.endsWith('/bin/run.mjs')))).toBe(true)
 })
 
 test('the Codex watcher starts with the session project root, not the shell cwd', async ($, on) => {
