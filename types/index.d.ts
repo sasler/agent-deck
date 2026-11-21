@@ -32,8 +32,8 @@ export type Harness = {
   color: string
   command: string
   /**
-   * The arguments, shell-like: quotes group words. {prompt}, {model}, {session} and {cwd}
-   * are filled in; a word whose placeholder is empty is left out with the flag before it.
+   * The arguments, shell-like: quotes group words. {prompt}, {model}, {session}, {cwd} and
+   * {effort} are filled in; a word whose placeholder is empty is left out with the flag before it.
    */
   args: string
   model?: string
@@ -53,17 +53,21 @@ export type Harness = {
 
 /**
  * Who does one kind of task: a harness id, `codex` (the built-in codex tool) or `claude`
- * (a Claude subagent). An empty target means no preference.
+ * (a Claude subagent). An empty target means no preference. `effort` is a reasoning effort
+ * the target takes: a harness CLI's flag, the codex tool's effort, or the Agent tool's.
  */
-export type TaskRoute = { task: string; target: string; model?: string }
+export type TaskRoute = { task: string; target: string; model?: string; effort?: string }
 
 /** Task routing: the table, and whether Claude is told to follow it. */
 export type Routing = { isOn: boolean; routes: TaskRoute[] }
 
+/** The settings pane's sections, one tab each. */
+export type SettingsSection = 'harnesses' | 'routing' | 'meters'
+
+/** What settings show: nothing (the deck), a section's list, Codex's settings, or the form that adds or edits a harness. */
 export type HarnessView =
   | { mode: 'cards' }
   | { mode: 'list' }
-  /** The built-in Codex: built in, or a custom harness. */
   | { mode: 'codex' }
   | {
       mode: 'edit'
@@ -135,6 +139,8 @@ export type AgentCard = {
   binary?: string
   /** Epoch ms of the last rollout line a Codex card got. */
   lastEventAt?: number
+  /** Byte offset in the Codex rollout file already processed, so reopening does not duplicate output. */
+  rolloutOffset?: number
   error?: string
 }
 
@@ -160,17 +166,31 @@ export type LimitWindow = {
   percent: number
   /** Epoch milliseconds. */
   resetsAt?: number
+  /** A stable model-group key where a provider has groups: Antigravity's gemini, argon or other, from agy's bucket ids. */
+  group?: string
+  /** The window's length as a stable key: 5h, 7d, or the provider's own. */
+  span?: string
 }
+
+export type CodexLimitSource = 'live' | 'rollout'
 
 export type Limits = {
   codex: LimitWindow[]
   claude: LimitWindow[]
   codexPlan?: string
+  /** Where Codex's reading came from: live from `codex app-server`, or a fallback session file. */
+  codexSource?: CodexLimitSource
+  /** Why the last live Codex limits read failed; absent once a live read succeeds. */
+  codexError?: string
   /** Copilot's monthly AI credits, read with `gh api copilot_internal/user`. */
   copilot?: LimitWindow[]
   copilotPlan?: string
   /** Antigravity's weekly and 5-hour limits, per model group, from agy's own language server. */
   antigravity?: LimitWindow[]
+  /** When each provider's reading was taken, epoch ms; a rollout fallback uses the time of the rollout line. */
+  readAt?: Partial<Record<MeterProvider, number>>
+  /** Refresh was pressed and the readings are being taken again. */
+  isRefreshing?: boolean
 }
 
 export type MeterProvider = 'claude' | 'codex' | 'copilot' | 'antigravity'
@@ -180,7 +200,13 @@ export type MeterChoice = {
   /** all: every provider with a reading; session: those used in this session; selected: the list below. */
   mode: 'all' | 'session' | 'selected'
   selected: MeterProvider[]
+  /** The usage limits are folded into one line. */
+  isCollapsed?: boolean
+  /** Which Antigravity windows show: Gemini's (basic, the default), Gemini's and Argon's, or all. */
+  agyView?: AgyView
 }
+
+export type AgyView = 'basic' | 'gemini' | 'all'
 
 export type CachePing = {
   at: number
@@ -232,10 +258,22 @@ declare module 'claude-code' {
       agents: AgentCard[]
       limits: Limits
       expanded: string[]
+      /** Cards whose output shows in full, not just its last lines. */
+      fullOutput: string[]
       tick: number
       cache: CacheState
       harnesses: Harness[]
       harnessView: HarnessView
+      /** The settings tab that shows. */
+      settingsSection: SettingsSection
+      /** Settings draw in the main pane, because a second pane could not open. */
+      settingsInline: boolean
+      /** What is typed in Task routing's Add a task field. */
+      taskDraft: string
+      /** Task names whose routing Model field is typing a custom id via Other…. */
+      routeTyping: string[]
+      /** Model picker group path and search text, keyed `h` for the edit view and `r-<task>` for routing cards. */
+      modelPicker: Record<string, { group?: string[]; filter?: string }>
       /** Harness id → whether its command was found on PATH. */
       found: Record<string, boolean>
       /** Whether the built-in Codex (codex tools, live view, usage meters) is on. */
@@ -245,6 +283,8 @@ declare module 'claude-code' {
       meters: MeterChoice
       /** Task routing: who does each kind of task, and whether Claude is told. */
       routing: Routing
+      /** Run keys whose completion reports were already accepted in this session, for receiver-side dedup across reloads. */
+      deliveredRuns: string[]
     }
   }
 }

@@ -1,16 +1,32 @@
 // agent-deck watcher: tails Codex rollout files and agent-deck run folders,
 // printing one compact JSON event per line for the hooks module to read.
 //
-//   node watch.mjs <codexSessionsDir> <runsDir> <projectCwd> <sinceMs>
+//   node watch.mjs <codexSessionsDir> <runsDir> <projectCwd> <sinceMs> [offsetsJson]
 //
 // Rollouts whose cwd is inside the project (or inside a Claude scratchpad for
-// this project) are tailed from the start; others only from their last 256 KB,
-// and only their rate limits are reported.
+// this project) are tailed from the start (or a saved byte offset); others only
+// from their last 256 KB, and only their rate limits are reported.
 import fs from 'node:fs'
 import path from 'node:path'
 
-const [, , sessionsDir, runsDir, projectCwd, sinceArg] = process.argv
+import { limitsOf, newestLimits } from './codex-limits.mjs'
+
+const [, , sessionsDir, runsDir, projectCwd, sinceArg, offsetsArg] = process.argv
 const since = Number(sinceArg) || Date.now() - 30 * 60_000
+const initialOffsets = (() => {
+  if (!offsetsArg) return {}
+  try {
+    const o = JSON.parse(offsetsArg)
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return {}
+    const clean = {}
+    for (const [k, v] of Object.entries(o)) {
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) clean[k] = Math.floor(v)
+    }
+    return clean
+  } catch {
+    return {}
+  }
+})()
 const TICK_MS = 1000
 const MAX_CHUNK = 8 * 1024 * 1024
 
@@ -18,10 +34,11 @@ const norm = p =>
   String(p ?? '')
     .replace(/^file:\/\/\/?/i, '')
     .replace(/\\/g, '/')
+    .replace(/^\/([a-zA-Z])(?=\/|$)/, '$1:')
     .replace(/\/+$/, '')
     .toLowerCase()
 const project = norm(projectCwd)
-const slug = String(projectCwd ?? '').replace(/[^A-Za-z0-9]/g, '-').toLowerCase()
+const slug = project.replace(/[^a-z0-9]/g, '-')
 const isOurs = cwd => {
   const c = norm(cwd)
   return (project && (c === project || c.startsWith(project + '/'))) || (slug && c.includes(`/claude/${slug}/`))
@@ -31,7 +48,7 @@ const emit = obj => process.stdout.write(JSON.stringify(obj) + '\n')
 const base = p => String(p ?? '').replace(/^file:\/\/\/?/i, '').split(/[\\/]/).pop()
 const clip = (s, n = 4000) => (s.length > n ? s.slice(0, n) + '…' : s)
 
-/** @type {Map<string, {offset: number, matched: boolean, thread: string, partial: string, skipFirst: boolean}>} */
+/** @type {Map<string, {offset: number, matched: boolean, thread: string, partial: Buffer, skipFirst: boolean}>} */
 const files = new Map()
 const runs = new Map() // run id -> thread id once known
 
@@ -61,12 +78,12 @@ const readHead = (file, bytes = 65536) => {
   }
 }
 
-const readRange = (file, start, length) => {
+const readRangeBuf = (file, start, length) => {
   const fd = fs.openSync(file, 'r')
   try {
     const buf = Buffer.alloc(length)
     const n = fs.readSync(fd, buf, 0, length, start)
-    return buf.subarray(0, n).toString('utf8')
+    return buf.subarray(0, n)
   } finally {
     fs.closeSync(fd)
   }
@@ -85,7 +102,7 @@ const commandLabel = item => {
   return '$ ' + cmd.replace(/\s+/g, ' ').trim()
 }
 
-const itemEvent = (f, ts, item, done) => {
+const itemEvent = (f, ts, item, done, off) => {
   const id = item.id
   const status = !done
     ? 'running'
@@ -96,34 +113,34 @@ const itemEvent = (f, ts, item, done) => {
     case 'AgentMessage': {
       if (!done) return
       const text = (item.content ?? []).map(c => c?.text ?? '').join('')
-      if (text.trim()) emit({ f, ts, t: 'msg', text: clip(text), phase: item.phase })
+      if (text.trim()) emit({ f, ts, off, t: 'msg', text: clip(text), phase: item.phase })
       return
     }
     case 'Reasoning': {
       if (!done) return
       const text = (item.summary_text ?? []).join('\n')
-      if (text.trim()) emit({ f, ts, t: 'reason', text: clip(text, 1500) })
+      if (text.trim()) emit({ f, ts, off, t: 'reason', text: clip(text, 1500) })
       return
     }
     case 'UserMessage': {
       const text = (item.content ?? []).map(c => c?.text ?? '').join('')
-      if (text.trim()) emit({ f, ts, t: 'prompt', text: clip(text, 300) })
+      if (text.trim()) emit({ f, ts, off, t: 'prompt', text: clip(text, 300) })
       return
     }
     case 'CommandExecution':
-      return emit({ f, ts, t: 'act', id, label: commandLabel(item), status })
+      return emit({ f, ts, off, t: 'act', id, label: commandLabel(item), status })
     case 'FileChange': {
       const changes = item.changes && typeof item.changes === 'object' ? Object.keys(item.changes) : []
-      return emit({ f, ts, t: 'act', id, label: 'edit ' + (changes.map(base).join(', ') || 'files'), status })
+      return emit({ f, ts, off, t: 'act', id, label: 'edit ' + (changes.map(base).join(', ') || 'files'), status })
     }
     case 'Extension':
-      return emit({ f, ts, t: 'act', id, label: item.kind === 'web.search' ? `search ${item.query ?? ''}` : String(item.kind ?? 'extension'), status })
+      return emit({ f, ts, off, t: 'act', id, label: item.kind === 'web.search' ? `search ${item.query ?? ''}` : String(item.kind ?? 'extension'), status })
     case 'ImageView':
-      return emit({ f, ts, t: 'act', id, label: 'view ' + base(item.path), status })
+      return emit({ f, ts, off, t: 'act', id, label: 'view ' + base(item.path), status })
     case 'McpToolCall':
-      return emit({ f, ts, t: 'act', id, label: `${item.server ?? 'mcp'}.${item.tool ?? ''}`, status })
+      return emit({ f, ts, off, t: 'act', id, label: `${item.server ?? 'mcp'}.${item.tool ?? ''}`, status })
     case 'ContextCompaction':
-      return emit({ f, ts, t: 'act', id, label: 'compact context', status })
+      return emit({ f, ts, off, t: 'act', id, label: 'compact context', status })
     default:
       return
   }
@@ -146,18 +163,8 @@ const callLabel = p => {
   return `${ns ? ns + '.' : ''}${p.name ?? 'tool'}${what ? ' ' + clip(String(what).replace(/\s+/g, ' '), 90) : ''}`
 }
 
-const limitsOf = rl => {
-  if (!rl) return undefined
-  const ws = []
-  for (const w of [rl.primary, rl.secondary]) {
-    if (w && typeof w.used_percent === 'number') {
-      ws.push({ minutes: w.window_minutes, percent: w.used_percent, resetsAt: typeof w.resets_at === 'number' ? w.resets_at * 1000 : undefined })
-    }
-  }
-  return { windows: ws, plan: rl.plan_type ?? undefined }
-}
 
-const handleLine = (state, line) => {
+const handleLine = (state, line, off) => {
   if (!line.includes('"type"')) return
   let o
   try {
@@ -179,6 +186,7 @@ const handleLine = (state, line) => {
     emit({
       f,
       ts,
+      off,
       t: 'tok',
       tokens: u
         ? {
@@ -200,23 +208,23 @@ const handleLine = (state, line) => {
     // a `wait` on a cell), so show it while it runs; its *_output line marks it done.
     if (p.type === 'custom_tool_call' || p.type === 'function_call') {
       const label = callLabel(p)
-      if (label && p.call_id) emit({ f, ts, t: 'act', id: p.call_id, label, status: 'running' })
+      if (label && p.call_id) emit({ f, ts, off, t: 'act', id: p.call_id, label, status: 'running' })
     } else if ((p.type === 'custom_tool_call_output' || p.type === 'function_call_output') && p.call_id) {
-      emit({ f, ts, t: 'act', id: p.call_id, status: 'done' })
+      emit({ f, ts, off, t: 'act', id: p.call_id, status: 'done' })
     } else {
-      emit({ f, ts, t: 'beat' })
+      emit({ f, ts, off, t: 'beat' })
     }
     return
   }
   if (o.type === 'turn_context') {
-    emit({ f, ts, t: 'ctx', model: p.model, effort: p.effort ?? p.reasoning_effort })
+    emit({ f, ts, off, t: 'ctx', model: p.model, effort: p.effort ?? p.reasoning_effort })
   } else if (o.type === 'event_msg') {
-    if (p.type === 'task_started') emit({ f, ts, t: 'task', state: 'running' })
-    else if (p.type === 'task_complete') emit({ f, ts, t: 'task', state: 'done' })
-    else if (p.type === 'turn_aborted') emit({ f, ts, t: 'task', state: 'aborted' })
-    else if (p.type === 'error') emit({ f, ts, t: 'err', text: clip(String(p.message ?? 'error'), 500) })
-    else if (p.type === 'item_started' && p.item) itemEvent(f, ts, p.item, false)
-    else if (p.type === 'item_completed' && p.item) itemEvent(f, ts, p.item, true)
+    if (p.type === 'task_started') emit({ f, ts, off, t: 'task', state: 'running' })
+    else if (p.type === 'task_complete') emit({ f, ts, off, t: 'task', state: 'done' })
+    else if (p.type === 'turn_aborted') emit({ f, ts, off, t: 'task', state: 'aborted' })
+    else if (p.type === 'error') emit({ f, ts, off, t: 'err', text: clip(String(p.message ?? 'error'), 500) })
+    else if (p.type === 'item_started' && p.item) itemEvent(f, ts, p.item, false, off)
+    else if (p.type === 'item_completed' && p.item) itemEvent(f, ts, p.item, true, off)
   }
 }
 
@@ -232,25 +240,36 @@ const tailFile = (file, stat) => {
     if (meta?.type !== 'session_meta') return
     const thread = meta.payload?.id ?? path.basename(file)
     const matched = isOurs(meta.payload?.cwd)
-    const offset = matched ? 0 : Math.max(0, stat.size - 262_144)
-    state = { offset, matched, thread, partial: '', skipFirst: offset > 0 }
+    const savedOffset = initialOffsets[thread]
+    const resumeAt = matched && typeof savedOffset === 'number' && savedOffset > 0 && savedOffset <= stat.size ? savedOffset : 0
+    const offset = matched ? resumeAt : Math.max(0, stat.size - 262_144)
+    state = { offset, matched, thread, partial: Buffer.alloc(0), skipFirst: !matched && offset > 0 }
     files.set(file, state)
-    if (matched) {
+    if (matched && resumeAt === 0) {
       emit({ f: thread, ts: Date.parse(meta.payload?.timestamp ?? meta.timestamp) || stat.birthtimeMs, t: 'meta', cwd: meta.payload?.cwd, file })
     }
   }
   // Catch up in chunks, at most 8 per tick so one huge file can't stall the rest.
   for (let i = 0; i < 8 && stat.size > state.offset; i++) {
     const length = Math.min(MAX_CHUNK, stat.size - state.offset)
-    const text = state.partial + readRange(file, state.offset, length)
-    state.offset += length
-    const lines = text.split('\n')
-    state.partial = lines.pop() ?? ''
-    if (state.skipFirst) {
-      lines.shift()
-      state.skipFirst = false
+    const chunk = readRangeBuf(file, state.offset, length)
+    const buf = state.partial.length ? Buffer.concat([state.partial, chunk]) : chunk
+    const bufStart = state.offset - state.partial.length
+    state.offset += chunk.length
+    let start = 0
+    while (true) {
+      const nl = buf.indexOf(0x0a, start)
+      if (nl === -1) break
+      const lineEndOffset = bufStart + nl + 1
+      if (state.skipFirst) {
+        state.skipFirst = false
+      } else {
+        const line = buf.subarray(start, nl).toString('utf8').replace(/\r$/, '')
+        handleLine(state, line, lineEndOffset)
+      }
+      start = nl + 1
     }
-    for (const line of lines) handleLine(state, line)
+    state.partial = start < buf.length ? Buffer.from(buf.subarray(start)) : Buffer.alloc(0)
   }
 }
 
@@ -301,36 +320,10 @@ const tick = () => {
   scanRuns()
 }
 
-// Seed the limit bars from the newest rollout on the machine, whatever its age.
+// Seed the limit bars from the newest reading on the machine, whatever its age; ts is when Codex wrote it.
 const seedLimits = () => {
-  let newest
-  for (const dir of dayDirs()) {
-    let names = []
-    try {
-      names = fs.readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      if (!name.endsWith('.jsonl')) continue
-      const file = path.join(dir, name)
-      try {
-        const stat = fs.statSync(file)
-        if (!newest || stat.mtimeMs > newest.stat.mtimeMs) newest = { file, stat }
-      } catch {}
-    }
-    if (newest) break
-  }
-  if (!newest) return
-  const start = Math.max(0, newest.stat.size - 262_144)
-  const lines = readRange(newest.file, start, newest.stat.size - start).split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i].includes('"rate_limits"')) continue
-    try {
-      const limits = limitsOf(JSON.parse(lines[i]).payload?.rate_limits)
-      if (limits) return emit({ t: 'limits', ts: newest.stat.mtimeMs, limits })
-    } catch {}
-  }
+  const found = newestLimits(sessionsDir)
+  if (found) emit({ t: 'limits', ts: found.ts, limits: found.limits, source: 'rollout' })
 }
 
 emit({ t: 'hello', pid: process.pid })

@@ -37,10 +37,11 @@ const envFile = path.join(dir, 'env.json')
 let extraEnv = {}
 let envError
 try {
-  extraEnv = JSON.parse(fs.readFileSync(envFile, 'utf8'))
-  if (!extraEnv || typeof extraEnv !== 'object' || Array.isArray(extraEnv) || Object.values(extraEnv).some(v => typeof v !== 'string')) {
+  const parsed = JSON.parse(fs.readFileSync(envFile, 'utf8'))
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.values(parsed).some(v => typeof v !== 'string')) {
     throw new Error('invalid environment')
   }
+  extraEnv = parsed
 } catch (e) {
   if (e?.code !== 'ENOENT') envError = 'could not read the temporary environment file; the run was not started.'
 }
@@ -51,8 +52,25 @@ try {
 }
 const out = fs.openSync(path.join(dir, 'events.jsonl'), 'a')
 const err = fs.openSync(path.join(dir, 'stderr.log'), 'a')
+const SECRET_ENV_KEY_RE = /(?:key|token|secret|password|passwd|auth|credential)/i
+const secretValues = [
+  ...new Set(
+    Object.entries(extraEnv)
+      .filter(([k, v]) => SECRET_ENV_KEY_RE.test(k) && typeof v === 'string' && v.trim().length > 0)
+      .map(([, v]) => v),
+  ),
+].sort((a, b) => b.length - a.length)
+const maxSecretLen = secretValues.reduce((m, s) => Math.max(m, s.length), 0)
+const scrub = text => {
+  let s = String(text ?? '')
+  for (const secret of secretValues) {
+    if (s.includes(secret)) s = s.split(secret).join('[redacted]')
+  }
+  return s
+}
+const writeErr = message => fs.writeSync(err, scrub(message))
 const failStart = message => {
-  fs.writeSync(err, `agent-deck: ${message}\n`)
+  writeErr(`agent-deck: ${message}\n`)
   fs.writeFileSync(path.join(dir, 'exit.txt'), '127')
   process.exit(0)
 }
@@ -81,29 +99,49 @@ if (usageFile) {
 }
 // Node reports a missing working folder as ENOENT on the program, which reads as "not installed".
 if (spec.cwd && !fs.statSync(spec.cwd, { throwIfNoEntry: false })?.isDirectory()) {
-  fs.writeSync(err, `agent-deck: the working folder ${spec.cwd} does not exist; ${command} was not started. Create it, or pass another cwd.\n`)
+  writeErr(`agent-deck: the working folder ${spec.cwd} does not exist; ${command} was not started. Create it, or pass another cwd.\n`)
   fs.writeFileSync(path.join(dir, 'exit.txt'), '127')
   process.exit(0)
 }
 let child
+const shouldScrubStderr = secretValues.length > 0
 try {
   const argv = launchArgv(command, args)
   child = spawn(argv[0], argv.slice(1), {
     cwd: spec.cwd || undefined,
-    stdio: [spec.stdin === undefined ? 'ignore' : 'pipe', out, err],
+    stdio: [spec.stdin === undefined ? 'ignore' : 'pipe', out, shouldScrubStderr ? 'pipe' : err],
     env: launchEnv(extraEnv, spec.isolateProvider),
     windowsHide: true,
     shell: false,
   })
 } catch (e) {
-  fs.writeSync(err, `agent-deck: could not start ${command}: ${e?.message ?? e}\n`)
+  writeErr(`agent-deck: could not start ${command}: ${e?.message ?? e}\n`)
   fs.writeFileSync(path.join(dir, 'exit.txt'), '127')
   process.exit(0)
+}
+if (shouldScrubStderr && child.stderr) {
+  let pending = ''
+  const keep = Math.max(0, maxSecretLen - 1)
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', chunk => {
+    pending = scrub(pending + chunk)
+    if (pending.length > keep) {
+      const flushLen = pending.length - keep
+      fs.writeSync(err, pending.slice(0, flushLen))
+      pending = pending.slice(flushLen)
+    }
+  })
+  child.stderr.on('end', () => {
+    if (pending) {
+      fs.writeSync(err, scrub(pending))
+      pending = ''
+    }
+  })
 }
 fs.writeFileSync(path.join(dir, 'pid.txt'), String(child.pid ?? ''))
 if (spec.stdin !== undefined) child.stdin.end(spec.stdin)
 child.on('error', e => {
-  fs.writeSync(err, `agent-deck: could not start ${command}: ${e?.message ?? e}\n`)
+  writeErr(`agent-deck: could not start ${command}: ${e?.message ?? e}\n`)
   fs.writeFileSync(path.join(dir, 'exit.txt'), '127')
   process.exit(0)
 })

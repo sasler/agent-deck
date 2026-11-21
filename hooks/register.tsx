@@ -1,14 +1,52 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, ToolSpec } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderInput, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, AgyView, CacheState, CodexBin, CodexLimitSource, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, SettingsSection, TaskRoute, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
+  AGY_VIEWS,
+  effortLabel,
+  shownWindows,
+  CARD_MAX_BYTES,
+  CARD_STALE_MS,
+  DEAD_RUNNER_REASON,
+  METER_PROVIDERS,
+  cardModelName,
+  cardsKey,
+  deadRunnerFailure,
+  effortProblem,
+  fmtSpan,
+  isResetPast,
+  limitSummary,
+  codexLiveError,
+  parseCodexLimitsOutput,
+  pickerLevels,
+  readingAge,
+  resetNote,
+  routeEffortChoices,
+  routeModelOptionLabel,
+  routeModels,
+  shouldTakeCodexLimits,
+  type PickerLevel,
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
+  DELIVERY_CLAIM_TTL_MS,
+  deliveryClaim,
+  deliveryRunKey,
+  isDeliveryTaken,
+  readDeliveryMark,
+  rememberDeliveredRun,
+  reportRunKey,
   loadRouting,
+  loadSessionCards,
+  loadSingleSessionCards,
+  migrateLegacyCards,
+  parseCardsIndex,
+  parseRunPid,
+  planCardsSave,
   resolveRun,
+  restoreCard,
   routeModelChoices,
   routeProblem,
   routedTasks,
@@ -30,12 +68,14 @@ import {
   harnessCommand,
   fromPreset,
   harnessError,
-  modelLabel,
+  harnessFailure,
   modelQuery,
   parseLine,
   parseModels,
   providerEnv,
   providerTypesFor,
+  redactSecrets,
+  stripAnsi,
   type ModelQuery,
   type CopilotRunOptions,
   pickCodex,
@@ -74,18 +114,33 @@ const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 const agents = atom({ plugin: 'agent-deck', key: 'agents' } as const, [] as AgentCard[])
 const limits = atom({ plugin: 'agent-deck', key: 'limits' } as const, { codex: [], claude: [] } as Limits)
 const expanded = atom({ plugin: 'agent-deck', key: 'expanded' } as const, [] as string[])
+const fullOutputAtom = atom({ plugin: 'agent-deck', key: 'fullOutput' } as const, [] as string[])
 const tick = atom({ plugin: 'agent-deck', key: 'tick' } as const, 0)
 const cacheAtom = atom({ plugin: 'agent-deck', key: 'cache' } as const, freshCache())
 const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, [] as Harness[])
 const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { mode: 'cards' } as HarnessView)
+const settingsSectionAtom = atom({ plugin: 'agent-deck', key: 'settingsSection' } as const, 'harnesses' as SettingsSection)
+const settingsInlineAtom = atom({ plugin: 'agent-deck', key: 'settingsInline' } as const, false)
+const taskDraftAtom = atom({ plugin: 'agent-deck', key: 'taskDraft' } as const, '')
+const routeTypingAtom = atom({ plugin: 'agent-deck', key: 'routeTyping' } as const, [] as string[])
+const modelPickerAtom = atom({ plugin: 'agent-deck', key: 'modelPicker' } as const, {} as Record<string, { group?: string[]; filter?: string }>)
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
-const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: ['claude', 'codex', 'copilot', 'antigravity'] }
+const DEFAULT_METERS: MeterChoice = { mode: 'all', selected: METER_PROVIDERS.map(m => m.id) }
 const AGY_ACCENT = '#3186FF'
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
 const routingAtom = atom({ plugin: 'agent-deck', key: 'routing' } as const, DEFAULT_ROUTING)
+const deliveredRunsAtom = atom({ plugin: 'agent-deck', key: 'deliveredRuns' } as const, [] as string[])
 const COPILOT_ACCENT = '#8957E5'
+/** The streamed output an open card shows before Show all: its last lines, newest at the bottom. */
+const OUTPUT_LINES = 12
+
+/**
+ * The top row's glyphs, one per control. Buttons take only text, so these are characters, with
+ * U+FE0E asking for the plain text form rather than a color emoji where a font has both.
+ */
+const ICON = { keepWarm: '\u2668\uFE0E', routing: '\u21C4', settings: '\u2699\uFE0E' } as const
 
 type $T = EngineInterface
 
@@ -121,9 +176,9 @@ export const filledCells = (percent: number, width: number): number =>
 /** The pane's keep-warm picker: off, or a window in hours. */
 export const KEEPWARM_OPTIONS = [
   { value: 'off', label: 'Off' },
-  { value: '2', label: '2 hours' },
-  { value: '4', label: '4 hours' },
-  { value: '6', label: '6 hours' },
+  { value: '2', label: '2h' },
+  { value: '4', label: '4h' },
+  { value: '6', label: '6h' },
 ]
 
 /** The option a running window shows: the smallest that holds what is left. */
@@ -231,19 +286,19 @@ export const isMeterShown = (choice: MeterChoice, p: MeterProvider, used: Readon
 
 const toneColor = (tone: 'warm' | 'cold' | 'unknown') => (tone === 'warm' ? 'success' : tone === 'cold' ? 'error' : undefined)
 
-const fmtReset = (at: number | undefined, now: number): string => {
-  if (!at) return ''
-  const mins = Math.max(0, Math.round((at - now) / 60000))
-  return mins < 60 ? `${mins}m` : mins < 2880 ? `${Math.round(mins / 60)}h` : `${Math.round(mins / 1440)}d`
-}
-
 const windowLabel = (minutes: number | undefined): string =>
   minutes === undefined ? '?' : minutes <= 300 ? `${Math.round(minutes / 60)}h` : minutes >= 10080 ? '7d' : `${Math.round(minutes / 1440)}d`
 
 const statusText = (l: Limits): string | undefined => {
+  const windows: Record<MeterProvider, LimitWindow[]> = {
+    claude: l.claude,
+    codex: l.codex,
+    copilot: l.copilot ?? [],
+    antigravity: l.antigravity ?? [],
+  }
   const part = (name: string, ws: LimitWindow[]) =>
     ws.length ? `${name} ${ws.map(w => `${w.label} ${Math.round(w.percent)}%`).join(' · ')}` : ''
-  const text = [part('Codex', l.codex), part('Claude', l.claude), part('Copilot', l.copilot ?? [])].filter(Boolean).join('  │  ')
+  const text = METER_PROVIDERS.map(m => part(m.name, windows[m.id])).filter(Boolean).join('  │  ')
   return text || undefined
 }
 
@@ -364,14 +419,75 @@ const CODEX_RESULT_SPEC: ToolSpec = {
   },
 }
 
-const persist = ($: $T) =>
-  update($, agents, () => [...cards.values()].slice(-MAX_CARDS))
+const KEY_CARDS = 'cards'
+const KEY_CARDS_INDEX = 'cards-index'
+let flushTimer: { cancel: () => void } | undefined
+let isSavingCards = false
+let hasPendingCardSave = false
+let cardSavePromise: Promise<void> | undefined
+let hasLoggedCardSaveError = false
+
+const saveCards = ($: $T): Promise<void> => {
+  hasPendingCardSave = true
+  if (isSavingCards && cardSavePromise) return cardSavePromise
+  isSavingCards = true
+  const run = (async () => {
+    try {
+      while (hasPendingCardSave) {
+        hasPendingCardSave = false
+        const sid = sessionId
+        if (!sid) return
+        const list = [...cards.values()].slice(-MAX_CARDS)
+        const now = await $.clock.now()
+        try {
+          const prevIndex = parseCardsIndex(await $.store.get(KEY_CARDS_INDEX))
+          const hadSession = sid in prevIndex
+          const { entry, index, prune } = planCardsSave(prevIndex, sid, list, now, {
+            maxCards: MAX_CARDS,
+            maxOutput: MAX_OUTPUT,
+            maxBytes: CARD_MAX_BYTES,
+          })
+          if (list.length === 0 && !hadSession && prune.length === 0) continue
+          if (entry) await $.store.set(cardsKey(sid), entry)
+          else if (hadSession) await $.store.delete(cardsKey(sid))
+          for (const oldSid of prune) {
+            await $.store.delete(cardsKey(oldSid)).catch(() => undefined)
+          }
+          await $.store.set(KEY_CARDS_INDEX, index)
+          hasLoggedCardSaveError = false
+        } catch (err) {
+          if (!hasLoggedCardSaveError) {
+            hasLoggedCardSaveError = true
+            $.ui.log(`agent-deck: could not save session cards: ${String((err as Error)?.message ?? err).slice(0, 120)}`)
+          }
+        }
+      }
+    } finally {
+      isSavingCards = false
+      if (cardSavePromise === run) cardSavePromise = undefined
+    }
+  })()
+  cardSavePromise = run
+  return run
+}
+
+const persist = async ($: $T) => {
+  if (flushPending) {
+    flushTimer?.cancel()
+    flushTimer = undefined
+    flushPending = false
+  }
+  const list = [...cards.values()].slice(-MAX_CARDS)
+  await update($, agents, () => list)
+  if (sessionId) await saveCards($).catch(() => undefined)
+}
 
 const schedule = ($: $T) => {
   if (flushPending) return
   flushPending = true
-  $.clock.after(200, () => {
+  flushTimer = $.clock.after(200, () => {
     flushPending = false
+    flushTimer = undefined
     void persist($)
   })
 }
@@ -389,6 +505,14 @@ const startTicking = ($: $T) => {
   })
 }
 
+const reviveClaudeCard = ($: $T, card: AgentCard) => {
+  if (card.provider === 'claude' && card.status === 'aborted') {
+    card.status = 'running'
+    card.endedAt = undefined
+    startTicking($)
+  }
+}
+
 const setLimits = async ($: $T, fn: (l: Limits) => Limits) => {
   const next = await update($, limits, fn)
   $.ui.status(statusText(next ?? (await read($, limits))))
@@ -398,7 +522,32 @@ const refreshClaudeLimits = async ($: $T) => {
   const usage = await $.session.usage().catch(() => undefined)
   if (!usage) return
   const claude = claudeLimits(usage.rateLimits)
-  await setLimits($, l => ({ ...l, claude }))
+  const at = await $.clock.now()
+  await setLimits($, l => ({ ...l, claude, readAt: { ...l.readAt, claude: at } }))
+}
+
+/** Codex's reading, unless a newer one is already shown; a live reading beats a rollout fallback at the same timestamp. */
+const setCodexLimits = async ($: $T, ts: number, reading: WatchLimits, source?: CodexLimitSource, liveError?: string) => {
+  const codex = toLimitWindows(reading)
+  if (!codex.length) return
+  await setLimits($, l => {
+    const nextError = source === 'live' ? undefined : liveError !== undefined ? liveError : l.codexError
+    if (!shouldTakeCodexLimits(l.readAt?.codex, l.codexSource, ts, source)) {
+      return nextError === l.codexError ? l : { ...l, codexError: nextError }
+    }
+    return {
+      ...l,
+      codex,
+      codexPlan: reading.plan,
+      codexSource: source ?? l.codexSource ?? 'rollout',
+      codexError: nextError,
+      readAt: { ...l.readAt, codex: ts },
+    }
+  })
+}
+
+const setCodexError = async ($: $T, error: string) => {
+  await setLimits($, l => (l.codexError === error ? l : { ...l, codexError: error }))
 }
 
 let version: string | undefined
@@ -423,10 +572,24 @@ const openPane = ($: $T) => {
   } catch {}
 }
 
+/** True while a card belongs to a managed background run whose report has not been delivered yet. */
+const hasPendingDelivery = (c: AgentCard): boolean => {
+  if (!c.runId) return false
+  if (c.provider === 'harness') {
+    const r = hruns.get(c.runId)
+    return !!r && !r.isDelivered
+  }
+  if (c.provider === 'codex') {
+    const r = runs.get(c.runId)
+    return !!r && !r.isDelivered
+  }
+  return false
+}
+
 const addCard = async ($: $T, card: AgentCard) => {
   cards.set(card.id, card)
   while (cards.size > MAX_CARDS) {
-    const oldest = [...cards.values()].find(c => c.status !== 'running')
+    const oldest = [...cards.values()].find(c => c.status !== 'running' && !hasPendingDelivery(c))
     if (!oldest) break
     cards.delete(oldest.id)
   }
@@ -454,21 +617,24 @@ export const newCodexCard = (id: string, title: string, startedAt: number, extra
 
 export type WatchEvent =
   | { t: 'hello' }
-  | { t: 'limits'; ts: number; limits: WatchLimits }
+  | { t: 'limits'; ts: number; limits: WatchLimits; source?: CodexLimitSource }
   | { t: 'run'; run: string; thread: string }
-  | { t: 'meta'; f: string; ts: number; cwd: string }
-  | { t: 'ctx'; f: string; ts: number; model?: string; effort?: string }
-  | { t: 'prompt'; f: string; ts: number; text: string }
-  | { t: 'msg'; f: string; ts: number; text: string; phase?: string }
-  | { t: 'reason'; f: string; ts: number; text: string }
-  | { t: 'act'; f: string; ts: number; id: string; label?: string; status: Activity['status'] }
+  | { t: 'meta'; f: string; ts: number; cwd: string; off?: number }
+  | { t: 'ctx'; f: string; ts: number; model?: string; effort?: string; off?: number }
+  | { t: 'prompt'; f: string; ts: number; text: string; off?: number }
+  | { t: 'msg'; f: string; ts: number; text: string; phase?: string; off?: number }
+  | { t: 'reason'; f: string; ts: number; text: string; off?: number }
+  | { t: 'act'; f: string; ts: number; id: string; label?: string; status: Activity['status']; off?: number }
   /** Any other rollout line: Codex is still writing. */
-  | { t: 'beat'; f: string; ts: number }
-  | { t: 'tok'; f: string; ts: number; tokens?: Omit<Tokens, never>; limits?: WatchLimits }
-  | { t: 'task'; f: string; ts: number; state: 'running' | 'done' | 'aborted' }
-  | { t: 'err'; f: string; ts: number; text: string }
+  | { t: 'beat'; f: string; ts: number; off?: number }
+  | { t: 'tok'; f: string; ts: number; tokens?: Omit<Tokens, never>; limits?: WatchLimits; off?: number }
+  | { t: 'task'; f: string; ts: number; state: 'running' | 'done' | 'aborted'; off?: number }
+  | { t: 'err'; f: string; ts: number; text: string; off?: number }
 
 type WatchLimits = { windows: { minutes?: number; percent: number; resetsAt?: number }[]; plan?: string }
+
+/** Timestamp high-water mark for Codex cards restored from store, used to ignore replayed lines when no byte offset is present. */
+const restoredWatermark = new Map<string, number>()
 
 export const toLimitWindows = (l: WatchLimits): LimitWindow[] =>
   l.windows.map(w => ({ label: windowLabel(w.minutes), percent: w.percent, resetsAt: w.resetsAt }))
@@ -500,6 +666,8 @@ const adoptThread = ($: $T, runId: string, thread: string) => {
     runCard.model = stray.model
     runCard.effort = stray.effort ?? runCard.effort
     runCard.isThinking = stray.isThinking
+    runCard.lastEventAt = Math.max(runCard.lastEventAt ?? 0, stray.lastEventAt ?? 0) || undefined
+    runCard.rolloutOffset = Math.max(runCard.rolloutOffset ?? 0, stray.rolloutOffset ?? 0) || undefined
     cards.delete(stray.id)
   }
   threadToCard.set(thread, runCard.id)
@@ -508,19 +676,24 @@ const adoptThread = ($: $T, runId: string, thread: string) => {
 
 /** Folds one watcher event about a Codex thread into its card. */
 /** How long a running Codex card has gone without a rollout line, once that passes two minutes. */
-export const STALE_MS = 2 * 60_000
+export const STALE_MS = CARD_STALE_MS
 export const staleFor = (c: AgentCard, now: number): number | undefined => {
   if (c.status !== 'running' || c.provider !== 'codex' || !c.lastEventAt) return undefined
   const quiet = now - c.lastEventAt
   return quiet >= STALE_MS ? quiet : undefined
 }
 
-export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string }>) => {
+export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string }>, replayCutoff?: number) => {
+  if (ev.off !== undefined) {
+    if (card.rolloutOffset !== undefined && ev.off <= card.rolloutOffset) return
+    card.rolloutOffset = ev.off
+  }
+  const isReplay = ev.off === undefined && replayCutoff !== undefined && ev.ts <= replayCutoff
   const isRunCard = card.runId !== undefined
   card.lastEventAt = Math.max(card.lastEventAt ?? 0, ev.ts)
   switch (ev.t) {
     case 'meta':
-      if (card.isExternal) card.startedAt = ev.ts
+      if (card.isExternal && !isReplay) card.startedAt = ev.ts
       break
     case 'ctx':
       if (ev.model) card.model = ev.model
@@ -530,10 +703,12 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
       if (card.isExternal && card.title === 'Codex') card.title = ev.text.split('\n')[0]!.slice(0, 70)
       break
     case 'msg':
+      if (isReplay) break
       card.isThinking = false
       appendOutput(card, `${ev.text.trimEnd()}\n`)
       break
     case 'reason':
+      if (isReplay) break
       appendOutput(card, `${ev.text.split('\n').map(l => `∴ ${l}`).join('\n')}\n`)
       break
     case 'act': {
@@ -545,7 +720,7 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
             a.id !== ev.id ? a : { ...a, label: ev.label ?? a.label, status: !ev.label && a.status === 'error' ? 'error' : ev.status },
           )
         : [...card.activity, { id: ev.id, label: ev.label!, status: ev.status }].slice(-30)
-      card.isThinking = !card.activity.some(a => a.status === 'running')
+      if (!isReplay) card.isThinking = !card.activity.some(a => a.status === 'running')
       break
     }
     case 'tok':
@@ -553,14 +728,14 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
       break
     case 'task':
       // A run's card is finished by its exit file; an external one by its rollout.
-      if (!isRunCard) {
+      if (!isRunCard && !(isReplay && card.status !== 'running')) {
         card.status = ev.state
         card.endedAt = ev.state === 'running' ? undefined : ev.ts
         card.isThinking = ev.state === 'running'
       }
       break
     case 'err':
-      card.error = ev.text
+      if (!isReplay) card.error = redactSecrets(stripAnsi(ev.text)).trim() || ev.text
       break
   }
 }
@@ -568,8 +743,7 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
 export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
   if (ev.t === 'hello') return
   if (ev.t === 'limits') {
-    const codex = toLimitWindows(ev.limits)
-    if (codex.length) await setLimits($, l => ({ ...l, codex, codexPlan: ev.limits.plan }))
+    await setCodexLimits($, ev.ts, ev.limits, ev.source)
     return
   }
   if (ev.t === 'run') {
@@ -577,12 +751,11 @@ export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
     return
   }
   const card = await cardForThread($, ev.f, ev.ts)
-  applyToCard(card, ev)
-  if (ev.t === 'tok' && ev.limits) {
-    const codex = toLimitWindows(ev.limits)
-    if (codex.length) await setLimits($, l => ({ ...l, codex, codexPlan: ev.limits!.plan }))
-  }
-  if (ev.t === 'task' && ev.state === 'running') startTicking($)
+  const cutoff = restoredWatermark.get(card.id)
+  if (cutoff !== undefined && ev.ts > cutoff) restoredWatermark.delete(card.id)
+  applyToCard(card, ev, cutoff)
+  if (ev.t === 'tok' && ev.limits) await setCodexLimits($, ev.ts, ev.limits)
+  if (ev.t === 'task' && ev.state === 'running' && (cutoff === undefined || ev.ts > cutoff)) startTicking($)
   schedule($)
 }
 
@@ -743,35 +916,265 @@ const footerOf = (run: Run, card: AgentCard | undefined) => {
 // ---------- delivering a finished run's report ----------
 
 const MAX_DELIVERY_TRIES = 5
-const deliveries = new Map<string, { tries: number; nextAt: number; isSending: boolean }>()
+/** How old this copy's claim must be before it hands the report over: a copy that claimed in the same moment has written by then. */
+const CLAIM_SETTLE_MS = 500
+type DeliveryState = {
+  tries: number
+  nextAt: number
+  isSending: boolean
+  claim?: string
+  claimAt?: number
+  /** Set once the report has been accepted so it is never submitted twice, even if writing delivered.txt has to be retried. */
+  deliveredAt?: number
+  /** True once delivered.txt holds the delivered timestamp. */
+  isWritten?: boolean
+  /** Exact report text currently in flight with $.prompt.submit so prompt.submit's hook can stamp delivered.txt as soon as next(e) accepts it. */
+  sendingText?: string
+  onDelivered?: () => void
+}
+const deliveries = new Map<string, DeliveryState>()
 
-/**
- * Hands a finished run's report to the model as a new turn, once. The run's folder
- * records it only after the prompt entered; a refused or failed submit is tried again
- * later (30 s, 60 s, ...), five times at most. True once nothing is left to do.
- */
-const deliverReport = async ($: $T, dir: string, what: string, text: string): Promise<boolean> => {
-  const d = deliveries.get(dir) ?? { tries: 0, nextAt: 0, isSending: false }
-  deliveries.set(dir, d)
-  if (d.isSending) return false
-  if (d.tries >= MAX_DELIVERY_TRIES || (await $.fs.exists(`${dir}/delivered.txt`))) return true
-  const now = await $.clock.now()
-  if (now < d.nextAt) return false
-  d.isSending = true
+type ClaimResult =
+  | { state: 'delivered' }
+  | { state: 'owned'; token: string; at: number }
+  | { state: 'taken'; token?: string; at?: number }
+  | { state: 'claimed'; token: string; at: number }
+  | { state: 'none' }
+  | { state: 'released' }
+  | { state: 'kept' }
+
+/** Serializes delivered.txt updates through bin/claim.mjs (O_EXCL lockfile), without a shell. */
+const runClaimScript = async ($: $T, args: string[]): Promise<ClaimResult | undefined> => {
+  const r = await $.process.run(['node', `${$.plugin.root}/bin/claim.mjs`, ...args], { timeoutMs: 5_000 }).catch(() => undefined)
+  if (!r || r.exitCode !== 0 || !r.stdout) return undefined
+  try {
+    const parsed = JSON.parse(r.stdout.trim()) as ClaimResult
+    return parsed && typeof parsed === 'object' && typeof parsed.state === 'string' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const isRunDelivered = async ($: $T, runKey: string): Promise<boolean> => {
+  const list = await read($, deliveredRunsAtom).catch(() => [] as string[])
+  return list.includes(runKey)
+}
+
+const markRunDelivered = async ($: $T, runKey: string): Promise<void> => {
+  await update($, deliveredRunsAtom, list => rememberDeliveredRun(list, runKey)).catch(() => undefined)
+}
+
+const releaseClaim = async ($: $T, dir: string, token: string | undefined) => {
+  if (!token) return
+  const res = await runClaimScript($, ['release', dir, token])
+  if (res) return
+  const file = `${dir}/delivered.txt`
+  const mark = readDeliveryMark(await readText($, file))
+  if (mark.state === 'claimed' && mark.token === token) {
+    await $.fs.write(file, '').catch(() => undefined)
+  }
+}
+
+const writeDeliveredMark = async ($: $T, dir: string, d: DeliveryState): Promise<boolean> => {
+  const at = d.deliveredAt ?? (await $.clock.now())
+  d.deliveredAt = at
+  d.claim = undefined
+  d.claimAt = undefined
+  if (d.isWritten) return true
+  const res = await runClaimScript($, ['deliver', dir, String(at)])
+  if (res?.state === 'delivered') {
+    d.isWritten = true
+    d.onDelivered?.()
+    return true
+  }
+  try {
+    const file = `${dir}/delivered.txt`
+    const cur = readDeliveryMark(await readText($, file))
+    if (cur.state !== 'delivered') await $.fs.write(file, String(at))
+    d.isWritten = true
+    d.onDelivered?.()
+    return true
+  } catch {
+    return false
+  }
+}
+
+const sendReport = async ($: $T, dir: string, what: string, text: string, d: DeliveryState, runKey?: string) => {
+  const token = d.claim
   try {
     const entered = await $.prompt.submit({ text })
     if (entered?.drop !== undefined) throw new Error(`refused: ${entered.drop}`)
-    await $.fs.write(`${dir}/delivered.txt`, String(now))
-    return true
+    if (runKey) await markRunDelivered($, runKey)
+    await writeDeliveredMark($, dir, d)
   } catch (err) {
+    // If prompt.submit already accepted the report (or another copy delivered it), never release the claim or submit again.
+    if (d.deliveredAt !== undefined || (runKey && (await isRunDelivered($, runKey)))) {
+      await writeDeliveredMark($, dir, d)
+      return
+    }
+    const at = await $.clock.now()
+    d.claim = undefined
+    d.claimAt = undefined
+    await releaseClaim($, dir, token)
     d.tries++
-    d.nextAt = now + 30_000 * d.tries
-    if (d.tries < MAX_DELIVERY_TRIES) return false
-    $.ui.toast(`agent-deck: gave up delivering ${what} after ${d.tries} tries (${String((err as Error)?.message ?? err).slice(0, 120)}); its result tool still reads it.`)
-    return true
+    d.nextAt = at + 30_000 * d.tries
+    if (d.tries >= MAX_DELIVERY_TRIES) {
+      $.ui.toast(`agent-deck: gave up delivering ${what} after ${d.tries} tries (${String((err as Error)?.message ?? err).slice(0, 120)}); its result tool still reads it.`)
+      d.onDelivered?.()
+    }
   } finally {
     d.isSending = false
+    d.sendingText = undefined
   }
+}
+
+/** Releases claims this copy wrote but has not yet submitted, so a replacement copy delivers them right away instead of waiting out the claim TTL. */
+const releaseUnsentClaims = async ($: $T) => {
+  for (const [dir, d] of deliveries) {
+    if (!d.claim || d.isSending || d.deliveredAt !== undefined) continue
+    const token = d.claim
+    d.claim = undefined
+    d.claimAt = undefined
+    await releaseClaim($, dir, token)
+  }
+}
+
+/**
+ * Hands a finished run's report to the model as a new turn, once. Another copy of agent-deck
+ * can be watching the same run folder: the copy a reload replaced, still finishing its poll, or
+ * the released plugin beside a dev copy. So one poll claims the folder's delivered.txt (atomically
+ * through bin/claim.mjs), and a later poll submits the report only if the claim there is still
+ * this copy's; a copy that finds another's claim leaves the report alone. A refused or failed
+ * submit lets the claim go and is tried again later (30 s, 60 s, ...), five times at most.
+ * True once nothing is left to do here.
+ */
+const deliverReport = async (
+  $: $T,
+  dir: string,
+  what: string,
+  text: string,
+  onDelivered?: () => void,
+  runKey?: string,
+): Promise<boolean> => {
+  const d = deliveries.get(dir) ?? { tries: 0, nextAt: 0, isSending: false }
+  if (onDelivered) d.onDelivered = onDelivered
+  deliveries.set(dir, d)
+  const file = `${dir}/delivered.txt`
+  const now = await $.clock.now()
+  if (runKey && (await isRunDelivered($, runKey))) {
+    return writeDeliveredMark($, dir, d)
+  }
+  if (d.deliveredAt !== undefined) {
+    if (d.isWritten) return true
+    return writeDeliveredMark($, dir, d)
+  }
+  if (d.isSending) {
+    // Keep our claim fresh while $.prompt.submit waits on a long turn, so another copy doesn't take it over.
+    if (d.claim && d.claimAt !== undefined && now - d.claimAt >= DELIVERY_CLAIM_TTL_MS / 2) {
+      const res = await runClaimScript($, ['refresh', dir, d.claim, String(now)])
+      if (res) {
+        if (res.state === 'owned') d.claimAt = now
+        else if (res.state === 'delivered') {
+          d.deliveredAt = now
+          d.isWritten = true
+          d.claim = undefined
+          d.claimAt = undefined
+        }
+      } else {
+        const mark = readDeliveryMark(await readText($, file))
+        if (mark.state === 'claimed' && mark.token === d.claim) {
+          d.claimAt = now
+          await $.fs.write(file, deliveryClaim(d.claim, now)).catch(() => undefined)
+        }
+      }
+    }
+    return false
+  }
+  if (d.tries >= MAX_DELIVERY_TRIES) return true
+
+  if (!d.claim && now >= d.nextAt) {
+    const token = `${now.toString(36)}-${Math.floor(Math.random() * 36 ** 6).toString(36)}`
+    const res = await runClaimScript($, ['claim', dir, token, String(now), String(DELIVERY_CLAIM_TTL_MS)])
+    if (res) {
+      if (res.state === 'delivered') {
+        d.deliveredAt = now
+        d.isWritten = true
+        d.claim = undefined
+        d.claimAt = undefined
+        d.onDelivered?.()
+        return true
+      }
+      if (res.state === 'claimed' || res.state === 'owned') {
+        d.claim = res.token
+        d.claimAt = res.at
+      }
+      return false
+    }
+  } else if (d.claim) {
+    const res = await runClaimScript($, ['claim', dir, d.claim, String(now), String(DELIVERY_CLAIM_TTL_MS)])
+    if (res) {
+      if (res.state === 'delivered') {
+        d.deliveredAt = now
+        d.isWritten = true
+        d.claim = undefined
+        d.claimAt = undefined
+        d.onDelivered?.()
+        return true
+      }
+      if (res.state === 'taken') {
+        d.claim = undefined
+        d.claimAt = undefined
+        return false
+      }
+      if (res.state === 'claimed') {
+        d.claim = res.token
+        d.claimAt = res.at
+        return false
+      }
+      if (res.state === 'owned') {
+        if (now - res.at < CLAIM_SETTLE_MS) return false
+        if (runKey && (await isRunDelivered($, runKey))) return writeDeliveredMark($, dir, d)
+        d.isSending = true
+        d.sendingText = text
+        void sendReport($, dir, what, text, d, runKey)
+        return false
+      }
+    }
+  }
+
+  // Fallback when bin/claim.mjs is unavailable (e.g. mocked process.run in tests).
+  const mark = readDeliveryMark(await readText($, file))
+  if (runKey && (await isRunDelivered($, runKey))) {
+    return writeDeliveredMark($, dir, d)
+  }
+  if (mark.state === 'delivered') {
+    d.deliveredAt = now
+    d.isWritten = true
+    d.claim = undefined
+    d.claimAt = undefined
+    d.onDelivered?.()
+    return true
+  }
+  if (mark.state !== 'claimed' || mark.token !== d.claim) {
+    d.claim = undefined
+    d.claimAt = undefined
+    // Another copy is handing it over now: look again on the next poll.
+    if (isDeliveryTaken(mark, now) || now < d.nextAt) return false
+    const token = `${now.toString(36)}-${Math.floor(Math.random() * 36 ** 6).toString(36)}`
+    d.claim = token
+    d.claimAt = now
+    await $.fs.write(file, deliveryClaim(token, now)).catch(() => {
+      d.claim = undefined
+      d.claimAt = undefined
+    })
+    return false
+  }
+  if (now - mark.at < CLAIM_SETTLE_MS) return false
+  d.isSending = true
+  d.sendingText = text
+  // Submit without stalling other runs in the poll loop while the session is busy.
+  void sendReport($, dir, what, text, d, runKey)
+  return false
 }
 
 /** Marks a finished run on its card and hands its report to the model as a new turn. */
@@ -784,6 +1187,9 @@ const finishRun = async ($: $T, run: Run, outcome: RunOutcome) => {
     card.isThinking = false
     if (outcome.error) card.error = outcome.error
     schedule($)
+  } else if (card && card.status === 'error' && outcome.error && card.error !== outcome.error) {
+    card.error = outcome.error
+    schedule($)
   }
   if (run.sessionId !== sessionId) {
     run.isDelivered = true
@@ -795,7 +1201,16 @@ const finishRun = async ($: $T, run: Run, outcome: RunOutcome) => {
       ? `Background Codex run ${run.id} ("${run.title}") finished after ${elapsed}. Its report:`
       : `Background Codex run ${run.id} ("${run.title}") failed after ${elapsed}: ${outcome.error ?? 'unknown error'}${outcome.report ? '\n\nIts last message:' : ''}`
   const text = `[agent-deck] ${head}\n\n${outcome.report}\n\n${footerOf(run, card)}`.trim()
-  run.isDelivered = await deliverReport($, run.dir, `Codex run ${run.id}`, text)
+  run.isDelivered = await deliverReport(
+    $,
+    run.dir,
+    `Codex run ${run.id}`,
+    text,
+    () => {
+      run.isDelivered = true
+    },
+    deliveryRunKey('codex', run.id),
+  )
 }
 
 let isPollingRuns = false
@@ -856,7 +1271,6 @@ const loadRuns = async ($: $T, root: string) => {
   }
   startRunPoller($)
   startTicking($)
-  await persist($)
 }
 
 const progressOf = (card: AgentCard | undefined): string => {
@@ -883,6 +1297,7 @@ type HarnessRunMeta = {
   sessionId: string
   startedAt: number
   model?: string
+  effort?: string
 }
 
 type HarnessRun = HarnessRunMeta & {
@@ -893,6 +1308,29 @@ type HarnessRun = HarnessRunMeta & {
   final: string
   isFinished: boolean
   isDelivered?: boolean
+  /** Last time pid.txt was checked for liveness; undefined on restored runs so they check on the first poll. */
+  lastPidCheckAt?: number
+  /** Snapshot of the card at finish so delivery still succeeds if the card is ever removed from the pane. */
+  finishedCard?: AgentCard
+}
+
+const PID_CHECK_INTERVAL_MS = 10_000
+
+/** Checks whether `pid` is still alive via bin/pid-alive.mjs without a shell; undefined when the check cannot run. */
+const checkPidAlive = async ($: $T, pid: number): Promise<boolean | undefined> => {
+  const r = await $.process.run(['node', `${$.plugin.root}/bin/pid-alive.mjs`, String(pid)], { timeoutMs: 5_000 }).catch(() => undefined)
+  if (!r || r.exitCode !== 0 || !r.stdout) return undefined
+  try {
+    const parsed = JSON.parse(r.stdout.trim()) as { alive?: unknown }
+    return typeof parsed.alive === 'boolean' ? parsed.alive : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const harnessSecrets = (harnessId: string): string[] | undefined => {
+  const key = harnessList.find(h => h.id === harnessId)?.provider?.apiKey?.trim()
+  return key ? [key] : undefined
 }
 
 const hruns = new Map<string, HarnessRun>()
@@ -914,6 +1352,7 @@ const newHarnessCard = (meta: HarnessRunMeta): AgentCard => ({
   accent: meta.color,
   title: meta.title,
   model: meta.model ?? meta.name,
+  effort: meta.effort,
   status: 'running',
   startedAt: meta.startedAt,
   output: '',
@@ -956,9 +1395,9 @@ async function saveHarnesses($: $T, list: Harness[]) {
 
 /** The stored harnesses; on first use, the presets whose CLI is installed. */
 async function loadHarnesses($: $T) {
-  const stored = await $.store.get(KEY_HARNESSES)
-  if (Array.isArray(stored)) {
-    harnessList = (stored as Harness[]).map(h => h.models ? { ...h, models: withFusion(h, h.models) } : h)
+  const stored = storedHarnesses(await $.store.get(KEY_HARNESSES))
+  if (stored) {
+    harnessList = stored
     await update($, harnessesAtom, () => harnessList)
     await registerAgentTools($)
     void detectHarnesses($, harnessList)
@@ -981,10 +1420,11 @@ const readHarnessEvents = async ($: $T, run: HarnessRun, card: AgentCard, isLast
   run.offset = text.length
   const lines = fresh.split('\n')
   run.partial = isLast ? '' : (lines.pop() ?? '')
+  const secrets = harnessSecrets(run.harness)
   for (const line of lines) {
     for (const ev of parseLine(run.parser, line.replace(/\r$/, ''))) {
       if (ev.kind === 'final') run.final = ev.text
-      else applyHarnessEvent(card, ev)
+      else applyHarnessEvent(card, ev, secrets)
     }
   }
 }
@@ -996,6 +1436,7 @@ const harnessFooter = (run: HarnessRun, card: AgentCard | undefined) => {
   const t = card?.tokens
   return (
     `[${run.name} run ${run.id} · harness ${run.harness} · model ${card?.model ?? run.model ?? 'default'}` +
+    (run.effort ? ` · effort ${run.effort}` : '') +
     (card?.sessionRef ? ` · session ${card.sessionRef}` : '') +
     (t && t.input + t.output > 0 ? ` · in ${fmtTokens(t.input + t.cacheRead + t.cacheWrite)} out ${fmtTokens(t.output)}` : '') +
     (card?.aiCredits !== undefined ? ` · ${fmtCredits(card.aiCredits)} AI credits${card.aiCreditsStatus === 'partial' ? ' (reported subtotal)' : ''}` : '') +
@@ -1009,22 +1450,23 @@ const finishHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard, code: n
   run.isFinished = true
   if (run.parser === 'antigravity') void refreshAgyLimits($)
   const stderr = (await readText($, `${run.dir}/stderr.log`)) ?? ''
+  const secrets = harnessSecrets(run.harness)
+  const exitCode = Number.isNaN(code) ? undefined : code
   const isOk = code === 0 && !card.error
   if (card.status === 'running') {
     card.status = isOk ? 'done' : 'error'
     card.endedAt = await $.clock.now()
     card.isThinking = false
-    if (!isOk && !card.error) {
-      card.error =
-        stderr
-          .split('\n')
-          .filter(l => l.trim())
-          .slice(-4)
-          .join(' ')
-          .slice(0, 600) || `${run.name} exited ${Number.isNaN(code) ? '?' : code}`
-    }
+    if (!isOk) card.error = harnessFailure(run.name, exitCode, card.error, stderr, run.parser, secrets)
     schedule($)
+  } else if (card.status === 'error') {
+    const nextError = harnessFailure(run.name, exitCode, card.error, stderr, run.parser, secrets)
+    if (nextError !== card.error) {
+      card.error = nextError
+      schedule($)
+    }
   }
+  run.finishedCard = { ...card }
   await deliverHarnessRun($, run, card)
 }
 
@@ -1040,7 +1482,16 @@ const deliverHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard) => {
     ? `Background ${run.name} run ${run.id} ("${run.title}") finished after ${elapsed}. Its report:`
     : `Background ${run.name} run ${run.id} ("${run.title}") failed after ${elapsed}: ${card.error ?? 'unknown error'}${report ? '\n\nIts last output:' : ''}`
   const text = `[agent-deck] ${head}\n\n${report}\n\n${harnessFooter(run, card)}`.trim()
-  run.isDelivered = await deliverReport($, run.dir, `${run.name} run ${run.id}`, text)
+  run.isDelivered = await deliverReport(
+    $,
+    run.dir,
+    `${run.name} run ${run.id}`,
+    text,
+    () => {
+      run.isDelivered = true
+    },
+    deliveryRunKey('harness', run.id),
+  )
 }
 
 let isPollingHarness = false
@@ -1053,14 +1504,46 @@ const pollHarnessRuns = async ($: $T) => {
     for (const run of hruns.values()) {
       if (run.isDelivered) continue
       const card = cards.get(harnessCardId(run.id))
-      if (!card) continue
       if (run.isFinished) {
-        await deliverHarnessRun($, run, card)
+        await deliverHarnessRun($, run, card ?? run.finishedCard ?? newHarnessCard(run))
         continue
       }
+      if (!card) continue
       const exit = await readText($, `${run.dir}/exit.txt`)
       await readHarnessEvents($, run, card, exit !== undefined)
-      if (exit !== undefined) await finishHarnessRun($, run, card, Number.parseInt(exit.trim(), 10))
+      if (exit !== undefined) {
+        await finishHarnessRun($, run, card, Number.parseInt(exit.trim(), 10))
+      } else {
+        const now = await $.clock.now()
+        if (run.lastPidCheckAt === undefined || now - run.lastPidCheckAt >= PID_CHECK_INTERVAL_MS) {
+          run.lastPidCheckAt = now
+          const pid = parseRunPid(await readText($, `${run.dir}/pid.txt`))
+          if (pid !== undefined) {
+            const isPidAlive = await checkPidAlive($, pid)
+            if (isPidAlive === false) {
+              // Re-check exit.txt in case the process exited normally right before writing it.
+              const exitAfter = await readText($, `${run.dir}/exit.txt`)
+              if (exitAfter !== undefined) {
+                await readHarnessEvents($, run, card, true)
+                await finishHarnessRun($, run, card, Number.parseInt(exitAfter.trim(), 10))
+              } else {
+                const deadReason = deadRunnerFailure({ hasExit: false, pid, isPidAlive })
+                if (deadReason) {
+                  await readHarnessEvents($, run, card, true)
+                  run.isFinished = true
+                  card.status = 'error'
+                  card.endedAt = await $.clock.now()
+                  card.isThinking = false
+                  card.error = deadReason
+                  run.finishedCard = { ...card }
+                  schedule($)
+                  await deliverHarnessRun($, run, card)
+                }
+              }
+            }
+          }
+        }
+      }
       schedule($)
     }
     if (![...hruns.values()].some(r => !r.isDelivered)) {
@@ -1100,7 +1583,6 @@ const loadHarnessRuns = async ($: $T) => {
   }
   startHarnessPoller($)
   startTicking($)
-  await persist($)
 }
 
 const clearTempSecretFile = async ($: $T, file: string) => {
@@ -1129,6 +1611,7 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     sessionId,
     startedAt: await $.clock.now(),
     model,
+    effort: input.effort,
   }
   const dir = `${root}/${id}`
   const command = harnessCommand(h, { ...input, session: input.resume, cwd, usageFile: `${dir}/usage.json` })
@@ -1151,7 +1634,7 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     if (hasEnv) await clearTempSecretFile($, envFile)
     throw error
   }
-  const run: HarnessRun = { ...meta, dir, offset: 0, partial: '', final: '', isFinished: false }
+  const run: HarnessRun = { ...meta, dir, offset: 0, partial: '', final: '', isFinished: false, lastPidCheckAt: meta.startedAt }
   hruns.set(id, run)
   await addCard($, newHarnessCard(meta))
   startHarnessPoller($)
@@ -1179,7 +1662,7 @@ const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: 
   }
 }
 
-type AgentRunInput = CopilotRunOptions & { harness: string; task?: string; prompt: string; title?: string; cwd?: string; resume?: string }
+type AgentRunInput = CopilotRunOptions & { harness: string; task?: string; prompt: string; title?: string; cwd?: string; resume?: string; effort?: string }
 
 // ---------- task routing: who does which kind of task ----------
 
@@ -1191,6 +1674,40 @@ let routingSent: string | undefined
 async function loadRoutingSetting($: $T) {
   routing = loadRouting(await $.store.get(KEY_ROUTING))
   await update($, routingAtom, () => routing)
+}
+
+const storedHarnesses = (stored: unknown): Harness[] | undefined =>
+  Array.isArray(stored) ? (stored as Harness[]).map(h => (h.models ? { ...h, models: withFusion(h, h.models) } : h)) : undefined
+
+/**
+ * Reads task routing, the harnesses and the Codex switch again from the store, where every
+ * change is written first. This module's own copies start at the defaults (routing off, no
+ * harnesses) each time the mod loads, and session.start fills them only after a moment; a
+ * tool call or prompt that comes in that moment, as it can right after a reload, would
+ * otherwise be answered from the defaults while the pane, drawn from state that outlives
+ * the reload, shows routing on.
+ */
+async function syncSettings($: $T) {
+  const [r, hs, cx] = await Promise.all([$.store.get(KEY_ROUTING), $.store.get(KEY_HARNESSES), $.store.get(KEY_CODEX)])
+  let isChanged = false
+  const nextRouting = loadRouting(r)
+  if (JSON.stringify(nextRouting) !== JSON.stringify(routing)) {
+    routing = nextRouting
+    isChanged = true
+    await update($, routingAtom, () => nextRouting)
+  }
+  const nextHarnesses = storedHarnesses(hs)
+  if (nextHarnesses && JSON.stringify(nextHarnesses) !== JSON.stringify(harnessList)) {
+    harnessList = nextHarnesses
+    isChanged = true
+    await update($, harnessesAtom, () => nextHarnesses)
+  }
+  if (typeof cx === 'boolean' && cx !== codexOn) {
+    codexOn = cx
+    isChanged = true
+    await update($, codexAtom, () => cx)
+  }
+  if (isChanged) await registerAgentTools($)
 }
 
 async function saveRouting($: $T, next: Routing) {
@@ -1245,7 +1762,8 @@ const refreshCopilotLimits = async ($: $T): Promise<boolean> => {
   }
   if (!reading) return false
   const { windows, plan } = reading
-  await setLimits($, l => ({ ...l, copilot: windows, copilotPlan: plan }))
+  const at = await $.clock.now()
+  await setLimits($, l => ({ ...l, copilot: windows, copilotPlan: plan, readAt: { ...l.readAt, copilot: at } }))
   return true
 }
 
@@ -1258,30 +1776,131 @@ const startCopilotLimits = async ($: $T) => {
 
 const KEY_AGY_SESSION = 'agy-quota-session'
 let agyPoller: { cancel: () => void } | undefined
-let isAgyChecking = false
+let agyCheck: Promise<boolean> | undefined
 
 /** The Antigravity harness the meters read through: the first one switched on. */
 const agyHarness = () => harnessList.find(h => h.isEnabled && h.parser === 'antigravity')
 
-const refreshAgyLimits = async ($: $T): Promise<boolean> => {
+/** Asks agy for its limits; a check already under way is the answer, not a second agy. */
+const refreshAgyLimits = ($: $T): Promise<boolean> => {
   const h = agyHarness()
-  if (!h || isAgyChecking) return false
-  isAgyChecking = true
+  if (!h) return Promise.resolve(false)
+  agyCheck ??= readAgyLimits($, h).finally(() => {
+    agyCheck = undefined
+  })
+  return agyCheck
+}
+
+const readAgyLimits = async ($: $T, h: Harness): Promise<boolean> => {
+  const saved = await $.store.get(KEY_AGY_SESSION)
+  const args = ['node', `${$.plugin.root}/bin/agy-quota.mjs`, h.command, ...(typeof saved === 'string' && saved ? [saved] : [])]
+  const r = await $.process.run(args, { timeoutMs: 60_000 }).catch(() => undefined)
+  let answer: { sessionId?: string; quota?: unknown; error?: string } = {}
   try {
-    const saved = await $.store.get(KEY_AGY_SESSION)
-    const args = ['node', `${$.plugin.root}/bin/agy-quota.mjs`, h.command, ...(typeof saved === 'string' && saved ? [saved] : [])]
-    const r = await $.process.run(args, { timeoutMs: 60_000 }).catch(() => undefined)
-    let answer: { sessionId?: string; quota?: unknown; error?: string } = {}
+    answer = JSON.parse(r?.stdout ?? '')
+  } catch {}
+  if (answer.sessionId && answer.sessionId !== saved) await $.store.set(KEY_AGY_SESSION, answer.sessionId)
+  const windows = answer.quota ? agyLimits(answer.quota) : []
+  if (!windows.length) return false
+  const at = await $.clock.now()
+  await setLimits($, l => ({ ...l, antigravity: windows, readAt: { ...l.readAt, antigravity: at } }))
+  return true
+}
+
+const CODEX_LIMITS_DEADLINE_MS = 25_000
+let codexLimitsPoller: { cancel: () => void } | undefined
+let codexLimitsCheck: Promise<boolean> | undefined
+
+/** The Codex CLI to ask for live limits without waiting on a slow discovery: override, else cached find, else `codex`. */
+const codexLimitsCommand = async ($: $T): Promise<string> => {
+  const override = await codexOverride($)
+  if (override) return override
+  if (codexFound?.chosen?.path) return codexFound.chosen.path
+  void findCodex($).catch(() => undefined)
+  return 'codex'
+}
+
+/** Reads Codex's limits live via `codex app-server` (bin/codex-limits.mjs), falling back to its newest session file. */
+const refreshCodexLimits = ($: $T): Promise<boolean> => {
+  codexLimitsCheck ??= (async () => {
+    if (!codexOn && !(await read($, codexAtom))) return false
+    return await readCodexLimits($)
+  })().finally(() => {
+    codexLimitsCheck = undefined
+  })
+  return codexLimitsCheck
+}
+
+const readCodexLimits = async ($: $T): Promise<boolean> => {
+  let timedOut = false
+  let timer: { cancel: () => void } | undefined
+  const timeout = new Promise<'timeout'>(resolve => {
+    timer = $.clock.after(CODEX_LIMITS_DEADLINE_MS, () => {
+      timedOut = true
+      resolve('timeout')
+    })
+  })
+  const run = (async (): Promise<{ ok: boolean; error?: string }> => {
+    const [home, command] = await Promise.all([codexHome($), codexLimitsCommand($)])
+    if (timedOut) return { ok: false }
+    let r: { exitCode: number; stdout: string; stderr: string } | undefined
+    let runError: string | undefined
     try {
-      answer = JSON.parse(r?.stdout ?? '')
-    } catch {}
-    if (answer.sessionId && answer.sessionId !== saved) await $.store.set(KEY_AGY_SESSION, answer.sessionId)
-    const windows = answer.quota ? agyLimits(answer.quota) : []
-    if (!windows.length) return false
-    await setLimits($, l => ({ ...l, antigravity: windows }))
-    return true
+      r = await $.process.run(['node', `${$.plugin.root}/bin/codex-limits.mjs`, home ? `${home}/sessions` : '', command], { timeoutMs: 22_000 })
+    } catch (err) {
+      runError = codexLiveError(String((err as Error)?.message ?? err))
+    }
+    if (timedOut) return { ok: false }
+    if (!r) return { ok: false, error: runError ?? 'could not read live' }
+    const parsed = parseCodexLimitsOutput(r.stdout, r.exitCode, r.stderr)
+    if (parsed.reading) {
+      await setCodexLimits($, parsed.reading.ts, parsed.reading.limits, parsed.reading.source, parsed.liveError)
+      return { ok: parsed.reading.source === 'live' }
+    }
+    return { ok: false, error: parsed.liveError ?? 'no answer from Codex' }
+  })()
+  const outcome = await Promise.race([run, timeout])
+  timer?.cancel()
+  if (outcome === 'timeout') {
+    await setCodexError($, 'timed out')
+    return false
+  }
+  if (!outcome.ok && outcome.error) await setCodexError($, outcome.error)
+  return outcome.ok
+}
+
+/** Reads Codex's limits now and every ten minutes, while the built-in Codex is switched on. */
+const startCodexLimits = ($: $T) => {
+  if (!codexOn) {
+    codexLimitsPoller?.cancel()
+    codexLimitsPoller = undefined
+    return
+  }
+  void refreshCodexLimits($)
+  codexLimitsPoller ??= $.clock.every(10 * 60_000, () => void refreshCodexLimits($))
+}
+
+let isRefreshingLimits = false
+
+/** The Refresh button: reads every provider's limits again now, and says so while it does. */
+const refreshAllLimits = async ($: $T) => {
+  if (isRefreshingLimits) return
+  isRefreshingLimits = true
+  await update($, limits, l => ({ ...l, isRefreshing: true }))
+  try {
+    await Promise.all(
+      [
+        refreshClaudeLimits($),
+        refreshCopilotLimits($).then(isRead => {
+          if (isRead && !copilotPoller) copilotPoller = $.clock.every(5 * 60_000, () => void refreshCopilotLimits($))
+        }),
+        refreshAgyLimits($),
+        refreshCodexLimits($),
+      ].map(p => p.catch(() => undefined)),
+    )
   } finally {
-    isAgyChecking = false
+    isRefreshingLimits = false
+    await update($, limits, l => ({ ...l, isRefreshing: false }))
   }
 }
 
@@ -1300,8 +1919,10 @@ async function loadMeters($: $T) {
   const stored = await $.store.get(KEY_METERS)
   const o = (stored && typeof stored === 'object' ? stored : {}) as Partial<MeterChoice>
   const mode = o.mode === 'session' || o.mode === 'selected' ? o.mode : 'all'
-  const selected = Array.isArray(o.selected) ? o.selected.filter(x => ['claude', 'codex', 'copilot', 'antigravity'].includes(x)) : DEFAULT_METERS.selected
-  await update($, metersAtom, () => ({ mode, selected }))
+  const valid = METER_PROVIDERS.map(m => m.id)
+  const selected = Array.isArray(o.selected) ? o.selected.filter(x => valid.includes(x)) : DEFAULT_METERS.selected
+  const agyView = AGY_VIEWS.find(v => v.value === o.agyView)?.value
+  await update($, metersAtom, () => ({ mode, selected, ...(o.isCollapsed === true ? { isCollapsed: true } : {}), ...(agyView ? { agyView } : {}) }))
 }
 
 async function saveMeters($: $T, choice: MeterChoice) {
@@ -1328,7 +1949,15 @@ const startCodexWatcher = async ($: $T) => {
   const root = await runsRoot($)
   if (!home || !root) return
   const since = (await $.clock.now()) - 30 * 60_000
-  startWatcher($, [`${home}/sessions`, root, await $.session.cwd(), String(since)])
+  const offsets: Record<string, number> = {}
+  for (const c of cards.values()) {
+    if (c.provider === 'codex' && c.threadId && typeof c.rolloutOffset === 'number' && c.rolloutOffset > 0) {
+      offsets[c.threadId] = Math.max(offsets[c.threadId] ?? 0, c.rolloutOffset)
+    }
+  }
+  const args = [`${home}/sessions`, root, await $.session.root(), String(since)]
+  if (Object.keys(offsets).length > 0) args.push(JSON.stringify(offsets))
+  startWatcher($, args)
 }
 
 /** The stored switch; on first use, on when `codex` is on PATH. */
@@ -1349,9 +1978,11 @@ async function setCodexEnabled($: $T, on: boolean) {
   if (on) {
     await registerCodexTools($)
     await startCodexWatcher($)
+    startCodexLimits($)
   } else {
     stopWatcher()
-    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined }))
+    startCodexLimits($)
+    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined, codexSource: undefined, codexError: undefined, readAt: { ...l.readAt, codex: undefined } }))
   }
 }
 
@@ -1916,12 +2547,27 @@ const registerCache = (on: On) => {
   // The guard: only the first character of the prompt is read, for a slash.
   // A prompt that goes through also carries the task-routing note when the model doesn't have it yet.
   on('prompt.submit', async ($, e, next) => {
+    const reportKey = e.origin.kind === 'plugin' ? reportRunKey(e.text) : undefined
+    if (reportKey && (await isRunDelivered($, reportKey))) {
+      return { drop: 'agent-deck: report already delivered' }
+    }
+    await syncSettings($).catch(() => undefined)
     const want = currentRoutingNote()
     const extra = routingContext(want, routingSent)
     const pass = async () => {
-      if (!extra) return next(e)
-      const r = await next({ ...e, context: [...(e.context ?? []), extra] })
-      if (!r.drop) routingSent = want
+      const r = extra ? await next({ ...e, context: [...(e.context ?? []), extra] }) : await next(e)
+      if (!r.drop) {
+        if (extra) routingSent = want
+        if (e.origin.kind === 'plugin') {
+          if (reportKey) await markRunDelivered($, reportKey)
+          for (const [dir, d] of deliveries) {
+            if (d.isSending && d.sendingText === e.text && d.deliveredAt === undefined) {
+              await writeDeliveredMark($, dir, d)
+              break
+            }
+          }
+        }
+      }
       return r
     }
     if (e.origin.kind === 'plugin' || s.guard === 'off') return pass()
@@ -1969,7 +2615,7 @@ async function routingCommand($: $T, word: string | undefined): Promise<string> 
   const lines = routing.routes.map(r => {
     const problem = routeProblem(r, harnessList, codexOn)
     const to = !r.target ? 'not set' : r.target === 'codex' ? 'Codex (built in)' : r.target === 'claude' ? 'Claude subagent' : (harnessList.find(h => h.id === r.target)?.name ?? r.target)
-    return `  ${r.task}: ${to}${r.model ? ` · ${r.model}` : ''}${problem ? ` (can't run: ${problem})` : ''}`
+    return `  ${r.task}: ${to}${r.model ? ` · ${r.model}` : ''}${r.effort ? ` · effort ${r.effort}` : ''}${problem ? ` (can't run: ${problem})` : ''}`
   })
   const head = routing.isOn
     ? routes.length
@@ -1980,6 +2626,1085 @@ async function routingCommand($: $T, word: string | undefined): Promise<string> 
 }
 
 // ---------- the module ----------
+
+// ---------- settings: their own pane, or the main pane where a second one can't open ----------
+
+const SETTINGS_PANE = 'agent-deck-settings'
+const SETTINGS_TITLE = 'Agent Deck settings'
+
+/** Opens settings in their own pane, beside the deck; where no second pane opens, the main pane draws them instead. */
+const openSettings = async ($: $T) => {
+  await update($, viewAtom, () => ({ mode: 'list' }))
+  const opened = await $.ui.open({ id: SETTINGS_PANE, title: SETTINGS_TITLE, focus: true, closeOnEscape: true }).catch(() => undefined)
+  const isPlaced = opened?.isPlaced === true
+  // An open that waits undrawn would pop up later on its own: settings draw in the main pane now instead.
+  if (!isPlaced) await $.ui.close({ id: SETTINGS_PANE }).catch(() => undefined)
+  await update($, settingsInlineAtom, () => !isPlaced)
+  void refreshRoutedModels($)
+}
+
+/** Done: back to the deck, closing the settings pane when they have one. */
+const closeSettings = async ($: $T) => {
+  const isInline = await read($, settingsInlineAtom)
+  await update($, viewAtom, () => ({ mode: 'cards' }))
+  await update($, modelPickerAtom, () => ({}))
+  await update($, settingsInlineAtom, () => false)
+  if (!isInline) await $.ui.close({ id: SETTINGS_PANE }).catch(() => undefined)
+}
+
+/** Which providers this session used, and which have a reading to show: Codex only while its built-in mode is on. */
+const meterReadings = (list: readonly AgentCard[], hs: readonly Harness[], lim: Limits, isCodexOn: boolean) => {
+  const presetOf = (id?: string) => hs.find(x => x.id === id)?.preset
+  const used = new Set<MeterProvider>(['claude'])
+  for (const c of list) {
+    if (c.provider === 'codex' || presetOf(c.harness) === 'codex-cli') used.add('codex')
+    if (presetOf(c.harness) === 'copilot') used.add('copilot')
+    if (hs.find(x => x.id === c.harness)?.parser === 'antigravity') used.add('antigravity')
+  }
+  const hasReading: Record<MeterProvider, boolean> = {
+    claude: lim.claude.length > 0,
+    codex: isCodexOn && lim.codex.length > 0,
+    copilot: (lim.copilot ?? []).length > 0,
+    antigravity: (lim.antigravity ?? []).length > 0,
+  }
+  return { used, hasReading }
+}
+
+const SETTINGS_TABS: readonly { value: SettingsSection; label: string }[] = [
+  { value: 'harnesses', label: 'Harnesses' },
+  { value: 'routing', label: 'Task routing' },
+  { value: 'meters', label: 'Usage meters' },
+]
+
+/** What each Antigravity view shows, under its picker in Usage meters. */
+const AGY_VIEW_NOTES: Record<AgyView, string> = {
+  basic: "Gemini's 5-hour and weekly limits.",
+  gemini: "Gemini's limits and Gemini 4 Argon's.",
+  all: 'Every Antigravity limit, Claude & GPT too.',
+}
+
+/** A settings card: a quiet round border around one thing. */
+const CARD = { flexDirection: 'column', borderStyle: 'round', borderColor: 'subtle', paddingX: 1 } as const
+
+/**
+ * Draws settings: a header with Done, a tab per section, and the section; or the form that adds or
+ * edits a harness. `isInline`: drawn in the main pane, because a second pane could not open.
+ */
+const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean): Promise<RenderElement> => {
+  const ui = $.ui.resolve(e)
+  const { Box, Text, Button } = ui
+  // Mobile draws no Select or Input yet: it keeps the buttons.
+  const Select = e.surface !== 'mobile' && 'Select' in ui ? ui.Select : undefined
+  const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
+  const list = await read($, agents)
+  const lim = await read($, limits)
+  const view = await read($, viewAtom)
+  const rawSection = await read($, settingsSectionAtom)
+  // An old settingsSection: 'codex' left in session state falls back to Harnesses.
+  const section: SettingsSection = rawSection === 'routing' || rawSection === 'meters' ? rawSection : 'harnesses'
+  const hs = await read($, harnessesAtom)
+  const found = await read($, foundAtom)
+  const codexBin = await read($, codexBinAtom)
+  const isCodexOn = await read($, codexAtom)
+  const meters = await read($, metersAtom)
+  const routingState = await read($, routingAtom)
+  const taskDraft = await read($, taskDraftAtom)
+  const routeTyping = await read($, routeTypingAtom)
+  const modelPicker = await read($, modelPickerAtom)
+  const { hasReading } = meterReadings(list, hs, lim, isCodexOn)
+  const cols = Math.max(24, e.props.bodyColumns || e.viewport?.columns || 60)
+  // A field's least width: it wraps to the next line below that, and never asks for more than a card holds.
+  const fieldMin = (n: number) => Math.max(8, Math.min(n, cols - 6))
+
+  const setView = (v: HarnessView) => update($, viewAtom, () => v)
+  const showSection = async (s: SettingsSection) => {
+    await update($, settingsSectionAtom, () => s)
+    await setView({ mode: 'list' })
+  }
+  const backToHarnesses = () => showSection('harnesses')
+
+  /** A section's title, a short line on what it is for, and a control at the right of the title. */
+  const sectionHead = (title: string, help: string, right?: RenderElement | false) => (
+    <Box flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Text bold>{title}</Text>
+        {right}
+      </Box>
+      <Text dimColor wrap="wrap">
+        {help}
+      </Text>
+    </Box>
+  )
+
+  /** A labelled field: the label above its control, a dim note under it. */
+  const fieldBox = (key: string, label: string, minWidth: number, control: RenderElement | false | undefined, note?: string) => (
+    <Box key={key} flexDirection="column" flexGrow={1} flexShrink={1} minWidth={fieldMin(minWidth)}>
+      <Text dimColor>{label}</Text>
+      {control}
+      {note && (
+        <Text dimColor wrap="truncate-end">
+          {note}
+        </Text>
+      )}
+    </Box>
+  )
+
+  const frame = (body: RenderElement, hasTabs: boolean) => (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Text bold>Settings</Text>
+        <Button key="h-done" label="Done" onPress={() => void closeSettings($)} />
+      </Box>
+      {hasTabs && (
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={0}>
+          {SETTINGS_TABS.map(t => (
+            <Button
+              key={`s-tab-${t.value}`}
+              label={t.label}
+              variant={t.value === section ? 'primary' : undefined}
+              dimColor={t.value !== section}
+              onPress={() => void showSection(t.value)}
+            />
+          ))}
+        </Box>
+      )}
+      {body}
+    </Box>
+  )
+
+  // ---- harnesses: the list, and the form that adds or edits one ----
+
+  const patchDraft = (fn: (d: Harness) => Harness) =>
+    update($, viewAtom, cur => (cur.mode === 'edit' ? { ...cur, draft: fn(cur.draft), error: undefined } : cur))
+  const parserLabel = (p: HarnessParser) => PARSERS.find(x => x.value === p)?.label ?? p
+  const showArgs = (words: string[]) => words.map(w => (/\s/.test(w) || !w ? `"${w}"` : w)).join(' ')
+
+  const harnessRow = (hr: Harness) => (
+    <Box key={`h-${hr.id}`} {...CARD}>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Box flexDirection="column" flexShrink={1} minWidth={0}>
+          <Text wrap="truncate-end">
+            <Text bold color={hr.color}>
+              ● {hr.name}
+            </Text>
+            <Text dimColor> {hr.id}</Text>
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            {[hr.command, parserLabel(hr.parser), hr.model ?? '', hr.provider ? `API ${hr.provider.baseUrl}` : ''].filter(Boolean).join(' · ')}
+          </Text>
+          {found[hr.id] === false && <Text color="warning">{hr.command} is not on PATH</Text>}
+        </Box>
+        <Box flexDirection="row" gap={1} flexShrink={0}>
+          <Button
+            key={`h-toggle-${hr.id}`}
+            label={hr.isEnabled ? 'On' : 'Off'}
+            variant={hr.isEnabled ? 'primary' : undefined}
+            onPress={() => void saveHarnesses($, hs.map(x => (x.id === hr.id ? { ...x, isEnabled: !x.isEnabled } : x)))}
+          />
+          {Input && <Button key={`h-edit-${hr.id}`} label="Edit" onPress={() => void openEdit({ ...hr }, hr.id)} />}
+        </Box>
+      </Box>
+    </Box>
+  )
+
+  const codexRow = (
+    <Box key="h-codex" {...CARD}>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Box flexDirection="column" flexShrink={1} minWidth={0}>
+          <Text wrap="truncate-end">
+            <Text bold color={CODEX_ACCENT}>
+              ● Codex
+            </Text>
+            <Text dimColor> built in</Text>
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            {isCodexOn ? 'the codex tool · live view of every Codex run · usage meters' : 'off'}
+          </Text>
+          {found.codex === false && <Text color="warning">codex is not on PATH</Text>}
+        </Box>
+        <Box flexDirection="row" gap={1} flexShrink={0}>
+          <Button
+            key="cx-toggle"
+            label={isCodexOn ? 'On' : 'Off'}
+            variant={isCodexOn ? 'primary' : undefined}
+            onPress={() => void setCodexEnabled($, !isCodexOn)}
+          />
+          <Button key="cx-edit" label="Edit" onPress={() => void setView({ mode: 'codex' })} />
+        </Box>
+      </Box>
+    </Box>
+  )
+
+  const harnessesSection = () => (
+    <Box flexDirection="column" gap={1}>
+      {sectionHead('Harnesses', 'Coding agents Claude can start in the background with agent_run. Each run gets a live card in the deck.')}
+      {codexRow}
+      {hs.map(harnessRow)}
+      {hs.length === 0 && <Text dimColor>No other harness yet.</Text>}
+      {Select && Input ? (
+        <Box flexDirection="column">
+          <Select
+            key="h-add"
+            label="Add a harness"
+            options={[{ value: '', label: 'Choose a preset…' }, ...PRESETS.map(p => ({ value: p.id, label: p.name }))]}
+            value=""
+            onSelect={v => {
+              const p = PRESETS.find(x => x.id === v)
+              if (p) void openEdit(fromPreset(p, hs.map(h => h.id)))
+            }}
+          />
+          <Text dimColor wrap="wrap">
+            Edit a harness to pick its model from the ones it reports. Copilot and Claude Code can also run on your own API
+            key (BYOK): Edit → Model API, or add the Copilot (own API) preset.
+          </Text>
+        </Box>
+      ) : (
+        <Text dimColor wrap="wrap">
+          Adding and editing harnesses needs the desktop app or the terminal.
+        </Text>
+      )}
+    </Box>
+  )
+
+  const field = (key: string, label: string, value: string, set: (d: Harness, v: string) => Harness) =>
+    Input && (
+      <Input
+        key={key}
+        label={label}
+        value={value}
+        submitLabel="keep"
+        onInput={v => void patchDraft(d => set(d, v))}
+        onSubmit={v => void patchDraft(d => set(d, v))}
+      />
+    )
+
+  /** Where the CLI sends its model calls: its own service, or an API set here (BYOK). */
+  const providerSection = (d: Harness) => {
+    const types = providerTypesFor(d.parser)
+    if (!types.length || !Select) return undefined
+    const p = d.provider
+    const setP = (x: Harness, patch: Partial<HarnessProvider>): Harness => ({
+      ...x,
+      provider: { type: x.provider?.type ?? types[0]!, baseUrl: x.provider?.baseUrl ?? '', ...x.provider, ...patch },
+      // Another endpoint serves other models.
+      models: 'baseUrl' in patch || 'type' in patch ? undefined : x.models,
+    })
+    return (
+      <Box key="h-provider" flexDirection="column" gap={1}>
+        <Select
+          key="h-provider-type"
+          label="Model API"
+          options={[{ value: '', label: "The CLI's own service" }, ...PROVIDER_TYPES.filter(t => types.includes(t.value))]}
+          value={p?.type ?? ''}
+          onSelect={s =>
+            void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined, models: undefined }))
+          }
+        />
+        {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
+        {p && field('h-provider-key', 'API key', p.apiKey ?? '', (x, s) => setP(x, { apiKey: s }))}
+        {p && p.type !== 'anthropic' && d.parser === 'copilot' && (
+          <Select
+            key="h-provider-wire"
+            label="Wire format"
+            options={[
+              { value: 'completions', label: 'Chat Completions' },
+              { value: 'responses', label: 'Responses (GPT-5 series)' },
+            ]}
+            value={p.wireApi ?? 'completions'}
+            onSelect={s => void patchDraft(x => setP(x, { wireApi: s as HarnessProvider['wireApi'] }))}
+          />
+        )}
+        {p && d.parser === 'copilot' && (
+          <Box flexDirection="column" gap={1}>
+            {p.type === 'anthropic' && <Text dimColor wrap="wrap">Use the API root or its /v1 URL; Copilot adds /v1 to requests.</Text>}
+            {field('h-provider-model-id', 'Base model id (optional)', p.modelId ?? '', (x, s) => setP(x, { modelId: s }))}
+            {field('h-provider-wire-model', 'Deployment / wire model (optional)', p.wireModel ?? '', (x, s) => setP(x, { wireModel: s }))}
+            {p.type !== 'anthropic' && p.wireApi === 'responses' && (
+              <Select
+                key="h-provider-transport"
+                label="Responses transport"
+                options={[{ value: 'http', label: 'HTTP' }, { value: 'websockets', label: 'WebSockets' }]}
+                value={p.transport ?? 'http'}
+                onSelect={s => void patchDraft(x => setP(x, { transport: s as HarnessProvider['transport'] }))}
+              />
+            )}
+            <Text dimColor wrap="wrap">Leave these empty to use the selected model for both. For Azure or a fine-tune, give a known base model and the deployment name your API expects.</Text>
+          </Box>
+        )}
+        {p && (
+          <Text dimColor wrap="wrap">
+            {`The key is kept in agent-deck's settings as plain text and handed to the CLI as ${
+              d.parser === 'copilot' ? 'COPILOT_PROVIDER_API_KEY' : 'ANTHROPIC_API_KEY'
+            }; it is not written into run files.`}
+          </Text>
+        )}
+      </Box>
+    )
+  }
+
+  /** Asks the harness for its models; a fixed list fills in at once. */
+  const loadModels = async (d: Harness) => {
+    const how = modelQuery(d)
+    if (!how) return
+    // An answer that comes back after the form moved on to another harness or endpoint is dropped.
+    const isSame = (x: Harness) => x.parser === d.parser && x.command === d.command && x.provider?.baseUrl === d.provider?.baseUrl
+    const patchEdit = (fn: (cur: Extract<HarnessView, { mode: 'edit' }>) => HarnessView) =>
+      update($, viewAtom, cur => (cur.mode === 'edit' && isSame(cur.draft) ? fn(cur) : cur))
+    if ('models' in how) return patchEdit(cur => ({ ...cur, modelsState: undefined, draft: { ...cur.draft, models: how.models } }))
+    await patchEdit(cur => ({ ...cur, modelsState: 'loading' }))
+    const r = await queryModels($, how.query, d)
+    await patchEdit(cur =>
+      'error' in r
+        ? { ...cur, modelsState: { error: r.error } }
+        : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
+    )
+  }
+
+  /** Opens the edit form, asking for the harness's models right away when it has none yet. */
+  const openEdit = async (draft: Harness, originalId?: string) => {
+    await update($, modelPickerAtom, cur => {
+      if (!('h' in cur)) return cur
+      const { h: _h, ...rest } = cur
+      return rest
+    })
+    await setView({ mode: 'edit', draft, originalId })
+    if (!draft.models?.length) await loadModels(draft)
+  }
+
+  const OTHER_MODEL = '__other__'
+
+  /**
+   * Shared model picker used by both the harness edit view and Task routing cards.
+   * Under 64 models it draws one Select; above it, draws a Search models input and
+   * prefix/run group Selects so every model is reachable within 64 options per Select.
+   */
+  const modelPickerControl = (opts: {
+    pickerId: string
+    selectKey: string
+    models: readonly HarnessModel[]
+    selected: string | undefined
+    defaultLabel: string
+    isTyping: boolean
+    hasOther: boolean
+    showLabels: boolean
+    labelOf?: (model: HarnessModel, prefix: string) => string
+    right?: RenderElement | false
+    onSelectModel: (value: string) => void
+    customInput?: RenderElement | false
+  }) => {
+    if (!Select) return undefined
+    const saved = modelPicker[opts.pickerId] ?? {}
+    const filter = saved.filter ?? ''
+    const state = pickerLevels(opts.models, {
+      selected: opts.selected,
+      group: saved.group,
+      filter,
+      defaultLabel: opts.defaultLabel,
+      hasOther: opts.hasOther,
+      otherValue: OTHER_MODEL,
+      isTyping: opts.isTyping,
+      labelOf: opts.labelOf,
+    })
+    const setFilter = (text: string) =>
+      void update($, modelPickerAtom, cur => ({ ...cur, [opts.pickerId]: { ...cur[opts.pickerId], filter: text, group: undefined } }))
+    const setGroup = (depth: number, value: string) =>
+      void update($, modelPickerAtom, cur => ({
+        ...cur,
+        [opts.pickerId]: { ...cur[opts.pickerId], group: [...state.group.slice(0, depth), value] },
+      }))
+    const groupLevels = state.levels.filter((l): l is Extract<PickerLevel, { kind: 'group' }> => l.kind === 'group')
+    const modelLevel = state.levels.find((l): l is Extract<PickerLevel, { kind: 'model' }> => l.kind === 'model')!
+    const isMulti = state.showSearch || groupLevels.length > 0
+    const modelSelect = (
+      <Select
+        key={opts.selectKey}
+        label={opts.showLabels || isMulti ? modelLevel.label : undefined}
+        options={modelLevel.options}
+        value={modelLevel.value}
+        onSelect={v => {
+          if (v && v !== OTHER_MODEL) {
+            void update($, modelPickerAtom, cur =>
+              cur[opts.pickerId]?.group ? { ...cur, [opts.pickerId]: { ...cur[opts.pickerId], group: undefined } } : cur,
+            )
+          }
+          opts.onSelectModel(v)
+        }}
+      />
+    )
+    return (
+      <Box flexDirection="column" gap={opts.showLabels ? 1 : 0}>
+        {state.showSearch && Input && (
+          <Input
+            key={`${opts.selectKey}-search`}
+            label="Search models"
+            placeholder="id or name"
+            value={filter}
+            submitLabel="filter"
+            onInput={setFilter}
+            onSubmit={setFilter}
+          />
+        )}
+        {state.narrowHint && (
+          <Text dimColor wrap="wrap">
+            {state.narrowHint}
+          </Text>
+        )}
+        {filter.trim() && state.matchCount === 0 && (
+          <Text dimColor wrap="wrap">
+            {opts.hasOther ? 'No matching models · pick Other… to type any id' : 'No matching models'}
+          </Text>
+        )}
+        {groupLevels.map(g => (
+          <Select
+            key={`${opts.selectKey}-g-${g.depth}`}
+            label={g.label}
+            options={g.options}
+            value={g.value}
+            onSelect={v => setGroup(g.depth, v)}
+          />
+        ))}
+        <Box flexDirection="row" columnGap={1} alignItems="center" flexWrap={opts.showLabels ? 'wrap' : undefined}>
+          {opts.showLabels ? (
+            modelSelect
+          ) : (
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              {modelSelect}
+            </Box>
+          )}
+          {opts.right}
+        </Box>
+        {opts.isTyping && opts.customInput}
+      </Box>
+    )
+  }
+
+  /**
+   * The model, as one control: a dropdown (or grouped dropdowns + search for large lists) of what
+   * the harness reports (its default first, Other… last), or a text field where it reports nothing.
+   */
+  const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
+    const d = v.draft
+    const how = modelQuery(d)
+    const known: HarnessModel[] = d.models ?? []
+    const st = v.modelsState
+    const isLoading = st === 'loading'
+    const isCustom = !!d.model && !known.some(m => m.id === d.model)
+    const typed = (label: string) => field('h-model', label, d.model ?? '', (x, s) => ({ ...x, model: s }))
+    const refresh = (label: string) => (
+      <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
+    )
+    if (known.length && Select) {
+      const isTyping = v.isTypingModel || isCustom
+      return (
+        <Box key="h-models" flexDirection="column" gap={1}>
+          {modelPickerControl({
+            pickerId: 'h',
+            selectKey: 'h-model-pick',
+            models: known,
+            selected: d.model,
+            defaultLabel: "Default (the CLI's choice)",
+            isTyping,
+            hasOther: true,
+            showLabels: true,
+            right: isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻'),
+            onSelectModel: s =>
+              void update($, viewAtom, cur =>
+                cur.mode !== 'edit'
+                  ? cur
+                  : s === OTHER_MODEL
+                    ? { ...cur, isTypingModel: true }
+                    : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
+              ),
+            customInput: typed('Model id'),
+          })}
+          {st && st !== 'loading' && (
+            <Text color="error" wrap="wrap">
+              {`Could not refresh the models: ${st.error}`}
+            </Text>
+          )}
+        </Box>
+      )
+    }
+    return (
+      <Box key="h-models" flexDirection="column" gap={1}>
+        {isLoading ? (
+          <Text>
+            Model <Text dimColor>· asking {d.provider?.baseUrl ? 'the API' : d.command || 'the CLI'} which models it has…</Text>
+          </Text>
+        ) : (
+          typed('Model')
+        )}
+        {!how && <Text dimColor wrap="wrap">This CLI can't list its models: type the id it takes, or leave it empty for its default.</Text>}
+        {how && st && st !== 'loading' && (
+          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+            <Text color="error" wrap="wrap">
+              {`Could not list models: ${st.error}`}
+            </Text>
+            {refresh('Try again')}
+          </Box>
+        )}
+        {how && !st && refresh('List models')}
+      </Box>
+    )
+  }
+
+  const editView = (v: Extract<HarnessView, { mode: 'edit' }>) => {
+    const d = v.draft
+    const preset = PRESETS.find(p => p.id === d.preset)
+    const others = hs.filter(h => h.id !== v.originalId)
+    const save = async () => {
+      const clean: Harness = {
+        ...d,
+        id: d.id.trim(),
+        name: d.name.trim(),
+        command: d.command.trim(),
+        args: d.args.trim(),
+        color: d.color.trim() || '#14B8A6',
+        model: d.model?.trim() || undefined,
+        autoTier: d.parser === 'copilot' && !d.provider ? d.autoTier?.trim() || undefined : undefined,
+        maxAiCredits: d.parser === 'copilot' ? d.maxAiCredits : undefined,
+        provider: d.provider && {
+          type: d.provider.type,
+          baseUrl: d.provider.baseUrl.trim().replace(/\/+$/, ''),
+          apiKey: d.provider.apiKey?.trim() || undefined,
+          wireApi: d.provider.type !== 'anthropic' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
+          transport: d.provider.type !== 'anthropic' && d.parser === 'copilot' && d.provider.wireApi === 'responses' ? d.provider.transport : undefined,
+          modelId: d.parser === 'copilot' ? d.provider.modelId?.trim() || undefined : undefined,
+          wireModel: d.parser === 'copilot' ? d.provider.wireModel?.trim() || undefined : undefined,
+        },
+      }
+      const error = harnessError(clean, others)
+      if (error) return setView({ ...v, error })
+      await saveHarnesses($, v.originalId ? hs.map(h => (h.id === v.originalId ? clean : h)) : [...hs, clean])
+      return backToHarnesses()
+    }
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text bold>
+          {v.originalId ? 'Edit' : 'Add'} <Text color={d.color}>● {d.name || 'harness'}</Text>
+        </Text>
+        {preset && (
+          <Text dimColor wrap="wrap">
+            {preset.note}
+          </Text>
+        )}
+        {field('h-name', 'Name', d.name, (x, s) => ({
+          ...x,
+          name: s,
+          // A new harness's id follows its name until the id is edited.
+          id: !v.originalId && (x.id === slugId(x.name) || !x.id) ? slugId(s) : x.id,
+        }))}
+        {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
+        {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
+        {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }))}
+        {Select && (
+          <Select
+            key="h-parser"
+            label="Output"
+            options={PARSERS}
+            value={d.parser}
+            onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser, models: undefined }))}
+          />
+        )}
+        {providerSection(d)}
+        {modelSection(v)}
+        {d.parser === 'copilot' && (
+          <Box key="h-copilot" flexDirection="column" gap={1}>
+            {!d.provider && Select && (
+              <Select
+                key="h-auto-tier"
+                label="Auto routing profile"
+                options={[
+                  { value: '', label: "CLI's default" },
+                  { value: 'efficiency', label: 'Efficiency' },
+                  { value: 'balance', label: 'Balance' },
+                  { value: 'intelligence', label: 'Intelligence' },
+                  { value: 'hydrafusion', label: 'Copilot Fusion Standard (preview)' },
+                  { value: 'hydrafusion-max', label: 'Copilot Fusion Max (preview)' },
+                  ...(d.autoTier && !['efficiency', 'balance', 'intelligence', 'hydrafusion', 'hydrafusion-max'].includes(d.autoTier) ? [{ value: d.autoTier, label: d.autoTier }] : []),
+                ]}
+                value={d.autoTier ?? ''}
+                onSelect={s => void patchDraft(x => ({ ...x, autoTier: s || undefined, model: s ? 'auto' : x.model }))}
+              />
+            )}
+            {field('h-max-credits', 'AI credit limit (optional, minimum 30)', d.maxAiCredits === undefined ? '' : String(d.maxAiCredits), (x, s) => ({ ...x, maxAiCredits: s.trim() ? Number(s) : undefined }))}
+            <Text dimColor wrap="wrap">Fusion availability depends on your CLI and account. Limits include subagents and may be exceeded by the final response; BYOK provider charges are separate.</Text>
+          </Box>
+        )}
+        {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
+        <Text dimColor wrap="wrap">
+          {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
+        </Text>
+        <Text dimColor wrap="wrap">
+          runs: <Text>{copilotOptionsError(d) ?? `${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', usageFile: '<run usage file>' }))}`}</Text>
+          {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
+        </Text>
+        {v.error && (
+          <Text color="error" wrap="wrap">
+            {v.error}
+          </Text>
+        )}
+        <Box flexDirection="row" gap={1} flexWrap="wrap">
+          <Button key="h-save" label="Save" variant="primary" onPress={() => void save()} />
+          <Button key="h-cancel" label="Cancel" onPress={() => void backToHarnesses()} />
+          {v.originalId && (
+            <Button
+              key="h-delete"
+              label="Delete"
+              onPress={() => {
+                void saveHarnesses($, hs.filter(h => h.id !== v.originalId)).then(() => backToHarnesses())
+              }}
+            />
+          )}
+        </Box>
+      </Box>
+    )
+  }
+
+  // ---- task routing: a card per kind of task, and the switch that tells Claude ----
+
+  const targetName = (t: string) =>
+    !t ? 'not set' : t === 'codex' ? 'Codex (built in)' : t === 'claude' ? 'Claude subagent' : (hs.find(h => h.id === t)?.name ?? t)
+
+  const setRoute = (task: string, patch: Partial<TaskRoute>) =>
+    saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
+
+  const setRouteTyping = (task: string, on: boolean) =>
+    update($, routeTypingAtom, cur => (on ? (cur.includes(task) ? cur : [...cur, task]) : cur.filter(t => t !== task)))
+
+  /** The route's model: a picker of what its agent reports (grouped + searchable above 64, with Other…), with ↻ to ask again, or a field to type the id. */
+  const routeModelField = (r: TaskRoute) => {
+    const target = hs.find(x => x.id === r.target)
+    const models = routeModels(r.target, target, codexBin.chosen?.models)
+    const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
+    const defaultModel = r.target === 'codex' ? codexDefaults.model : target?.model
+    const how = target && modelQuery(target)
+    const canRefresh = r.target === 'codex' || (!!how && 'query' in how)
+    const refreshButton = canRefresh && (
+      <Button key={`r-refresh-${r.task}`} label="↻" plain dimColor onPress={() => void refreshRoutedModels($, { only: r.target, force: true })} />
+    )
+    const picked = known.find(k => k.value === r.model)
+    const isCustom = !!r.model && !picked
+    const note = r.model ? picked?.detail : defaultModel && r.target !== 'claude' ? `default: ${defaultModel}` : undefined
+    let control: RenderElement | undefined
+    if (Select && models.length) {
+      const isTyping = !!Input && (routeTyping.includes(r.task) || isCustom)
+      control = modelPickerControl({
+        pickerId: `r-${r.task}`,
+        selectKey: `r-model-${r.task}`,
+        models,
+        selected: r.model,
+        defaultLabel: r.target === 'claude' ? "Claude's choice" : 'Default',
+        isTyping,
+        hasOther: !!Input,
+        showLabels: false,
+        labelOf: routeModelOptionLabel,
+        right: refreshButton,
+        onSelectModel: v => {
+          if (v === OTHER_MODEL) void setRouteTyping(r.task, true)
+          else void setRouteTyping(r.task, false).then(() => setRoute(r.task, { model: v || undefined }))
+        },
+        customInput: Input && (
+          <Input
+            key={`r-model-input-${r.task}`}
+            value={r.model ?? ''}
+            placeholder={defaultModel ?? 'model id'}
+            submitLabel="keep"
+            onSubmit={v => {
+              const clean = v.trim() || undefined
+              const isKnown = !clean || known.some(k => k.value === clean)
+              void setRouteTyping(r.task, !isKnown).then(() => setRoute(r.task, { model: clean }))
+            }}
+          />
+        ),
+      })
+    } else if (Input) {
+      control = (
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Input
+              key={`r-model-${r.task}`}
+              value={r.model ?? ''}
+              placeholder={defaultModel ?? 'default'}
+              submitLabel="keep"
+              onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
+            />
+          </Box>
+          {refreshButton}
+        </Box>
+      )
+    }
+    return control && fieldBox(`r-f-model-${r.task}`, 'Model', 22, control, note)
+  }
+
+  /** The route's effort: the levels its agent takes, in sentence case, or a dim line where it takes none. */
+  const routeEffortField = (r: TaskRoute) => {
+    const choices = routeEffortChoices(r.target, hs.find(x => x.id === r.target))
+    if (!choices) return undefined
+    if ('reason' in choices) {
+      return fieldBox(
+        `r-f-effort-${r.task}`,
+        'Effort',
+        12,
+        <Text dimColor>No effort setting</Text>,
+        choices.reason,
+      )
+    }
+    if (!Select) return undefined
+    const options = [
+      { value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' },
+      ...choices.levels.map(l => ({ value: l, label: effortLabel(l) })),
+      ...(r.effort && !choices.levels.includes(r.effort) ? [{ value: r.effort, label: `${effortLabel(r.effort)} · not taken` }] : []),
+    ]
+    return fieldBox(
+      `r-f-effort-${r.task}`,
+      'Effort',
+      12,
+      <Select key={`r-effort-${r.task}`} options={options} value={r.effort ?? ''} onSelect={v => void setRoute(r.task, { effort: v || undefined })} />,
+    )
+  }
+
+  const routeCard = (r: TaskRoute) => {
+    const problem = routeProblem(r, hs, isCodexOn)
+    const hint = taskHint(r.task)
+    const targets = [
+      { value: '', label: 'Not set' },
+      { value: 'claude', label: 'Claude subagent' },
+      { value: 'codex', label: `Codex (built in)${isCodexOn ? '' : ' · off'}` },
+      ...hs.map(h => ({ value: h.id, label: `${h.name}${h.isEnabled ? '' : ' · off'}` })),
+      ...(r.target && r.target !== 'claude' && r.target !== 'codex' && !hs.some(h => h.id === r.target) ? [{ value: r.target, label: `${r.target} · missing` }] : []),
+    ]
+    return (
+      <Box key={`r-${r.task}`} {...CARD}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+          <Box flexDirection="row" columnGap={1} flexShrink={1} minWidth={0} overflow="hidden">
+            <Text bold>{r.task}</Text>
+            {hint && (
+              <Text dimColor wrap="truncate-end">
+                {hint}
+              </Text>
+            )}
+          </Box>
+          {Select && (
+            <Button
+              key={`r-remove-${r.task}`}
+              label="Remove"
+              plain
+              dimColor
+              onPress={() => void saveRouting($, { ...routingState, routes: routingState.routes.filter(x => x.task !== r.task) })}
+            />
+          )}
+        </Box>
+        {Select ? (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2} rowGap={0}>
+            {fieldBox(
+              `r-f-agent-${r.task}`,
+              'Agent',
+              16,
+              <Select
+                key={`r-target-${r.task}`}
+                options={targets}
+                value={r.target}
+                onSelect={v =>
+                  void setRouteTyping(r.task, false)
+                    .then(() =>
+                      update($, modelPickerAtom, cur => {
+                        const k = `r-${r.task}`
+                        if (!(k in cur)) return cur
+                        const { [k]: _drop, ...rest } = cur
+                        return rest
+                      }),
+                    )
+                    .then(() => setRoute(r.task, { target: v, model: undefined, effort: undefined }))
+                    .then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))
+                }
+              />,
+              r.target ? undefined : 'Pick one to choose its model and effort.',
+            )}
+            {r.target ? routeModelField(r) : undefined}
+            {r.target ? routeEffortField(r) : undefined}
+          </Box>
+        ) : (
+          <Text dimColor wrap="wrap">{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}${r.effort ? ` · effort ${effortLabel(r.effort)}` : ''}`}</Text>
+        )}
+        {problem && <Text color="warning" wrap="wrap">{`Can't run: ${problem}.`}</Text>}
+      </Box>
+    )
+  }
+
+  const addTask = (text: string) => {
+    const task = taskSlug(text)
+    if (!task || routingState.routes.some(r => r.task === task)) return
+    void saveRouting($, { ...routingState, routes: [...routingState.routes, { task, target: '' }] }).then(() => update($, taskDraftAtom, () => ''))
+  }
+
+  const routingSection = () => {
+    const isOn = routingState.isOn
+    const missing = DEFAULT_TASKS.filter(t => !routingState.routes.some(r => r.task === t.task))
+    return (
+      <Box flexDirection="column" gap={1}>
+        {sectionHead(
+          'Task routing',
+          'Who does each kind of work: an agent, its model and its effort per task.',
+          <Button key="r-toggle" label={isOn ? 'On' : 'Off'} variant={isOn ? 'primary' : undefined} onPress={() => void saveRouting($, { ...routingState, isOn: !isOn })} />,
+        )}
+        <Text dimColor wrap="wrap">
+          {isOn
+            ? 'On: Claude hands each kind of task to the agent you pick here, and keeps quick questions and small edits itself. Changes reach Claude with your next message.'
+            : 'Off: Claude places work as usual. Pick an agent for each kind of task, then switch this on, here or with /agent-deck routing on.'}
+        </Text>
+        {routingState.routes.map(routeCard)}
+        {routingState.routes.length === 0 && <Text dimColor>No tasks yet.</Text>}
+        {Input && (
+          <Box flexDirection="row" columnGap={1} alignItems="center">
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Input
+                key="r-add"
+                value={taskDraft}
+                placeholder="Add a task, for example tests or docs"
+                submitLabel="add"
+                onInput={v => void update($, taskDraftAtom, () => v)}
+                onSubmit={v => addTask(v)}
+              />
+            </Box>
+            <Button key="r-add-button" label="Add" onPress={() => addTask(taskDraft)} />
+          </Box>
+        )}
+        {Select && missing.length > 0 && (
+          <Button
+            key="r-defaults"
+            label={`Add back ${missing.map(t => t.task).join(', ')}`}
+            plain
+            dimColor
+            onPress={() => void saveRouting($, { ...routingState, routes: [...routingState.routes, ...missing.map(t => ({ task: t.task, target: '' }))] })}
+          />
+        )}
+      </Box>
+    )
+  }
+
+  // ---- usage meters: which providers show, and how many Antigravity windows ----
+
+  const METER_MODES: { value: MeterChoice['mode']; label: string }[] = [
+    { value: 'all', label: 'All connected' },
+    { value: 'session', label: 'Used in this session' },
+    { value: 'selected', label: 'Selected' },
+  ]
+  const meterNote = (id: MeterProvider): string => {
+    if (id === 'claude') return 'this session.'
+    if (id === 'antigravity') return hasReading.antigravity ? 'read from agy, as /usage shows them.' : 'needs an Antigravity harness switched on, and agy signed in.'
+    if (id === 'codex') return isCodexOn ? 'read live from the Codex CLI, falling back to its last session file.' : 'needs the built-in Codex on.'
+    return hasReading.copilot ? 'AI credits via gh.' : 'needs the GitHub CLI (gh) signed in to an account with Copilot.'
+  }
+  const agyView = meters.agyView ?? 'basic'
+
+  const metersSection = () => (
+    <Box flexDirection="column" gap={1}>
+      {sectionHead('Usage meters', "Which providers' limits show in the deck, and how many of Antigravity's.")}
+      <Box {...CARD}>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2} rowGap={0}>
+          {fieldBox(
+            'm-f-mode',
+            'Show',
+            20,
+            Select ? (
+              <Select key="m-mode" options={METER_MODES} value={meters.mode} onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })} />
+            ) : (
+              <Text>{METER_MODES.find(m => m.value === meters.mode)?.label ?? meters.mode}</Text>
+            ),
+          )}
+          {fieldBox(
+            'm-f-agy',
+            'Antigravity',
+            20,
+            Select ? (
+              <Select key="m-agy-view" options={AGY_VIEWS} value={agyView} onSelect={v => void saveMeters($, { ...meters, agyView: v as AgyView })} />
+            ) : (
+              <Text>{AGY_VIEWS.find(v => v.value === agyView)?.label ?? agyView}</Text>
+            ),
+            AGY_VIEW_NOTES[agyView],
+          )}
+        </Box>
+        {meters.mode === 'selected' && (
+          <Box flexDirection="row" gap={1} flexWrap="wrap" marginTop={1}>
+            {METER_PROVIDERS.map(({ id: x, name }) => {
+              const isOn = meters.selected.includes(x)
+              return (
+                <Button
+                  key={`m-${x}`}
+                  label={`${name} ${isOn ? '✓' : '·'}`}
+                  variant={isOn ? 'primary' : undefined}
+                  onPress={() => void saveMeters($, { ...meters, selected: isOn ? meters.selected.filter(y => y !== x) : [...meters.selected, x] })}
+                />
+              )
+            })}
+          </Box>
+        )}
+      </Box>
+      <Box {...CARD}>
+        {METER_PROVIDERS.map(({ id, name }) => (
+          <Text key={`m-note-${id}`} wrap="wrap">
+            <Text bold>{name}</Text>
+            <Text dimColor>{`: ${meterNote(id)}`}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Text dimColor wrap="wrap">
+        The Usage limits header in the deck switches between these views too, folds the meters into one line, and refreshes
+        them. The Antigravity title there switches its view.
+      </Text>
+    </Box>
+  )
+
+  // ---- Codex: built in, a custom harness, or off; and which CLI runs start with ----
+
+  const codexHarnesses = hs.filter(x => x.preset === 'codex-cli')
+  const codexMode = isCodexOn ? 'builtin' : codexHarnesses.some(x => x.isEnabled) ? 'custom' : 'off'
+
+  const pickCodexMode = async (mode: string) => {
+    if (mode === 'builtin' || mode === 'off') {
+      if (codexHarnesses.some(x => x.isEnabled)) {
+        await saveHarnesses($, hs.map(x => (x.preset === 'codex-cli' ? { ...x, isEnabled: false } : x)))
+      }
+      await setCodexEnabled($, mode === 'builtin')
+      return
+    }
+    await setCodexEnabled($, false)
+    const existing = codexHarnesses[0]
+    if (existing) {
+      await saveHarnesses($, hs.map(x => (x.id === existing.id ? { ...x, isEnabled: true } : x)))
+      return openEdit({ ...existing, isEnabled: true }, existing.id)
+    }
+    const preset = PRESETS.find(x => x.id === 'codex-cli')
+    if (preset) return openEdit(fromPreset(preset, hs.map(x => x.id)))
+  }
+
+  /** Which Codex CLI runs start with: the newest found, or a path set here or in CODEX_PATH. */
+  const codexBinSection = () => {
+    const b = codexBin
+    const note = codexUpdateNote(b.chosen, b.latest)
+    const others = (b.candidates ?? []).filter(c => c.path !== b.chosen?.path)
+    return (
+      <Box flexDirection="column">
+        <Text bold>Codex CLI</Text>
+        {b.at === undefined && !b.isChecking && <Text dimColor>Not checked yet. Look for Codex to see which one runs start with.</Text>}
+        {b.chosen && (
+          <Text wrap="wrap">
+            Runs start with codex-cli {b.chosen.version} · {b.chosen.path}
+            {b.override ? ' (set by hand)' : ' (the newest found)'}
+          </Text>
+        )}
+        {b.at !== undefined && !b.chosen && (
+          <Text color="error" wrap="wrap">
+            {b.override
+              ? `The Codex set by hand (${b.override}) does not run: ${b.candidates?.[0]?.error ?? 'unknown error'}`
+              : `No Codex CLI found. Install it with: ${CODEX_UPDATE_COMMAND}`}
+          </Text>
+        )}
+        {note && (
+          <Text color="warning" wrap="wrap">
+            {note}
+          </Text>
+        )}
+        {b.latest && !note && b.chosen && <Text dimColor>That is the newest published version.</Text>}
+        {b.updateError && (
+          <Text color="error" wrap="wrap">
+            The update failed: {b.updateError}
+          </Text>
+        )}
+        {others.map(c => (
+          <Text key={`cx-c-${c.path}`} dimColor wrap="truncate-end">
+            also: {c.version ? `codex-cli ${c.version}` : c.error} · {c.path}
+          </Text>
+        ))}
+        {Input && (
+          <Input
+            key="cx-path"
+            label="Codex path (blank: the newest found; CODEX_PATH wins)"
+            value={b.override && !b.isEnvOverride ? b.override : ''}
+            submitLabel="save"
+            onSubmit={v =>
+              void (async () => {
+                await $.store.set(KEY_CODEX_PATH, v.trim())
+                await findCodex($, { force: true })
+              })()
+            }
+          />
+        )}
+        <Box flexDirection="row" gap={1}>
+          <Button key="cx-find" label={b.isChecking && !b.isUpdating ? 'Looking…' : 'Look again'} onPress={() => void findCodex($, { force: true })} />
+          <Button
+            key="cx-update"
+            label={b.isUpdating ? 'Updating…' : 'Update Codex (npm)'}
+            variant={note ? 'primary' : undefined}
+            onPress={() => void findCodex($, { update: true })}
+          />
+        </Box>
+      </Box>
+    )
+  }
+
+  const codexEditView = () => (
+    <Box flexDirection="column" gap={1}>
+      <Text bold>
+        Edit <Text color={CODEX_ACCENT}>● Codex</Text>
+      </Text>
+      <Text dimColor wrap="wrap">
+        How Codex runs, and which Codex CLI it starts.
+      </Text>
+      <Box {...CARD}>
+        {Select && (
+          <Select
+            key="cx-mode"
+            label="Runs as"
+            options={[
+              { value: 'builtin', label: 'Built in' },
+              { value: 'custom', label: 'Custom harness' },
+              { value: 'off', label: 'Off' },
+            ]}
+            value={codexMode}
+            onSelect={v => void pickCodexMode(v)}
+          />
+        )}
+        <Text dimColor wrap="wrap">
+          Built in: the codex tool (model, effort, sandbox, resume), a live card for every Codex run, also ones started in a
+          terminal or the Codex app, and Codex usage meters.
+        </Text>
+        <Text dimColor wrap="wrap">
+          Custom harness: Codex runs through agent_run like the other harnesses, with a command and arguments you edit.
+          Only its own runs get cards, and there are no usage meters.
+        </Text>
+      </Box>
+      <Box {...CARD}>{codexBinSection()}</Box>
+      <Box flexDirection="row" gap={1} flexWrap="wrap">
+        <Button key="cx-done" label="Done" variant="primary" onPress={() => void backToHarnesses()} />
+      </Box>
+    </Box>
+  )
+
+  // A settings view that fails to draw says why and keeps a way back, not a blank pane.
+  const orBack = (draw: () => RenderElement): RenderElement => {
+    try {
+      return draw()
+    } catch (err) {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="error" wrap="wrap">{`agent-deck could not draw this view: ${String((err as Error)?.message ?? err)}`}</Text>
+          <Button key="h-recover" label="Back to agents" onPress={() => void closeSettings($)} />
+        </Box>
+      )
+    }
+  }
+  if (view.mode === 'edit') return orBack(() => frame(editView(view), false))
+  if (view.mode === 'codex') {
+    if (codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
+    return orBack(() => frame(codexEditView(), false))
+  }
+  return orBack(() =>
+    frame(section === 'routing' ? routingSection() : section === 'meters' ? metersSection() : harnessesSection(), true),
+  )
+}
+
 
 export const register: Register = on => {
   // ---- the main conversation's prompt cache ----
@@ -1995,18 +3720,53 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     // Registered before next(e) so the tools are listed from the first turn.
+    // Routing first: it is a store read, while the Codex check starts a process.
+    await loadRoutingSetting($).catch(() => undefined)
     await loadCodexEnabled($).catch(() => undefined)
     if (codexOn) await registerCodexTools($)
-    await loadRoutingSetting($).catch(() => undefined)
     routingSent = undefined
     await loadHarnesses($).catch(err => $.ui.toast(`agent-deck: harnesses not loaded: ${String((err as Error)?.message ?? err)}`))
     const started = await next(e)
     sessionId = await $.session.id()
-    for (const c of await read($, agents)) {
-      // Claude subagents can't outlive a reload; Codex runs are re-read from disk below.
-      const isStale = c.status === 'running' && c.provider === 'claude'
-      cards.set(c.id, isStale ? { ...c, status: 'aborted' } : c)
+    const now = await $.clock.now()
+    hasLoggedCardSaveError = false
+    cards.clear()
+    threadToCard.clear()
+    restoredWatermark.clear()
+    const fromAtom = await read($, agents)
+    const isSameProcess = fromAtom.length > 0
+    // Migrate legacy shared `cards` key once into per-session `cards:<sid>` + `cards-index`.
+    const legacyCards = await $.store.get(KEY_CARDS).catch(() => undefined)
+    if (legacyCards !== undefined) {
+      try {
+        const existingIndex = await $.store.get(KEY_CARDS_INDEX).catch(() => undefined)
+        const { sessions, index } = migrateLegacyCards(legacyCards, existingIndex, now, {
+          maxCards: MAX_CARDS,
+          maxOutput: MAX_OUTPUT,
+          maxBytes: CARD_MAX_BYTES,
+        })
+        for (const [sid, entry] of Object.entries(sessions)) {
+          await $.store.set(cardsKey(sid), entry)
+        }
+        if (Object.keys(index).length > 0 || Object.keys(sessions).length > 0) {
+          await $.store.set(KEY_CARDS_INDEX, index)
+        }
+        await $.store.delete(KEY_CARDS)
+      } catch {}
+    }
+    const perSessionRaw = isSameProcess ? undefined : await $.store.get(cardsKey(sessionId)).catch(() => undefined)
+    const initial = isSameProcess
+      ? fromAtom
+      : perSessionRaw !== undefined
+        ? loadSingleSessionCards(perSessionRaw, MAX_OUTPUT)
+        : loadSessionCards(legacyCards, sessionId, MAX_OUTPUT)
+    for (const raw of initial) {
+      // On a hot reload (cards came from $.state), running Claude subagents are still alive;
+      // on a fresh start (loaded from $.store), they aren't. Stale external Codex cards still stop.
+      const c = restoreCard(raw, now, STALE_MS, isSameProcess)
+      cards.set(c.id, c)
       if (c.threadId) threadToCard.set(c.threadId, c.id)
+      if (c.provider === 'codex' && c.lastEventAt !== undefined) restoredWatermark.set(c.id, c.lastEventAt)
     }
     await $.command.register({
       name: 'agent-deck',
@@ -2018,15 +3778,27 @@ export const register: Register = on => {
       const toml = await readText($, `${home}/config.toml`)
       if (toml) codexDefaults = parseCodexConfig(toml)
     }
+    // A session started again in this copy of the module polls afresh.
+    runPoller?.cancel()
+    runPoller = undefined
+    harnessPoller?.cancel()
+    harnessPoller = undefined
+    isPollingRuns = false
+    isPollingHarness = false
     const root = await runsRoot($)
     if (root) await loadRuns($, root)
     await loadHarnessRuns($)
+    if (anyRunning()) startTicking($)
+    await persist($)
     if (codexOn) await startCodexWatcher($)
+    // A reload can cut a refresh short: the limits outlive it, the refresh doesn't.
+    await update($, limits, l => (l.isRefreshing ? { ...l, isRefreshing: false } : l))
     void refreshClaudeLimits($)
     poller = $.clock.every(60_000, () => void refreshClaudeLimits($))
     await loadMeters($).catch(() => undefined)
     void startCopilotLimits($)
     startAgyLimits($)
+    startCodexLimits($)
     openPane($)
     strataSince = (await $.clock.now()) - 5000
     strataTimer = $.clock.every(1000, () => void pollStrata($))
@@ -2039,17 +3811,24 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    if (flushPending) await persist($)
+    await releaseUnsentClaims($).catch(() => undefined)
     cacheTicker?.cancel()
     cacheSessionEnd()
     strataTimer?.cancel()
     poller?.cancel()
     ticker?.cancel()
+    ticker = undefined
     runPoller?.cancel()
+    runPoller = undefined
     harnessPoller?.cancel()
+    harnessPoller = undefined
     copilotPoller?.cancel()
     copilotPoller = undefined
     agyPoller?.cancel()
     agyPoller = undefined
+    codexLimitsPoller?.cancel()
+    codexLimitsPoller = undefined
     return next(e)
   })
 
@@ -2063,7 +3842,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
-    if (card && card.status === 'running') {
+    if (card && (card.status === 'running' || (card.provider === 'claude' && card.status === 'aborted'))) {
       card.status = e.isAborted ? 'aborted' : e.reason === 'error' ? 'error' : 'done'
       card.endedAt = await $.clock.now()
       card.isThinking = false
@@ -2102,6 +3881,7 @@ export const register: Register = on => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
     if (!card) return yield* next(e)
 
+    reviveClaudeCard($, card)
     card.model = e.model
     if (e.effort !== undefined) card.effort = String(e.effort)
     if (card.output && !card.output.endsWith('\n')) appendOutput(card, '\n')
@@ -2144,6 +3924,7 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
     if (!card || [TOOL, RESULT_TOOL, AGENT_TOOL, AGENT_RESULT_TOOL].includes(e.tool)) return next(e)
+    reviveClaudeCard($, card)
     const mark = (status: Activity['status'], label?: string) => {
       card.activity = card.activity.map(a =>
         a.id === e.tool_use_id ? { ...a, status, label: label ?? a.label } : a,
@@ -2260,20 +4041,25 @@ export const register: Register = on => {
   // ---- other harnesses ----
 
   on('tool.call', { tool: 'mcp__agent-deck__agent_run' }, async ($, e) => {
+    await syncSettings($).catch(() => undefined)
     const asked = e as unknown as AgentRunInput
     const resolved = resolveRun(asked, routing, harnessList, codexOn)
     if ('error' in resolved) return { deny: `agent-deck: ${resolved.error}` }
-    const input: AgentRunInput = { ...asked, harness: resolved.harness, model: resolved.model, title: asked.title ?? (asked.task && !asked.harness ? `${taskSlug(asked.task)}: ${asked.prompt.replace(/\s+/g, ' ').slice(0, 50)}` : undefined) }
+    const input: AgentRunInput = { ...asked, harness: resolved.harness, model: resolved.model, effort: resolved.effort, title: asked.title ?? (asked.task && !asked.harness ? `${taskSlug(asked.task)}: ${asked.prompt.replace(/\s+/g, ' ').slice(0, 50)}` : undefined) }
     const h = harnessList.find(x => x.id === input.harness)
     if (!h) {
       const ids = harnessList.filter(x => x.isEnabled).map(x => x.id)
       return { deny: `agent-deck: no harness "${input.harness}". ${ids.length ? `Enabled: ${ids.join(', ')}.` : 'None is enabled: add one under ⚙ Settings in the Agents pane.'}` }
     }
     if (!h.isEnabled) return { deny: `agent-deck: the ${h.name} harness is switched off in the Agents pane.` }
+    const effortError = effortProblem(h, asked.effort)
+    if (effortError) return { deny: `agent-deck: not started. ${effortError}` }
+    // A route's effort that this harness doesn't take (its CLI changed since) is left out.
+    if (input.effort && effortProblem(h, input.effort)) input.effort = undefined
     const run = await launchHarnessRun($, h, input)
     return {
       result:
-        `${h.name} run ${run.id} started in the background (model ${run.model ?? 'default'}). ` +
+        `${h.name} run ${run.id} started in the background (model ${run.model ?? 'default'}${run.effort ? `, effort ${run.effort}` : ''}). ` +
         `Its report will arrive as a new message when it finishes; don't wait or poll for it. ` +
         `Continue with other work, or end your turn if there is nothing else to do. agent_result with id "${run.id}" shows its progress.`,
     }
@@ -2384,16 +4170,16 @@ export const register: Register = on => {
     const lim = await read($, limits)
     const cache = await read($, cacheAtom)
     const open = new Set(await read($, expanded))
+    const fullOut = new Set(await read($, fullOutputAtom))
     const n = await read($, tick)
     const now = await $.clock.now()
     const view = await read($, viewAtom)
     const hs = await read($, harnessesAtom)
-    const found = await read($, foundAtom)
-    const codexBin = await read($, codexBinAtom)
     const isCodexOn = await read($, codexAtom)
     const meters = await read($, metersAtom)
     const routingState = await read($, routingAtom)
-    const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
+    // Where settings could not open a pane of their own, this pane draws them until Done.
+    if (view.mode !== 'cards' && (await read($, settingsInlineAtom))) return renderSettings($, e, true)
     // Surfaces that draw SVG get thick bars; the terminal keeps its text meters.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
     // The body's own width: the viewport is the whole window, wider than a docked pane.
@@ -2419,20 +4205,24 @@ export const register: Register = on => {
     const maxWindows = Math.max(1, lim.codex.length, lim.claude.length)
     const isSideBySide = glyph === 1 && cols >= 7 + maxWindows * windowCols + (maxWindows - 1) * 2 + 2
 
-    const limitWindow = (name: string, w: LimitWindow) => (
-      <Box key={`${name}-${w.label}`} flexDirection="row" gap={1} flexShrink={0}>
-        <Box width={Math.max(2, w.label.length)} flexShrink={0}>
-          <Text dimColor>{w.label}</Text>
+    const limitWindow = (name: string, w: LimitWindow) => {
+      const isPast = isResetPast(w, now)
+      const shownPercent = isPast ? 0 : w.percent
+      return (
+        <Box key={`${name}-${w.label}`} flexDirection="row" gap={1} flexShrink={0}>
+          <Box width={Math.max(2, w.label.length)} flexShrink={0}>
+            <Text dimColor>{w.label}</Text>
+          </Box>
+          {meter(`${name}-${w.label}-m`, shownPercent, limitColor(shownPercent))}
+          <Box width={5} flexShrink={0} justifyContent="flex-end">
+            <Text bold={!isPast} color={isPast ? undefined : limitColor(shownPercent)} dimColor={isPast}>
+              {`${Math.round(shownPercent)}%`}
+            </Text>
+          </Box>
+          {w.resetsAt !== undefined && <Text dimColor>{isPast ? 'reset since this reading' : `↻${fmtSpan(w.resetsAt - now)}`}</Text>}
         </Box>
-        {meter(`${name}-${w.label}-m`, w.percent, limitColor(w.percent))}
-        <Box width={5} flexShrink={0} justifyContent="flex-end">
-          <Text bold color={limitColor(w.percent)}>
-            {`${Math.round(w.percent)}%`}
-          </Text>
-        </Box>
-        {w.resetsAt !== undefined && <Text dimColor>{`↻${fmtReset(w.resetsAt, now)}`}</Text>}
-      </Box>
-    )
+      )
+    }
 
     // A fixed-width name column keeps the meters aligned in a proportional font too.
     const nameCell = (name: string, color: string, isShown: boolean) => (
@@ -2448,42 +4238,79 @@ export const register: Register = on => {
     const bar = (key: string, percent: number, fill: string) =>
       Svg && <Svg key={key} source={barSvg(percent, fill)} alt={`${Math.round(percent)}% used`} height={6} />
 
-    const limitBars = (name: string, color: string, ws: LimitWindow[], extra?: string) => (
-      <Box key={`lim-${name}`} flexDirection="column" marginBottom={1}>
-        <Text>
+    const limitBars = (name: string, color: string, ws: LimitWindow[], extra?: string, control?: RenderElement, empty = 'no reading yet') => {
+      const title = (
+        <Text wrap="wrap">
           <Text bold color={color}>
             {name}
           </Text>
           {extra && <Text dimColor> · {extra}</Text>}
         </Text>
-        {ws.length === 0 && <Text dimColor>no reading yet</Text>}
-        {ws.map(w => (
-          <Box key={`${name}-${w.label}`} flexDirection="column">
-            <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
-              <Text>{windowName(w)}</Text>
-              <Box flexDirection="row" columnGap={1} flexShrink={0}>
-                {w.resetsAt !== undefined && <Text dimColor>resets in {fmtReset(w.resetsAt, now)}</Text>}
-                <Text bold color={limitColor(w.percent)}>
-                  {`${Math.round(w.percent)}%`}
-                </Text>
+      )
+      return (
+        <Box key={`lim-${name}`} flexDirection="column">
+          {control ? (
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+              <Box flexShrink={1} minWidth={0}>
+                {title}
               </Box>
+              <Box flexShrink={0}>{control}</Box>
             </Box>
-            {bar(`${name}-${w.label}-bar`, w.percent, SVG_COLORS[limitColor(w.percent)])}
-          </Box>
-        ))}
-      </Box>
-    )
+          ) : (
+            title
+          )}
+          {ws.length === 0 && empty && <Text dimColor>{empty}</Text>}
+          {ws.map(w => {
+            const isPast = isResetPast(w, now)
+            const shownPercent = isPast ? 0 : w.percent
+            return (
+              <Box key={`${name}-${w.label}`} flexDirection="column">
+                <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
+                  <Text wrap="truncate-end">{windowName(w)}</Text>
+                  <Box flexDirection="row" columnGap={1} flexShrink={0}>
+                    {w.resetsAt !== undefined && <Text dimColor>{resetNote(w, now)}</Text>}
+                    <Text bold={!isPast} color={isPast ? undefined : limitColor(shownPercent)} dimColor={isPast}>
+                      {`${Math.round(shownPercent)}%`}
+                    </Text>
+                  </Box>
+                </Box>
+                {bar(`${name}-${w.label}-bar`, shownPercent, isPast ? '#8B949E' : SVG_COLORS[limitColor(shownPercent)])}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
 
-    const limitRow = (name: string, color: string, ws: LimitWindow[], extra?: string) =>
-      Svg ? limitBars(name, color, ws, extra) : limitText(name, color, ws, extra)
+    /** A provider's meters, with how old the reading is once that matters. */
+    const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string, control?: RenderElement, empty?: string) => {
+      const hasPast = ws.some(w => isResetPast(w, now))
+      const codexError = p === 'codex' ? lim.codexError : undefined
+      const codexRetry = <Button key="lim-codex-retry" label="Retry" plain dimColor onPress={() => void refreshCodexLimits($)} />
+      const rowControl = p === 'codex' && ws.length === 0 && !codexError ? codexRetry : control
+      const rowEmpty = p === 'codex' && ws.length === 0 && codexError ? '' : empty
+      const extra = [plan, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
+      return (
+        <Box key={`lim-row-${p}`} flexDirection="column" marginBottom={Svg ? 1 : 0}>
+          {Svg ? limitBars(name, color, ws, extra, rowControl, rowEmpty) : limitText(name, color, ws, extra, rowControl, rowEmpty)}
+          {codexError && (
+            <Box key="lim-codex-err" flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
+              <Text dimColor wrap="wrap">{`Live reading failed: ${codexError}`}</Text>
+              {codexRetry}
+            </Box>
+          )}
+        </Box>
+      )
+    }
 
-    const limitText = (name: string, color: string, ws: LimitWindow[], extra?: string) =>
+    const limitText = (name: string, color: string, ws: LimitWindow[], extra?: string, control?: RenderElement, empty = 'no reading yet') =>
       (isSideBySide && ws.length <= maxWindows) || ws.length === 0 ? (
         <Box key={`lim-${name}`} flexDirection="row" columnGap={2}>
           {nameCell(name, color, true)}
-          {ws.length === 0 && <Text dimColor>no reading yet</Text>}
+          {ws.length === 0 && empty && <Text dimColor>{empty}</Text>}
           {ws.map(w => limitWindow(name, w))}
           {extra && <Text dimColor>{extra}</Text>}
+          {control}
         </Box>
       ) : (
         <Box key={`lim-${name}`} flexDirection="column">
@@ -2492,6 +4319,7 @@ export const register: Register = on => {
               {nameCell(name, color, i === 0)}
               {limitWindow(name, w)}
               {i === ws.length - 1 && extra && <Text dimColor>{extra}</Text>}
+              {i === 0 && control}
             </Box>
           ))}
         </Box>
@@ -2547,38 +4375,18 @@ export const register: Register = on => {
             </Text>
           </Box>
         )}
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} flexWrap="wrap">
-          <Box flexShrink={1} minWidth={0}>
-            {kw ? (
-              <Text wrap="wrap">
-                <Text bold color="success">
-                  ♨ keep-warm {fmtDuration(kw.leftMs)}
-                </Text>
-                <Text dimColor> · {kw.next}</Text>
-              </Text>
-            ) : (
-              <Text dimColor wrap="wrap">
-                keep-warm off
-              </Text>
-            )}
-          </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            {Select ? (
-              <Select
-                key="kw-window"
-                label="Keep warm"
-                options={KEEPWARM_OPTIONS}
-                value={keepWarmValue(kw?.leftMs)}
-                onSelect={v => void pickKeepWarm($, v)}
-              />
-            ) : kw ? (
-              <Button key="kw-stop" label="Stop" onPress={() => void stopKeepWarm($)} />
-            ) : (
-              <Button key="kw-2h" label="Keep warm 2h" variant="primary" onPress={() => void startKeepWarm($, DEFAULT_WINDOW_MS)} />
-            )}
-            {!Select && !kw && <Button key="kw-6h" label="6h" onPress={() => void startKeepWarm($, 6 * 3_600_000)} />}
-          </Box>
-        </Box>
+        {kw ? (
+          <Text wrap="wrap">
+            <Text bold color="success">
+              {ICON.keepWarm} keep-warm {fmtDuration(kw.leftMs)}
+            </Text>
+            <Text dimColor> · {kw.next}</Text>
+          </Text>
+        ) : (
+          <Text dimColor wrap="wrap">
+            keep-warm off · {Select ? 'pick a window with Keep warm above' : 'Keep warm above starts it'}
+          </Text>
+        )}
         {cache.stopped && (
           <Text color="warning" wrap="wrap">
             keep-warm stopped: {cache.stopped}
@@ -2598,10 +4406,31 @@ export const register: Register = on => {
       </Box>
     )
 
+    // ---- the top row: keep-warm, routing, settings ----
+
+    const keepWarmControls = Select
+      ? [
+          <Select
+            key="kw-window"
+            label={`${ICON.keepWarm} Keep warm`}
+            options={KEEPWARM_OPTIONS}
+            value={keepWarmValue(kw?.leftMs)}
+            onSelect={v => void pickKeepWarm($, v)}
+          />,
+        ]
+      : kw
+        ? [<Button key="kw-stop" label={`${ICON.keepWarm} Stop keep-warm`} onPress={() => void stopKeepWarm($)} />]
+        : [
+            <Button key="kw-2h" label={`${ICON.keepWarm} Keep warm 2h`} onPress={() => void startKeepWarm($, DEFAULT_WINDOW_MS)} />,
+            <Button key="kw-6h" label="6h" onPress={() => void startKeepWarm($, 6 * 3_600_000)} />,
+          ]
+
     // ---- agent cards ----
 
     const toggle = (id: string) =>
       update($, expanded, ids => (ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]))
+    const toggleFull = (id: string) =>
+      update($, fullOutputAtom, ids => (ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]))
 
     const stat = (key: string, label: string, value: string, color?: string) => (
       <Text key={key}>
@@ -2621,56 +4450,72 @@ export const register: Register = on => {
       const glyphColor = isRunning ? accent : c.status === 'done' ? 'success' : c.status === 'aborted' ? 'warning' : 'error'
       const provider = (c.providerName ?? c.provider).toUpperCase()
       const fullTitle = `${c.title}${c.isExternal ? ' (outside tool)' : ''}`
-      // A collapsed row cuts its title to fit before the surface lays it out, so it never pushes past the frame;
-      // an open card gives the title a wrapping line of its own.
+      const model = cardModelName(c, hs)
+      const statusWord = isRunning ? 'running' : c.status === 'done' ? 'done' : c.status === 'aborted' ? 'stopped' : 'failed'
+      // A collapsed row cuts its title to fit before the surface lays it out, so it never pushes past the frame.
       const room = cols - provider.length - elapsed.length - 12
-      const title = isOpen ? '' : clip(fullTitle, Math.max(8, room))
+      const title = clip(fullTitle, Math.max(8, room))
 
-      const header = (
-        <Box flexDirection="row" justifyContent="space-between" gap={1}>
-          <Box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
-            <Text color={glyphColor}>{glyph}</Text>
-            <Text bold color={accent}>
-              {provider}
-            </Text>
-            {title && (
-              <Text bold wrap="truncate-end">
-                {title}
-              </Text>
-            )}
-          </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor>
-              {elapsed}
-            </Text>
-            {!isRunning && <Button key={`t-${c.id}`} label={isOpen ? '▾' : '▸'} plain onPress={() => toggle(c.id)} />}
-          </Box>
-        </Box>
-      )
+      const toggleButton = !isRunning && <Button key={`t-${c.id}`} label={isOpen ? '▾' : '▸'} plain onPress={() => toggle(c.id)} />
 
       if (!isOpen) {
         return (
           <Box key={c.id} flexDirection="column" paddingX={1}>
-            {header}
+            <Box flexDirection="row" justifyContent="space-between" gap={1}>
+              <Box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+                <Text color={glyphColor}>{glyph}</Text>
+                <Text bold color={accent}>
+                  {provider}
+                </Text>
+                <Text bold wrap="truncate-end">
+                  {title}
+                </Text>
+              </Box>
+              <Box flexDirection="row" gap={1} flexShrink={0}>
+                <Text dimColor>{elapsed}</Text>
+                {toggleButton}
+              </Box>
+            </Box>
           </Box>
         )
       }
 
+      // An open card's header: who, which model, how it stands and for how long on one line, the title under it.
+      // It stays put at the card's top while the output below is capped to its last lines.
+      const header = (
+        <Box flexDirection="column">
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Box flexDirection="row" columnGap={1} flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+              <Text color={glyphColor}>{glyph}</Text>
+              <Text bold color={accent}>
+                {provider}
+              </Text>
+              <Text bold color={accent} wrap="truncate-end">
+                ◆ {model}
+              </Text>
+              {c.effort && (
+                <Text bold inverse color={accent}>
+                  {` ${c.effort} `}
+                </Text>
+              )}
+            </Box>
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              <Text dimColor={c.status !== 'error'} color={c.status === 'error' ? 'error' : undefined}>
+                {statusWord}
+              </Text>
+              <Text dimColor>{elapsed}</Text>
+              {toggleButton}
+            </Box>
+          </Box>
+          <Text bold wrap="wrap">
+            {fullTitle}
+          </Text>
+        </Box>
+      )
+
       const stale = staleFor(c, now)
       const t = c.tokens
       const hit = cacheHitPercent(t)
-      const modelRow = (
-        <Box flexDirection="row" columnGap={1} flexWrap="wrap">
-          <Text bold color={accent}>
-            ◆ {c.model}
-          </Text>
-          {c.effort && (
-            <Text bold inverse color={accent}>
-              {` ${c.effort} `}
-            </Text>
-          )}
-        </Box>
-      )
       const statsRow = (
         <Box flexDirection="row" columnGap={2} flexWrap="wrap">
           {stat('in', 'in', fmtTokens(t.input + t.cacheRead + t.cacheWrite))}
@@ -2684,15 +4529,14 @@ export const register: Register = on => {
       )
 
       const lines = c.output.split('\n').filter(l => l.trim() !== '')
-      const tail = lines.slice(isRunning ? -8 : -14)
+      // The engine scrolls only the whole pane, so an open card shows its last lines and Show all lifts the cap.
+      const isFull = fullOut.has(c.id)
+      const tail = isFull ? lines : lines.slice(-OUTPUT_LINES)
+      const hidden = lines.length - tail.length
       const acts = c.activity.slice(-5)
       return (
         <Box key={c.id} flexDirection="column" borderStyle="round" borderColor={accent} paddingX={1}>
           {header}
-          <Text bold wrap="wrap">
-            {fullTitle}
-          </Text>
-          {modelRow}
           {c.binary && (
             <Text dimColor wrap="truncate-end">
               {c.binary}
@@ -2720,9 +4564,15 @@ export const register: Register = on => {
           )}
           {tail.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
+              {(hidden > 0 || isFull) && lines.length > OUTPUT_LINES && (
+                <Box flexDirection="row" columnGap={1} alignItems="center">
+                  <Text dimColor>{isFull ? `all ${lines.length} lines` : `${hidden} earlier line${hidden === 1 ? '' : 's'}`}</Text>
+                  <Button key={`out-${c.id}`} label={isFull ? 'Show less' : 'Show all'} plain dimColor onPress={() => void toggleFull(c.id)} />
+                </Box>
+              )}
               {tail.map((l, i) => (
                 <Text key={`${c.id}-o${i}`} dimColor={l.startsWith('∴')} italic={l.startsWith('∴')} wrap="wrap">
-                  {l}
+                  {isFull ? l : clip(l, cols * 3)}
                 </Text>
               ))}
             </Box>
@@ -2757,738 +4607,121 @@ export const register: Register = on => {
       )
     }
 
-    // ---- harnesses: the list, and the form that adds or edits one ----
+    const { used, hasReading } = meterReadings(list, hs, lim, isCodexOn)
+    const hasMeter: Record<MeterProvider, boolean> = { ...hasReading, codex: isCodexOn }
+    const shown = new Set(METER_PROVIDERS.map(m => m.id).filter(x => hasMeter[x] && isMeterShown(meters, x, used)))
 
-    const setView = (v: HarnessView) => update($, viewAtom, () => v)
-    const patchDraft = (fn: (d: Harness) => Harness) =>
-      update($, viewAtom, cur => (cur.mode === 'edit' ? { ...cur, draft: fn(cur.draft), error: undefined } : cur))
-    const parserLabel = (p: HarnessParser) => PARSERS.find(x => x.value === p)?.label ?? p
-    const showArgs = (words: string[]) => words.map(w => (/\s/.test(w) || !w ? `"${w}"` : w)).join(' ')
-
-    const harnessRow = (hr: Harness) => (
-      <Box key={`h-${hr.id}`} flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-        <Box flexDirection="column" flexShrink={1} minWidth={0}>
-          <Text wrap="truncate-end">
-            <Text bold color={hr.color}>
-              ● {hr.name}
-            </Text>
-            <Text dimColor> {hr.id}</Text>
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            {[hr.command, parserLabel(hr.parser), hr.model ?? '', hr.provider ? `API ${hr.provider.baseUrl}` : ''].filter(Boolean).join(' · ')}
-          </Text>
-          {found[hr.id] === false && <Text color="warning">{hr.command} is not on PATH</Text>}
-        </Box>
-        <Box flexDirection="row" gap={1} flexShrink={0}>
-          <Button
-            key={`h-toggle-${hr.id}`}
-            label={hr.isEnabled ? 'On' : 'Off'}
-            variant={hr.isEnabled ? 'primary' : undefined}
-            onPress={() => void saveHarnesses($, hs.map(x => (x.id === hr.id ? { ...x, isEnabled: !x.isEnabled } : x)))}
-          />
-          {Input && <Button key={`h-edit-${hr.id}`} label="Edit" onPress={() => void openEdit({ ...hr }, hr.id)} />}
-        </Box>
-      </Box>
-    )
-
-    const listView = () => (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text bold>Settings</Text>
-          <Button key="h-done" label="Done" onPress={() => void setView({ mode: 'cards' })} />
-        </Box>
-        <Text dimColor wrap="wrap">
-          Coding agents Claude can start in the background with agent_run. Each run gets a live card here.
-        </Text>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-          <Box flexDirection="column" flexShrink={1} minWidth={0}>
-            <Text wrap="truncate-end">
-              <Text bold color={CODEX_ACCENT}>
-                ● Codex
-              </Text>
-              <Text dimColor> built in</Text>
-            </Text>
-            <Text dimColor wrap="truncate-end">
-              {isCodexOn ? 'the codex tool · live view of every Codex run · usage meters' : 'off'}
-            </Text>
-            {found.codex === false && <Text color="warning">codex is not on PATH</Text>}
-          </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Button
-              key="cx-toggle"
-              label={isCodexOn ? 'On' : 'Off'}
-              variant={isCodexOn ? 'primary' : undefined}
-              onPress={() => void setCodexEnabled($, !isCodexOn)}
-            />
-            {Select && <Button key="cx-edit" label="Edit" onPress={() => void setView({ mode: 'codex' })} />}
-          </Box>
-        </Box>
-        {hs.map(harnessRow)}
-        {hs.length === 0 && <Text dimColor>No other harness yet.</Text>}
-        {Select && Input && (
-          <Text dimColor wrap="wrap">
-            Edit a harness to pick its model from the ones it reports. Copilot and Claude Code can also run on your own API
-            key (BYOK): Edit → Model API, or add the Copilot (own API) preset.
-          </Text>
-        )}
-        {Select && Input ? (
-          <Select
-            key="h-add"
-            label="Add"
-            options={[{ value: '', label: 'Choose a preset…' }, ...PRESETS.map(p => ({ value: p.id, label: p.name }))]}
-            value=""
-            onSelect={v => {
-              const p = PRESETS.find(x => x.id === v)
-              if (p) void openEdit(fromPreset(p, hs.map(h => h.id)))
-            }}
-          />
-        ) : (
-          <Text dimColor wrap="wrap">
-            Adding and editing harnesses needs the desktop app or the terminal.
-          </Text>
-        )}
-        {routingSection()}
-        {metersSection()}
-      </Box>
-    )
-
-    const field = (key: string, label: string, value: string, set: (d: Harness, v: string) => Harness) =>
-      Input && (
-        <Input
-          key={key}
-          label={label}
-          value={value}
-          submitLabel="keep"
-          onInput={v => void patchDraft(d => set(d, v))}
-          onSubmit={v => void patchDraft(d => set(d, v))}
-        />
-      )
-
-    /** Where the CLI sends its model calls: its own service, or an API set here (BYOK). */
-    const providerSection = (d: Harness) => {
-      const types = providerTypesFor(d.parser)
-      if (!types.length || !Select) return undefined
-      const p = d.provider
-      const setP = (x: Harness, patch: Partial<HarnessProvider>): Harness => ({
-        ...x,
-        provider: { type: x.provider?.type ?? types[0]!, baseUrl: x.provider?.baseUrl ?? '', ...x.provider, ...patch },
-        // Another endpoint serves other models.
-        models: 'baseUrl' in patch || 'type' in patch ? undefined : x.models,
-      })
-      return (
-        <Box key="h-provider" flexDirection="column" gap={1}>
-          <Select
-            key="h-provider-type"
-            label="Model API"
-            options={[{ value: '', label: "The CLI's own service" }, ...PROVIDER_TYPES.filter(t => types.includes(t.value))]}
-            value={p?.type ?? ''}
-            onSelect={s =>
-              void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined, models: undefined }))
-            }
-          />
-          {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
-          {p && field('h-provider-key', 'API key', p.apiKey ?? '', (x, s) => setP(x, { apiKey: s }))}
-          {p && p.type !== 'anthropic' && d.parser === 'copilot' && (
-            <Select
-              key="h-provider-wire"
-              label="Wire format"
-              options={[
-                { value: 'completions', label: 'Chat Completions' },
-                { value: 'responses', label: 'Responses (GPT-5 series)' },
-              ]}
-              value={p.wireApi ?? 'completions'}
-              onSelect={s => void patchDraft(x => setP(x, { wireApi: s as HarnessProvider['wireApi'] }))}
-            />
-          )}
-          {p && d.parser === 'copilot' && (
-            <Box flexDirection="column" gap={1}>
-              {p.type === 'anthropic' && <Text dimColor wrap="wrap">Use the API root or its /v1 URL; Copilot adds /v1 to requests.</Text>}
-              {field('h-provider-model-id', 'Base model id (optional)', p.modelId ?? '', (x, s) => setP(x, { modelId: s }))}
-              {field('h-provider-wire-model', 'Deployment / wire model (optional)', p.wireModel ?? '', (x, s) => setP(x, { wireModel: s }))}
-              {p.type !== 'anthropic' && p.wireApi === 'responses' && (
-                <Select
-                  key="h-provider-transport"
-                  label="Responses transport"
-                  options={[{ value: 'http', label: 'HTTP' }, { value: 'websockets', label: 'WebSockets' }]}
-                  value={p.transport ?? 'http'}
-                  onSelect={s => void patchDraft(x => setP(x, { transport: s as HarnessProvider['transport'] }))}
-                />
-              )}
-              <Text dimColor wrap="wrap">Leave these empty to use the selected model for both. For Azure or a fine-tune, give a known base model and the deployment name your API expects.</Text>
-            </Box>
-          )}
-          {p && (
-            <Text dimColor wrap="wrap">
-              {`The key is kept in agent-deck's settings as plain text and handed to the CLI as ${
-                d.parser === 'copilot' ? 'COPILOT_PROVIDER_API_KEY' : 'ANTHROPIC_API_KEY'
-              }; it is not written into run files.`}
-            </Text>
-          )}
-        </Box>
-      )
-    }
-
-    /** Asks the harness for its models; a fixed list fills in at once. */
-    const loadModels = async (d: Harness) => {
-      const how = modelQuery(d)
-      if (!how) return
-      // An answer that comes back after the form moved on to another harness or endpoint is dropped.
-      const isSame = (x: Harness) => x.parser === d.parser && x.command === d.command && x.provider?.baseUrl === d.provider?.baseUrl
-      const patchEdit = (fn: (cur: Extract<HarnessView, { mode: 'edit' }>) => HarnessView) =>
-        update($, viewAtom, cur => (cur.mode === 'edit' && isSame(cur.draft) ? fn(cur) : cur))
-      if ('models' in how) return patchEdit(cur => ({ ...cur, modelsState: undefined, draft: { ...cur.draft, models: how.models } }))
-      await patchEdit(cur => ({ ...cur, modelsState: 'loading' }))
-      const r = await queryModels($, how.query, d)
-      await patchEdit(cur =>
-        'error' in r
-          ? { ...cur, modelsState: { error: r.error } }
-          : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
-      )
-    }
-
-    /** Opens the edit form, asking for the harness's models right away when it has none yet. */
-    const openEdit = async (draft: Harness, originalId?: string) => {
-      await setView({ mode: 'edit', draft, originalId })
-      if (!draft.models?.length) await loadModels(draft)
-    }
-
-    const OTHER_MODEL = '__other__'
-
-    /**
-     * The model, as one control: a dropdown of what the harness reports (its default first,
-     * Other… last), or a text field where it reports nothing.
-     */
-    const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
-      const d = v.draft
-      const how = modelQuery(d)
-      const known: HarnessModel[] = d.models ?? []
-      const st = v.modelsState
-      const isLoading = st === 'loading'
-      const isCustom = !!d.model && !known.some(m => m.id === d.model)
-      const typed = (label: string) => field('h-model', label, d.model ?? '', (x, s) => ({ ...x, model: s }))
-      const refresh = (label: string) => (
-        <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
-      )
-      if (known.length && Select) {
-        const options = [
-          { value: '', label: "Default (the CLI's choice)" },
-          ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
-          { value: OTHER_MODEL, label: 'Other…' },
-        ]
-        const isTyping = v.isTypingModel || isCustom
-        return (
-          <Box key="h-models" flexDirection="column" gap={1}>
-            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-              <Select
-                key="h-model-pick"
-                label="Model"
-                options={options}
-                value={isTyping ? OTHER_MODEL : (d.model ?? '')}
-                onSelect={s =>
-                  void update($, viewAtom, cur =>
-                    cur.mode !== 'edit'
-                      ? cur
-                      : s === OTHER_MODEL
-                        ? { ...cur, isTypingModel: true }
-                        : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
-                  )
-                }
-              />
-              {isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻')}
-            </Box>
-            {isTyping && typed('Model id')}
-            {st && st !== 'loading' && (
-              <Text color="error" wrap="wrap">
-                {`Could not refresh the models: ${st.error}`}
-              </Text>
-            )}
-          </Box>
-        )
-      }
-      return (
-        <Box key="h-models" flexDirection="column" gap={1}>
-          {isLoading ? (
-            <Text>
-              Model <Text dimColor>· asking {d.provider?.baseUrl ? 'the API' : d.command || 'the CLI'} which models it has…</Text>
-            </Text>
-          ) : (
-            typed('Model')
-          )}
-          {!how && <Text dimColor wrap="wrap">This CLI can't list its models: type the id it takes, or leave it empty for its default.</Text>}
-          {how && st && st !== 'loading' && (
-            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-              <Text color="error" wrap="wrap">
-                {`Could not list models: ${st.error}`}
-              </Text>
-              {refresh('Try again')}
-            </Box>
-          )}
-          {how && !st && refresh('List models')}
-        </Box>
-      )
-    }
-
-    const editView = (v: Extract<HarnessView, { mode: 'edit' }>) => {
-      const d = v.draft
-      const preset = PRESETS.find(p => p.id === d.preset)
-      const others = hs.filter(h => h.id !== v.originalId)
-      const save = async () => {
-        const clean: Harness = {
-          ...d,
-          id: d.id.trim(),
-          name: d.name.trim(),
-          command: d.command.trim(),
-          args: d.args.trim(),
-          color: d.color.trim() || '#14B8A6',
-          model: d.model?.trim() || undefined,
-          autoTier: d.parser === 'copilot' && !d.provider ? d.autoTier?.trim() || undefined : undefined,
-          maxAiCredits: d.parser === 'copilot' ? d.maxAiCredits : undefined,
-          provider: d.provider && {
-            type: d.provider.type,
-            baseUrl: d.provider.baseUrl.trim().replace(/\/+$/, ''),
-            apiKey: d.provider.apiKey?.trim() || undefined,
-            wireApi: d.provider.type !== 'anthropic' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
-            transport: d.provider.type !== 'anthropic' && d.parser === 'copilot' && d.provider.wireApi === 'responses' ? d.provider.transport : undefined,
-            modelId: d.parser === 'copilot' ? d.provider.modelId?.trim() || undefined : undefined,
-            wireModel: d.parser === 'copilot' ? d.provider.wireModel?.trim() || undefined : undefined,
-          },
-        }
-        const error = harnessError(clean, others)
-        if (error) return setView({ ...v, error })
-        await saveHarnesses($, v.originalId ? hs.map(h => (h.id === v.originalId ? clean : h)) : [...hs, clean])
-        return setView({ mode: 'list' })
-      }
-      return (
-        <Box flexDirection="column" gap={1}>
-          <Text bold>
-            {v.originalId ? 'Edit' : 'Add'} <Text color={d.color}>● {d.name || 'harness'}</Text>
-          </Text>
-          {preset && (
-            <Text dimColor wrap="wrap">
-              {preset.note}
-            </Text>
-          )}
-          {field('h-name', 'Name', d.name, (x, s) => ({
-            ...x,
-            name: s,
-            // A new harness's id follows its name until the id is edited.
-            id: !v.originalId && (x.id === slugId(x.name) || !x.id) ? slugId(s) : x.id,
-          }))}
-          {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
-          {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
-          {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }))}
-          {Select && (
-            <Select
-              key="h-parser"
-              label="Output"
-              options={PARSERS}
-              value={d.parser}
-              onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser, models: undefined }))}
-            />
-          )}
-          {providerSection(d)}
-          {modelSection(v)}
-          {d.parser === 'copilot' && (
-            <Box key="h-copilot" flexDirection="column" gap={1}>
-              {!d.provider && Select && (
-                <Select
-                  key="h-auto-tier"
-                  label="Auto routing profile"
-                  options={[
-                    { value: '', label: "CLI's default" },
-                    { value: 'efficiency', label: 'Efficiency' },
-                    { value: 'balance', label: 'Balance' },
-                    { value: 'intelligence', label: 'Intelligence' },
-                    { value: 'hydrafusion', label: 'Copilot Fusion Standard (preview)' },
-                    { value: 'hydrafusion-max', label: 'Copilot Fusion Max (preview)' },
-                    ...(d.autoTier && !['efficiency', 'balance', 'intelligence', 'hydrafusion', 'hydrafusion-max'].includes(d.autoTier) ? [{ value: d.autoTier, label: d.autoTier }] : []),
-                  ]}
-                  value={d.autoTier ?? ''}
-                  onSelect={s => void patchDraft(x => ({ ...x, autoTier: s || undefined, model: s ? 'auto' : x.model }))}
-                />
-              )}
-              {field('h-max-credits', 'AI credit limit (optional, minimum 30)', d.maxAiCredits === undefined ? '' : String(d.maxAiCredits), (x, s) => ({ ...x, maxAiCredits: s.trim() ? Number(s) : undefined }))}
-              <Text dimColor wrap="wrap">Fusion availability depends on your CLI and account. Limits include subagents and may be exceeded by the final response; BYOK provider charges are separate.</Text>
-            </Box>
-          )}
-          {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
-          <Text dimColor wrap="wrap">
-            {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
-          </Text>
-          <Text dimColor wrap="wrap">
-            runs: <Text>{copilotOptionsError(d) ?? `${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', usageFile: '<run usage file>' }))}`}</Text>
-            {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
-          </Text>
-          {v.error && (
-            <Text color="error" wrap="wrap">
-              {v.error}
-            </Text>
-          )}
-          <Box flexDirection="row" gap={1} flexWrap="wrap">
-            <Button key="h-save" label="Save" variant="primary" onPress={() => void save()} />
-            <Button key="h-cancel" label="Cancel" onPress={() => void setView({ mode: 'list' })} />
-            {v.originalId && (
-              <Button
-                key="h-delete"
-                label="Delete"
-                onPress={() => {
-                  void saveHarnesses($, hs.filter(h => h.id !== v.originalId)).then(() => setView({ mode: 'list' }))
-                }}
-              />
-            )}
-          </Box>
-        </Box>
-      )
-    }
-
-    const presetOf = (id?: string) => hs.find(x => x.id === id)?.preset
-    const used = new Set<MeterProvider>(['claude'])
-    for (const c of list) {
-      if (c.provider === 'codex' || presetOf(c.harness) === 'codex-cli') used.add('codex')
-      if (presetOf(c.harness) === 'copilot') used.add('copilot')
-      if (hs.find(x => x.id === c.harness)?.parser === 'antigravity') used.add('antigravity')
-    }
-    // A provider shows only with a reading: Codex also only while its built-in mode is on.
-    const hasReading: Record<MeterProvider, boolean> = {
-      claude: lim.claude.length > 0,
-      codex: isCodexOn && lim.codex.length > 0,
-      copilot: (lim.copilot ?? []).length > 0,
-      antigravity: (lim.antigravity ?? []).length > 0,
-    }
-    const shown = new Set((['codex', 'claude', 'copilot', 'antigravity'] as const).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
-
-    const METER_NAMES: Record<MeterProvider, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', antigravity: 'Antigravity' }
-    // ---- task routing: a target and model per kind of task, and the switch that tells Claude ----
-
-    const targetName = (t: string) =>
-      !t ? 'not set' : t === 'codex' ? 'Codex (built in)' : t === 'claude' ? 'Claude subagent' : (hs.find(h => h.id === t)?.name ?? t)
-
-    const setRoute = (task: string, patch: Partial<TaskRoute>) =>
-      saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
-
-    const routeModel = (r: TaskRoute) => {
-      const target = hs.find(x => x.id === r.target)
-      const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
-      if (!r.target) return undefined
-      const defaultModel = r.target === 'codex' ? codexDefaults.model : target?.model
-      const canRefresh = r.target === 'codex' || (!!target && !!modelQuery(target) && 'query' in modelQuery(target)!)
-      const refreshButton = canRefresh && (
-        <Button key={`r-refresh-${r.task}`} label="↻" plain dimColor onPress={() => void refreshRoutedModels($, { only: r.target, force: true })} />
-      )
-      if (Select && known.length) {
-        const options = [
-          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${defaultModel ? ` (${defaultModel})` : ''}` },
-          ...known,
-          ...(r.model && !known.some(k => k.value === r.model) ? [{ value: r.model, label: r.model }] : []),
-        ]
-        return (
-          <Box key={`r-models-${r.task}`} flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-            <Select key={`r-model-${r.task}`} label="Model" options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
-            {refreshButton}
-          </Box>
-        )
-      }
-      return (
-        Input && (
-          <Input
-            key={`r-model-${r.task}`}
-            label="Model"
-            value={r.model ?? ''}
-            placeholder={defaultModel ?? 'default'}
-            submitLabel="keep"
-            onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
-          />
-        )
-      )
-    }
-
-    const routeRow = (r: TaskRoute) => {
-      const problem = routeProblem(r, hs, isCodexOn)
-      const hint = taskHint(r.task)
-      const targets = [
-        { value: '', label: 'Not set' },
-        { value: 'claude', label: 'Claude subagent' },
-        { value: 'codex', label: `Codex (built in)${isCodexOn ? '' : ' · off'}` },
-        ...hs.map(h => ({ value: h.id, label: `${h.name}${h.isEnabled ? '' : ' · off'}` })),
-        ...(r.target && r.target !== 'claude' && r.target !== 'codex' && !hs.some(h => h.id === r.target) ? [{ value: r.target, label: `${r.target} · missing` }] : []),
-      ]
-      return (
-        <Box key={`r-${r.task}`} flexDirection="column" gap={0}>
-          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-            <Text wrap="truncate-end">
-              <Text bold>{r.task}</Text>
-              {hint && <Text dimColor> {hint}</Text>}
-            </Text>
-            {Select && <Button key={`r-remove-${r.task}`} label="Remove" plain dimColor onPress={() => void saveRouting($, { ...routingState, routes: routingState.routes.filter(x => x.task !== r.task) })} />}
-          </Box>
-          {Select ? (
-            <Box flexDirection="column" gap={0}>
-              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))} />
-              {routeModel(r)}
-            </Box>
-          ) : (
-            <Text dimColor>{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}`}</Text>
-          )}
-          {problem && <Text color="warning">{`Can't run: ${problem}.`}</Text>}
-        </Box>
-      )
-    }
-
-    const routingSection = () => {
-      const isOn = routingState.isOn
-      const missing = DEFAULT_TASKS.filter(t => !routingState.routes.some(r => r.task === t.task))
-      return (
-        <Box flexDirection="column" gap={1} marginTop={1}>
-          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-            <Text bold>Task routing</Text>
-            <Button key="r-toggle" label={isOn ? 'On' : 'Off'} variant={isOn ? 'primary' : undefined} onPress={() => void saveRouting($, { ...routingState, isOn: !isOn })} />
-          </Box>
-          <Text dimColor wrap="wrap">
-            {isOn
-              ? 'On: Claude hands each kind of task to the agent you pick here, and keeps quick questions and small edits itself. Changes reach Claude with your next message.'
-              : 'Off: Claude places work as usual. Pick an agent for each kind of task, then switch this on, here or with /agent-deck routing on.'}
-          </Text>
-          {routingState.routes.map(routeRow)}
-          {routingState.routes.length === 0 && <Text dimColor>No tasks yet.</Text>}
-          {Input && (
-            <Input
-              key="r-add"
-              label="Add a task"
-              value=""
-              placeholder="for example tests or docs"
-              submitLabel="add"
-              onSubmit={v => {
-                const task = taskSlug(v)
-                if (task && !routingState.routes.some(r => r.task === task)) void saveRouting($, { ...routingState, routes: [...routingState.routes, { task, target: '' }] })
-              }}
-            />
-          )}
-          {Select && missing.length > 0 && (
-            <Button
-              key="r-defaults"
-              label={`Add back ${missing.map(t => t.task).join(', ')}`}
-              plain
-              dimColor
-              onPress={() => void saveRouting($, { ...routingState, routes: [...routingState.routes, ...missing.map(t => ({ task: t.task, target: '' }))] })}
-            />
-          )}
-        </Box>
-      )
-    }
-
-    const metersSection = () => (
-      <Box flexDirection="column" gap={1} marginTop={1}>
-        <Text bold>Usage meters</Text>
-        {Select ? (
-          <Select
-            key="m-mode"
-            label="Show"
-            options={[
-              { value: 'all', label: 'All connected' },
-              { value: 'session', label: 'Used in this session' },
-              { value: 'selected', label: 'Selected' },
-            ]}
-            value={meters.mode}
-            onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })}
-          />
-        ) : (
-          <Text dimColor>{meters.mode === 'all' ? 'All connected' : meters.mode === 'session' ? 'Used in this session' : 'Selected'}</Text>
-        )}
-        {meters.mode === 'selected' && (
-          <Box flexDirection="row" gap={1} flexWrap="wrap">
-            {(['claude', 'codex', 'copilot', 'antigravity'] as const).map(x => {
-              const isOn = meters.selected.includes(x)
-              return (
-                <Button
-                  key={`m-${x}`}
-                  label={`${METER_NAMES[x]} ${isOn ? '✓' : '·'}`}
-                  variant={isOn ? 'primary' : undefined}
-                  onPress={() =>
-                    void saveMeters($, { ...meters, selected: isOn ? meters.selected.filter(y => y !== x) : [...meters.selected, x] })
-                  }
-                />
-              )
-            })}
-          </Box>
-        )}
-        <Text dimColor wrap="wrap">
-          {[
-            'Claude: this session.',
-            isCodexOn ? 'Codex: read from its session files.' : 'Codex: needs the built-in Codex on.',
-            hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
-            hasReading.antigravity ? 'Antigravity: read from agy, as /usage shows them.' : 'Antigravity: needs an Antigravity harness switched on, and agy signed in.',
-          ].join(' ')}
-        </Text>
-      </Box>
-    )
-
-    const codexHarnesses = hs.filter(x => x.preset === 'codex-cli')
-    const codexMode = isCodexOn ? 'builtin' : codexHarnesses.some(x => x.isEnabled) ? 'custom' : 'off'
-
-    const pickCodexMode = async (mode: string) => {
-      if (mode === 'builtin' || mode === 'off') {
-        if (codexHarnesses.some(x => x.isEnabled)) {
-          await saveHarnesses($, hs.map(x => (x.preset === 'codex-cli' ? { ...x, isEnabled: false } : x)))
-        }
-        await setCodexEnabled($, mode === 'builtin')
-        return setView({ mode: 'list' })
-      }
-      await setCodexEnabled($, false)
-      const existing = codexHarnesses[0]
-      if (existing) {
-        await saveHarnesses($, hs.map(x => (x.id === existing.id ? { ...x, isEnabled: true } : x)))
-        return openEdit({ ...existing, isEnabled: true }, existing.id)
-      }
-      const preset = PRESETS.find(x => x.id === 'codex-cli')
-      if (preset) return openEdit(fromPreset(preset, hs.map(x => x.id)))
-    }
-
-    /** Which Codex CLI runs start with: the newest found, or a path set here or in CODEX_PATH. */
-    const codexBinSection = () => {
-      const b = codexBin
-      const note = codexUpdateNote(b.chosen, b.latest)
-      const others = (b.candidates ?? []).filter(c => c.path !== b.chosen?.path)
-      return (
-        <Box flexDirection="column">
-          <Text bold>Codex CLI</Text>
-          {b.at === undefined && !b.isChecking && <Text dimColor>Not checked yet. Look for Codex to see which one runs start with.</Text>}
-          {b.chosen && (
-            <Text wrap="wrap">
-              Runs start with codex-cli {b.chosen.version} · {b.chosen.path}
-              {b.override ? ' (set by hand)' : ' (the newest found)'}
-            </Text>
-          )}
-          {b.at !== undefined && !b.chosen && (
-            <Text color="error" wrap="wrap">
-              {b.override
-                ? `The Codex set by hand (${b.override}) does not run: ${b.candidates?.[0]?.error ?? 'unknown error'}`
-                : `No Codex CLI found. Install it with: ${CODEX_UPDATE_COMMAND}`}
-            </Text>
-          )}
-          {note && (
-            <Text color="warning" wrap="wrap">
-              {note}
-            </Text>
-          )}
-          {b.latest && !note && b.chosen && <Text dimColor>That is the newest published version.</Text>}
-          {b.updateError && (
-            <Text color="error" wrap="wrap">
-              The update failed: {b.updateError}
-            </Text>
-          )}
-          {others.map(c => (
-            <Text key={`cx-c-${c.path}`} dimColor wrap="truncate-end">
-              also: {c.version ? `codex-cli ${c.version}` : c.error} · {c.path}
-            </Text>
-          ))}
-          {Input && (
-            <Input
-              key="cx-path"
-              label="Codex path (blank: the newest found; CODEX_PATH wins)"
-              value={b.override && !b.isEnvOverride ? b.override : ''}
-              submitLabel="save"
-              onSubmit={v =>
-                void (async () => {
-                  await $.store.set(KEY_CODEX_PATH, v.trim())
-                  await findCodex($, { force: true })
-                })()
-              }
-            />
-          )}
-          <Box flexDirection="row" gap={1}>
-            <Button key="cx-find" label={b.isChecking && !b.isUpdating ? 'Looking…' : 'Look again'} onPress={() => void findCodex($, { force: true })} />
-            <Button
-              key="cx-update"
-              label={b.isUpdating ? 'Updating…' : 'Update Codex (npm)'}
-              variant={note ? 'primary' : undefined}
-              onPress={() => void findCodex($, { update: true })}
-            />
-          </Box>
-        </Box>
-      )
-    }
-
-    const codexView = () => (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text bold color={CODEX_ACCENT}>
-            ● Codex
-          </Text>
-          <Button key="cx-back" label="Back" onPress={() => void setView({ mode: 'list' })} />
-        </Box>
-        {Select && (
-          <Select
-            key="cx-mode"
-            label="Runs as"
-            options={[
-              { value: 'builtin', label: 'Built in' },
-              { value: 'custom', label: 'Custom harness' },
-              { value: 'off', label: 'Off' },
-            ]}
-            value={codexMode}
-            onSelect={v => void pickCodexMode(v)}
-          />
-        )}
-        <Text dimColor wrap="wrap">
-          Built in: the codex tool (model, effort, sandbox, resume), a live card for every Codex run, also ones started in a
-          terminal or the Codex app, and Codex usage meters.
-        </Text>
-        <Text dimColor wrap="wrap">
-          Custom harness: Codex runs through agent_run like the other harnesses, with a command and arguments you edit.
-          Only its own runs get cards, and there are no usage meters.
-        </Text>
-        {codexBinSection()}
-      </Box>
-    )
-
-    // A settings view that fails to draw says why and keeps a way back, not a blank pane.
-    const orBack = (draw: () => ReturnType<typeof listView>) => {
-      try {
-        return draw()
-      } catch (err) {
-        return (
-          <Box flexDirection="column" gap={1}>
-            <Text color="error" wrap="wrap">{`agent-deck could not draw this view: ${String((err as Error)?.message ?? err)}`}</Text>
-            <Button key="h-recover" label="Back to agents" onPress={() => void setView({ mode: 'cards' })} />
-          </Box>
-        )
-      }
-    }
-    if (view.mode === 'codex') {
-      if (codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
-      return orBack(codexView)
-    }
-    if (view.mode === 'list') return orBack(listView)
-    if (view.mode === 'edit') return orBack(() => editView(view))
 
     const running = list.filter(c => c.status === 'running')
     const finished = list.filter(c => c.status !== 'running').reverse()
     const totalCost = list.reduce((s, c) => s + (c.costUsd ?? 0), 0)
 
+    // ---- usage limits: a header that folds them, switches the view and refreshes them ----
+
+    const LIMIT_VIEWS: { value: MeterChoice['mode']; label: string }[] = [
+      { value: 'all', label: 'All' },
+      { value: 'session', label: 'Used here' },
+      { value: 'selected', label: 'Selected' },
+    ]
+    const meterData: Record<MeterProvider, { color: string; windows: LimitWindow[]; plan?: string }> = {
+      claude: { color: 'claude', windows: lim.claude, plan: undefined },
+      antigravity: { color: AGY_ACCENT, windows: lim.antigravity ?? [], plan: undefined },
+      codex: { color: CODEX_ACCENT, windows: lim.codex, plan: lim.codexPlan },
+      copilot: { color: COPILOT_ACCENT, windows: lim.copilot ?? [], plan: lim.copilotPlan },
+    }
+    // Each provider's windows as they show: the 5-hour before the weekly, and Antigravity's by its view.
+    const limitProviders = METER_PROVIDERS.map(({ id, name }) => ({ p: id, name, ...meterData[id], windows: shownWindows(id, meterData[id].windows, meters.agyView) })).filter(x => shown.has(x.p))
+    const agyView = meters.agyView ?? 'basic'
+    const agyIndex = Math.max(0, AGY_VIEWS.findIndex(v => v.value === agyView))
+    const agyControl = Select ? (
+      <Select key="lim-agy-view" options={AGY_VIEWS} value={agyView} onSelect={v => void saveMeters($, { ...meters, agyView: v as AgyView })} />
+    ) : (
+      <Button
+        key="lim-agy-view"
+        label={AGY_VIEWS[agyIndex]!.label}
+        plain
+        dimColor
+        onPress={() => void saveMeters($, { ...meters, agyView: AGY_VIEWS[(agyIndex + 1) % AGY_VIEWS.length]!.value })}
+      />
+    )
+    const isCollapsed = meters.isCollapsed === true
+    const viewIndex = Math.max(0, LIMIT_VIEWS.findIndex(v => v.value === meters.mode))
+    const summary = limitSummary(limitProviders.filter(x => x.windows.length > 0), now)
+    const limitsBlock = Object.values(hasMeter).some(Boolean) && (
+      <Box key="limits" flexDirection="column" marginTop={1} marginBottom={Svg ? 0 : 1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} flexWrap="wrap">
+          <Button
+            key="lim-toggle"
+            label={`${isCollapsed ? '▸' : '▾'} Usage limits`}
+            plain
+            onPress={() => void saveMeters($, { ...meters, isCollapsed: !isCollapsed })}
+          />
+          <Box flexDirection="row" alignItems="center" columnGap={1} flexShrink={0}>
+            {Select ? (
+              <Select key="lim-view" options={LIMIT_VIEWS} value={meters.mode} onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })} />
+            ) : (
+              <Button
+                key="lim-view"
+                label={LIMIT_VIEWS[viewIndex]!.label}
+                plain
+                dimColor
+                onPress={() => void saveMeters($, { ...meters, mode: LIMIT_VIEWS[(viewIndex + 1) % LIMIT_VIEWS.length]!.value })}
+              />
+            )}
+            <Button key="lim-refresh" label={lim.isRefreshing ? '↻ Refreshing…' : '↻ Refresh'} plain dimColor onPress={() => void refreshAllLimits($)} />
+          </Box>
+        </Box>
+        {limitProviders.length === 0 && (
+          <Text dimColor wrap="wrap">
+            {meters.mode === 'selected' ? 'None selected: pick them under Settings → Usage meters.' : 'Nothing used here has a reading yet.'}
+          </Text>
+        )}
+        {isCollapsed ? (
+          summary.length > 0 ? (
+            <Text key="lim-summary" wrap="wrap">
+              {summary.map((x, i) => (
+                <Text key={`lim-sum-${x.name}`}>
+                  {i > 0 && <Text dimColor> · </Text>}
+                  <Text dimColor>{x.name} </Text>
+                  {x.percent === undefined ? (
+                    <Text dimColor>0%</Text>
+                  ) : (
+                    <Text bold color={limitColor(x.percent)}>{`${Math.round(x.percent)}%`}</Text>
+                  )}
+                </Text>
+              ))}
+            </Text>
+          ) : (
+            limitProviders.length > 0 && <Text dimColor>no reading yet</Text>
+          )
+        ) : (
+          limitProviders.map(x =>
+            x.p === 'antigravity'
+              ? limitRow(x.p, x.name, x.color, x.windows, x.plan, agyControl, 'Nothing in this view: pick All to see every window.')
+              : limitRow(x.p, x.name, x.color, x.windows, x.plan),
+          )
+        )}
+      </Box>
+    )
+
     return (
       <Box flexDirection="column" gap={0}>
-        <Box flexDirection="row" justifyContent="flex-end" alignItems="center" columnGap={1}>
+        <Box flexDirection="row" justifyContent="flex-end" alignItems="center" columnGap={1} rowGap={0} flexWrap="wrap" marginBottom={1}>
+          {keepWarmControls}
           <Button
             key="r-toggle-main"
-            label={`Routing ${routingState.isOn ? 'on' : 'off'}`}
+            label={`${ICON.routing} Routing ${routingState.isOn ? 'on' : 'off'}`}
             variant={routingState.isOn ? 'primary' : undefined}
             onPress={() => void saveRouting($, { ...routingState, isOn: !routingState.isOn })}
           />
           <Button
             key="h-open"
-            label="⚙ Settings"
-            plain
-            dimColor
-            onPress={() => void setView({ mode: 'list' }).then(() => refreshRoutedModels($))}
+            label={`${ICON.settings} Settings`}
+            onPress={() => void openSettings($)}
           />
         </Box>
-        <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
-          {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
-          {shown.has('claude') && limitRow('Claude', 'claude', lim.claude)}
-          {shown.has('copilot') && limitRow('Copilot', COPILOT_ACCENT, lim.copilot ?? [], lim.copilotPlan)}
-          {shown.has('antigravity') && limitRow('Antigravity', AGY_ACCENT, lim.antigravity ?? [])}
-        </Box>
         {cacheBox}
+        {limitsBlock}
         {list.length === 0 && <Text dimColor>No subagents yet. Codex, Claude and harness runs appear here.</Text>}
         {running.map(card)}
         {finished.length > 0 && (
@@ -3503,4 +4736,8 @@ export const register: Register = on => {
       </Box>
     )
   })
+
+  // ---- settings: their own pane beside the deck ----
+
+  on('ui.render', { component: 'Pane', requestId: SETTINGS_PANE }, async ($, e) => renderSettings($, e, false))
 }

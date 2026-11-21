@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, AgyView, CodexLimitSource, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -179,13 +179,477 @@ const CLAUDE_MODELS: HarnessModel[] = [
 /** What a Claude subagent takes (the Agent tool's model: a family), named by the version it runs now. */
 export const SUBAGENT_MODELS: HarnessModel[] = CLAUDE_MODELS.filter(m => m.name).map(m => ({ id: m.name!.split(' ')[0]!.toLowerCase(), name: m.name }))
 
+/** The raw models a task's route can pick from: a harness's last list, the chosen Codex's, or Claude's families. */
+export const routeModels = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): HarnessModel[] =>
+  target === 'claude' ? SUBAGENT_MODELS : target === 'codex' ? codexModels.map(id => ({ id })) : (h?.models ?? [])
+
 /** The models a task's route can pick from: a harness's last list, the chosen Codex's, or Claude's families. */
-export const routeModelChoices = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): { value: string; label: string }[] =>
-  target === 'claude'
-    ? SUBAGENT_MODELS.map(m => ({ value: m.id, label: m.name ?? m.id }))
-    : target === 'codex'
-      ? codexModels.map(id => ({ value: id, label: id }))
-      : (h?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
+export const routeModelChoices = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): RouteModelChoice[] =>
+  routeModels(target, h, codexModels).map(routeChoice)
+
+/** One model a route offers: its display name as the label; its id and note, where they add something, as the detail. */
+export type RouteModelChoice = { value: string; label: string; detail?: string }
+
+/** Maximum options a Select control accepts in the engine (1 to 64). */
+export const MAX_SELECT_OPTIONS = 64
+
+export type SelectOption = { value: string; label: string }
+
+export type CappedSelect<T extends SelectOption> = {
+  options: T[]
+  shown: number
+  total: number
+  isCapped: boolean
+}
+
+/**
+ * Caps a Select's options to `max` (default 64): always keeps `fixedHead` (e.g. Default),
+ * `fixedTail` (e.g. Other…), and the currently selected value (`keep`) even when it falls
+ * past the cut, filling the remaining slots in original order.
+ */
+export const capSelectOptions = <T extends SelectOption>(
+  options: readonly T[],
+  opts: { max?: number; keep?: string; fixedHead?: readonly T[]; fixedTail?: readonly T[] } = {},
+): CappedSelect<T> => {
+  const max = Math.max(1, opts.max ?? MAX_SELECT_OPTIONS)
+  const head = opts.fixedHead ?? []
+  const tail = opts.fixedTail ?? []
+  const total = options.length
+  const budget = Math.max(0, max - head.length - tail.length)
+  if (total <= budget) {
+    return { options: [...head, ...options, ...tail].slice(0, max), shown: total, total, isCapped: false }
+  }
+  const taken = options.slice(0, budget)
+  if (
+    opts.keep !== undefined &&
+    !head.some(o => o.value === opts.keep) &&
+    !tail.some(o => o.value === opts.keep) &&
+    !taken.some(o => o.value === opts.keep)
+  ) {
+    const kept = options.find(o => o.value === opts.keep)
+    if (kept && budget > 0) taken[budget - 1] = kept
+  }
+  return {
+    options: [...head, ...taken, ...tail].slice(0, max),
+    shown: taken.length,
+    total,
+    isCapped: true,
+  }
+}
+
+// ---------- multi-level model picker (prefix groups, alphabetical runs, search) ----------
+
+/** Option budgets for model picker Selects at a given Select limit (default 64). */
+export const modelPickerBudget = (max = MAX_SELECT_OPTIONS) => {
+  const cap = Math.max(4, max)
+  return {
+    /** Max options a Select can hold. */
+    max: cap,
+    /** Max models in a leaf Select alongside Default, Other… and an already-selected model (61 at 64). */
+    leaf: Math.max(1, cap - 3),
+    /** Max models in one ungrouped Select alongside Default and Other… (62 at 64). */
+    single: Math.max(1, cap - 2),
+    /** Max children in a group Select before wrapping those children into runs (63 at 64). */
+    group: Math.max(2, cap - 1),
+  }
+}
+
+export const OTHER_MODELS_GROUP = '__other_models__'
+
+export const stripModelPrefix = (text: string, prefix: string): string =>
+  prefix && text.startsWith(prefix) && text.length > prefix.length ? text.slice(prefix.length) : text
+
+export const modelOptionLabel = (m: HarnessModel, prefix = ''): string => {
+  const id = stripModelPrefix(m.id, prefix)
+  const name = m.name ? stripModelPrefix(m.name, prefix) : undefined
+  return [name && name !== id && name !== m.id ? `${name} (${id})` : id, m.note].filter(Boolean).join(' · ')
+}
+
+export const routeModelOptionLabel = (m: HarnessModel, prefix = ''): string => stripModelPrefix(m.name || m.id, prefix)
+
+/** Case-insensitive search matching a model's id or display name across all groups. */
+export const filterModels = (models: readonly HarnessModel[], text: string): HarnessModel[] => {
+  const q = text.trim().toLowerCase()
+  if (!q) return [...models]
+  return models.filter(m => m.id.toLowerCase().includes(q) || (m.name?.toLowerCase().includes(q) ?? false))
+}
+
+export type ModelGroup = {
+  key: string
+  label: string
+  /** Prefix segment (without `/`) when this group came from a `/` segment; absent for "other models". */
+  segment?: string
+  models: HarnessModel[]
+}
+
+export type GroupedModels =
+  | { kind: 'shared'; segment: string }
+  | { kind: 'split'; groups: ModelGroup[] }
+  | { kind: 'none' }
+
+const compareNames = (a: string, b: string): number => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true })
+
+/**
+ * Splits `models` by the `/` segment at `prefixDepth` when most ids have one.
+ * A prefix shared by every model returns `shared` (so the caller skips down a level);
+ * prefixes with two or more models become groups, and singletons + non-segmented ids
+ * gather under "other models".
+ */
+export const groupModels = (models: readonly HarnessModel[], prefixDepth = 0): GroupedModels => {
+  const bySeg = new Map<string, HarnessModel[]>()
+  const withoutSeg: HarnessModel[] = []
+  for (const m of models) {
+    const parts = m.id.split('/')
+    const seg = parts.length > prefixDepth + 1 ? parts[prefixDepth] : ''
+    if (seg) {
+      let bucket = bySeg.get(seg)
+      if (!bucket) {
+        bucket = []
+        bySeg.set(seg, bucket)
+      }
+      bucket.push(m)
+    } else {
+      withoutSeg.push(m)
+    }
+  }
+  const withSegCount = models.length - withoutSeg.length
+  if (withSegCount <= models.length / 2) return { kind: 'none' }
+  if (withoutSeg.length === 0 && bySeg.size === 1) {
+    const [segment] = bySeg.keys()
+    return { kind: 'shared', segment: segment! }
+  }
+  const real: { seg: string; models: HarnessModel[] }[] = []
+  const other: HarnessModel[] = []
+  for (const [seg, list] of bySeg) {
+    if (list.length >= 2) real.push({ seg, models: list })
+    else other.push(...list)
+  }
+  other.push(...withoutSeg)
+  if (real.length === 0) return { kind: 'none' }
+  real.sort((a, b) => compareNames(a.seg, b.seg))
+  const groups: ModelGroup[] = real.map(({ seg, models: list }) => ({
+    key: seg === OTHER_MODELS_GROUP ? `seg:${seg}` : seg,
+    label: `${seg} (${list.length})`,
+    segment: seg,
+    models: list,
+  }))
+  if (other.length > 0) {
+    groups.push({ key: OTHER_MODELS_GROUP, label: `other models (${other.length})`, models: other })
+  }
+  return { kind: 'split', groups }
+}
+
+export type ModelTreeLeaf = {
+  kind: 'leaf'
+  /** Chosen `/` prefix (ending in `/` or empty) to drop from model labels. */
+  prefix: string
+  models: HarnessModel[]
+}
+
+export type ModelTreeChild = {
+  key: string
+  label: string
+  count: number
+  node: ModelTreeNode
+}
+
+export type ModelTreeBranch = {
+  kind: 'branch'
+  by: 'prefix' | 'run'
+  prefix: string
+  children: ModelTreeChild[]
+}
+
+export type ModelTreeNode = ModelTreeLeaf | ModelTreeBranch
+
+const balancedChunks = <T>(items: readonly T[], maxPerChunk: number): T[][] => {
+  const count = Math.ceil(items.length / maxPerChunk)
+  const out: T[][] = []
+  let at = 0
+  for (let i = 0; i < count; i++) {
+    const size = Math.ceil((items.length - at) / (count - i))
+    out.push(items.slice(at, at + size))
+    at += size
+  }
+  return out
+}
+
+const commonPrefixLen = (strings: readonly string[]): number => {
+  if (strings.length < 2) return 0
+  const first = strings[0]!
+  let len = first.length
+  for (let i = 1; i < strings.length && len > 0; i++) {
+    const s = strings[i]!
+    len = Math.min(len, s.length)
+    for (let j = 0; j < len; j++) {
+      if (first[j] !== s[j]) {
+        len = j
+        break
+      }
+    }
+  }
+  // Back up to a natural boundary so names stay readable.
+  const sep = Math.max(first.lastIndexOf('/', len - 1), first.lastIndexOf('.', len - 1), first.lastIndexOf('-', len - 1), first.lastIndexOf('_', len - 1), first.lastIndexOf(' ', len - 1))
+  return sep >= 0 ? sep + 1 : 0
+}
+
+const trimTag = (s: string, skip = 0): string => {
+  const t = s.slice(skip).trim() || s.trim()
+  return t.length <= 20 ? t : `${t.slice(0, 19)}…`
+}
+
+const rangeLabels = <T>(chunks: readonly T[][], keyOf: (item: T) => string, countOf: (chunk: T[]) => number): string[] => {
+  const pairs = chunks.map(c => ({ first: keyOf(c[0]!).trim(), last: keyOf(c[c.length - 1]!).trim(), count: countOf(c) }))
+  const oneChar = pairs.map(({ first, last }) => {
+    const lo = (first[0] ?? '?').toLowerCase()
+    const hi = (last[0] ?? '?').toLowerCase()
+    return lo === hi ? lo : `${lo} … ${hi}`
+  })
+  if (new Set(oneChar).size === oneChar.length) {
+    return pairs.map((p, i) => `${oneChar[i]} (${p.count})`)
+  }
+  const direct = pairs.map(({ first, last }) => {
+    const lo = trimTag(first)
+    const hi = trimTag(last)
+    return lo === hi ? lo : `${lo} … ${hi}`
+  })
+  if (new Set(direct).size === direct.length) {
+    return pairs.map((p, i) => `${direct[i]} (${p.count})`)
+  }
+  const skip = commonPrefixLen(pairs.flatMap(p => [p.first, p.last]))
+  return pairs.map(({ first, last, count }) => {
+    const lo = trimTag(first, skip)
+    const hi = trimTag(last, skip)
+    return `${lo === hi ? lo : `${lo} … ${hi}`} (${count})`
+  })
+}
+
+const wrapBranch = (by: 'prefix' | 'run', prefix: string, children: ModelTreeChild[], maxChildren: number): ModelTreeBranch => {
+  if (children.length <= maxChildren) return { kind: 'branch', by, prefix, children }
+  const chunks = balancedChunks(children, maxChildren)
+  const labels = rangeLabels(
+    chunks,
+    c => (c.key === OTHER_MODELS_GROUP ? 'other' : c.label.replace(/\s*\(\d+\)$/, '')),
+    chunk => chunk.reduce((n, c) => n + c.count, 0),
+  )
+  const wrapped: ModelTreeChild[] = chunks.map((chunk, i) => ({
+    key: `run:${i}`,
+    label: labels[i]!,
+    count: chunk.reduce((n, c) => n + c.count, 0),
+    node: { kind: 'branch', by, prefix, children: chunk },
+  }))
+  return wrapBranch('run', prefix, wrapped, maxChildren)
+}
+
+/**
+ * Builds a tree of model groups so every Select stays within `max` options (default 64):
+ * leaves hold at most `leaf` models (61 at 64); larger nodes split by `/` segments (skipping
+ * a segment shared by every model) or fall back to name-ordered runs.
+ */
+export const buildModelTree = (models: readonly HarnessModel[], opts: { max?: number } = {}): ModelTreeNode => {
+  const budget = modelPickerBudget(opts.max)
+  const build = (list: readonly HarnessModel[], depth: number, prefix: string, allowPrefix: boolean): ModelTreeNode => {
+    if (list.length <= budget.leaf) return { kind: 'leaf', prefix, models: [...list] }
+    if (allowPrefix) {
+      const grouped = groupModels(list, depth)
+      if (grouped.kind === 'shared') {
+        return build(list, depth + 1, `${prefix}${grouped.segment}/`, true)
+      }
+      if (grouped.kind === 'split') {
+        const children: ModelTreeChild[] = grouped.groups.map(g => ({
+          key: g.key,
+          label: g.label,
+          count: g.models.length,
+          node:
+            g.segment !== undefined
+              ? build(g.models, depth + 1, `${prefix}${g.segment}/`, true)
+              : build(g.models, depth, prefix, false),
+        }))
+        return wrapBranch('prefix', prefix, children, budget.group)
+      }
+    }
+    const keyOf = (m: HarnessModel) => stripModelPrefix(m.name || m.id, prefix)
+    const sorted = [...list].sort((a, b) => compareNames(keyOf(a), keyOf(b)))
+    const chunks = balancedChunks(sorted, budget.leaf)
+    const labels = rangeLabels(chunks, keyOf, c => c.length)
+    const children: ModelTreeChild[] = chunks.map((chunk, i) => ({
+      key: `run:${i}`,
+      label: labels[i]!,
+      count: chunk.length,
+      node: { kind: 'leaf', prefix, models: chunk },
+    }))
+    return wrapBranch('run', prefix, children, budget.group)
+  }
+  return build(models, 0, '', true)
+}
+
+const findModelPath = (node: ModelTreeNode, id: string): string[] | undefined => {
+  if (node.kind === 'leaf') return node.models.some(m => m.id === id) ? [] : undefined
+  for (const child of node.children) {
+    const rest = findModelPath(child.node, id)
+    if (rest) return [child.key, ...rest]
+  }
+  return undefined
+}
+
+export type PickerLevel =
+  | {
+      kind: 'group'
+      depth: number
+      label: string
+      value: string
+      options: SelectOption[]
+    }
+  | {
+      kind: 'model'
+      depth: number
+      label: string
+      value: string
+      options: SelectOption[]
+      prefix: string
+    }
+
+export type PickerLevelsOptions = {
+  selected?: string
+  group?: readonly string[]
+  filter?: string
+  max?: number
+  defaultLabel?: string
+  hasOther?: boolean
+  otherValue?: string
+  isTyping?: boolean
+  labelOf?: (model: HarnessModel, prefix: string) => string
+}
+
+export type PickerState = {
+  levels: PickerLevel[]
+  group: string[]
+  showSearch: boolean
+  matchCount: number
+  narrowHint?: string
+}
+
+const uniqueOptions = (options: readonly SelectOption[]): SelectOption[] => {
+  const seen = new Set<string>()
+  const out: SelectOption[] = []
+  for (const o of options) {
+    if (seen.has(o.value)) continue
+    seen.add(o.value)
+    out.push(o)
+  }
+  return out
+}
+
+/**
+ * Turns a harness's model list into the Selects to draw, keeping every Select within `max`
+ * options (default 64). Under the single-Select limit it returns one flat Select unchanged;
+ * above it, returns group Selects down to a leaf model Select plus search state.
+ */
+export const pickerLevels = (models: readonly HarnessModel[], opts: PickerLevelsOptions = {}): PickerState => {
+  const budget = modelPickerBudget(opts.max)
+  const defaultLabel = opts.defaultLabel ?? 'Default'
+  const otherValue = opts.otherValue ?? '__other__'
+  const hasOther = opts.hasOther ?? true
+  const labelOf = opts.labelOf ?? modelOptionLabel
+  const selected = opts.selected || undefined
+  const isKnownSelected = !!selected && models.some(m => m.id === selected)
+  const isTyping = opts.isTyping || (hasOther && !!selected && !isKnownSelected)
+  const fixedHead: SelectOption[] = [{ value: '', label: defaultLabel }]
+  const fixedTail: SelectOption[] = hasOther ? [{ value: otherValue, label: 'Other…' }] : []
+  const filter = opts.filter?.trim() ?? ''
+  const showSearch = models.length > budget.single
+
+  const buildLeaf = (leafModels: readonly HarnessModel[], prefix: string, depth: number): PickerLevel => {
+    const middle: SelectOption[] = leafModels.map(m => ({ value: m.id, label: labelOf(m, prefix) }))
+    if (!isTyping && selected && !leafModels.some(m => m.id === selected) && selected !== otherValue) {
+      const selModel = models.find(m => m.id === selected)
+      middle.unshift({ value: selected, label: selModel ? labelOf(selModel, '') : selected })
+    }
+    const capped = capSelectOptions(uniqueOptions(middle), {
+      max: budget.max,
+      keep: isTyping ? undefined : selected,
+      fixedHead,
+      fixedTail,
+    })
+    return {
+      kind: 'model',
+      depth,
+      label: 'Model',
+      value: isTyping ? otherValue : (selected ?? ''),
+      options: uniqueOptions(capped.options),
+      prefix,
+    }
+  }
+
+  if (!showSearch) {
+    return {
+      levels: [buildLeaf(models, '', 0)],
+      group: [],
+      showSearch: false,
+      matchCount: models.length,
+    }
+  }
+
+  const matched = filter ? filterModels(models, filter) : [...models]
+  if (filter && matched.length <= budget.leaf) {
+    return {
+      levels: [buildLeaf(matched, '', 0)],
+      group: [],
+      showSearch: true,
+      matchCount: matched.length,
+    }
+  }
+
+  const narrowHint = filter ? `${matched.length} matches · type more to narrow` : undefined
+  const tree = buildModelTree(matched, { max: budget.max })
+  const selectedPath = selected ? findModelPath(tree, selected) : undefined
+  const levels: PickerLevel[] = []
+  const resolvedGroup: string[] = []
+  let node: ModelTreeNode = tree
+  let depth = 0
+  let followsSelected = !!selectedPath
+
+  while (node.kind === 'branch') {
+    const wanted = opts.group?.[depth]
+    const byWanted = wanted !== undefined ? node.children.find(c => c.key === wanted) : undefined
+    const bySelected =
+      !byWanted && followsSelected && selectedPath?.[depth] !== undefined
+        ? node.children.find(c => c.key === selectedPath[depth])
+        : undefined
+    const chosen = byWanted ?? bySelected ?? node.children[0]!
+    if (byWanted && selectedPath?.[depth] !== byWanted.key) followsSelected = false
+    const groupLabel = node.by === 'run' ? 'Range' : depth === 0 ? 'Provider' : 'Group'
+    const cappedGroup = capSelectOptions(
+      uniqueOptions(node.children.map(c => ({ value: c.key, label: c.label }))),
+      { max: budget.max, keep: chosen.key },
+    )
+    levels.push({
+      kind: 'group',
+      depth,
+      label: groupLabel,
+      value: chosen.key,
+      options: uniqueOptions(cappedGroup.options),
+    })
+    resolvedGroup.push(chosen.key)
+    node = chosen.node
+    depth++
+  }
+
+  levels.push(buildLeaf(node.models, node.prefix, depth))
+  return {
+    levels,
+    group: resolvedGroup,
+    showSearch: true,
+    matchCount: matched.length,
+    narrowHint,
+  }
+}
+
+const routeChoice = (m: HarnessModel): RouteModelChoice => {
+  const label = m.name || m.id
+  const detail = [label !== m.id ? m.id : '', m.note ?? ''].filter(Boolean).join(' · ')
+  return detail ? { value: m.id, label, detail } : { value: m.id, label }
+}
 
 /** What bin/models.mjs is asked to do; the env and provider can hold a key, so it goes through a file it deletes. */
 export type ModelQuery = {
@@ -227,7 +691,7 @@ export const parseModels = (stdout: string): { models: HarnessModel[] } | { erro
   }
 }
 
-/** Fusion selections also remain compatible with harnesses saved with the old virtual model ids. */
+/** Fusion models offered alongside Auto in the Copilot picker; they run directly as --model <id>. */
 const COPILOT_FUSION: HarnessModel[] = [
   { id: 'hydrafusion', name: 'Copilot Fusion Standard', note: 'picks models per prompt' },
   { id: 'hydrafusion-max', name: 'Copilot Fusion Max', note: 'picks models per prompt' },
@@ -240,6 +704,78 @@ export const withFusion = (h: Pick<Harness, 'parser' | 'provider'>, models: Harn
     : models
 
 export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
+
+/** A model's name as the model pickers show it: the name its list gives, else the id. */
+export const modelName = (id: string, models: readonly HarnessModel[] = []): string => models.find(m => m.id === id)?.name ?? id
+
+/**
+ * The model a card shows, by name: a harness card looks in its harness's model list, a Claude
+ * card (a subagent, or a Claude Code harness) in Claude's. Codex's list has ids only.
+ */
+export const cardModelName = (c: Pick<AgentCard, 'provider' | 'harness' | 'model'>, harnesses: readonly Harness[]): string => {
+  const h = c.provider === 'harness' ? harnesses.find(x => x.id === c.harness) : undefined
+  const list = [...(h?.models ?? []), ...(c.provider === 'claude' || h?.parser === 'claude' ? CLAUDE_MODELS : [])]
+  return modelName(c.model, list)
+}
+
+// ---------- reasoning effort ----------
+
+/**
+ * How each CLI takes a reasoning effort, as its --help gives it. Copilot: --reasoning-effort;
+ * Claude Code and Antigravity: --effort; OpenCode: --variant (provider-specific); Codex exec:
+ * -c model_reasoning_effort=. Gemini and Cursor have no such flag, so they are not listed.
+ */
+const EFFORT_FLAGS: Partial<Record<HarnessParser, { flag: string; config?: string; levels: readonly string[] }>> = {
+  copilot: { flag: '--reasoning-effort', levels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+  claude: { flag: '--effort', levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  antigravity: { flag: '--effort', levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  opencode: { flag: '--variant', levels: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+  codex: { flag: '-c', config: 'model_reasoning_effort', levels: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
+}
+
+/** The codex tool's efforts (its model_reasoning_effort). */
+export const CODEX_EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh']
+/** The Agent tool's efforts for a Claude subagent. */
+export const SUBAGENT_EFFORTS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const TEMPLATE_EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** The efforts a harness takes: its CLI's, or the usual ones when its arguments place {effort}; none for a CLI without one. */
+export const harnessEfforts = (h: Pick<Harness, 'parser' | 'args'>): readonly string[] =>
+  EFFORT_FLAGS[h.parser]?.levels ?? (/\{effort\}/.test(h.args) ? TEMPLATE_EFFORTS : [])
+
+/** The efforts a task's route offers, or why it offers none; undefined while it has no agent. */
+export const routeEffortChoices = (target: string, h: Harness | undefined): { levels: readonly string[] } | { reason: string } | undefined => {
+  if (!target) return undefined
+  if (target === 'codex') return { levels: CODEX_EFFORTS }
+  if (target === 'claude') return { levels: SUBAGENT_EFFORTS }
+  if (!h) return undefined
+  const levels = harnessEfforts(h)
+  if (levels.length) return { levels }
+  return { reason: h.parser === 'text' ? `Put {effort} in ${h.name}'s arguments where its CLI takes one.` : `${h.name}'s CLI has none.` }
+}
+
+const EFFORT_LABELS: Record<string, string> = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' }
+
+/** An effort level as the pickers show it, in sentence case ("xhigh" → "Extra high"); the stored value stays as it is. */
+export const effortLabel = (level: string): string => EFFORT_LABELS[level] ?? (level ? level[0]!.toUpperCase() + level.slice(1) : level)
+
+/** Puts the effort flag in front of the prompt (and the flag before it), replacing one already there. */
+const placeEffort = (args: string[], parser: HarnessParser, effort: string, prompt: string) => {
+  const how = EFFORT_FLAGS[parser]
+  if (!how) return
+  if (how.config) {
+    const key = `${how.config}=`
+    for (let i = args.length - 1; i >= 0; i--) {
+      if ((args[i] === '-c' || args[i] === '--config') && args[i + 1]?.startsWith(key)) args.splice(i, 2)
+      else if (args[i]?.startsWith(`--config=${key}`)) args.splice(i, 1)
+    }
+  } else removeArg(args, how.flag)
+  let at = args.findIndex(a => a.includes(prompt))
+  // Go and other parsers stop at the first word that is not a flag, so the effort goes before the prompt.
+  if (at < 0) at = args.length
+  else if (at > 0 && args[at - 1]!.startsWith('-') && !args[at - 1]!.includes('=')) at--
+  args.splice(at, 0, how.flag, how.config ? `${how.config}=${effort}` : effort)
+}
 
 // ---------- arguments ----------
 
@@ -268,9 +804,9 @@ export const tokenizeArgs = (s: string): string[] => {
   return words
 }
 
-export type ArgValues = { prompt: string; model?: string; session?: string; cwd?: string }
+export type ArgValues = { prompt: string; model?: string; session?: string; cwd?: string; effort?: string }
 
-const PLACEHOLDER = /\{(prompt|model|session|cwd)\}/g
+const PLACEHOLDER = /\{(prompt|model|session|cwd|effort)\}/g
 
 /**
  * Fills the template's placeholders. A word whose placeholders are all empty is
@@ -282,7 +818,7 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
   for (const word of tokenizeArgs(template)) {
     const names = [...word.matchAll(PLACEHOLDER)].map(m => m[1] as keyof ArgValues)
     if (names.length && names.every(n => !v[n])) {
-      const isBare = /^\{(prompt|model|session|cwd)\}$/.test(word)
+      const isBare = /^\{(prompt|model|session|cwd|effort)\}$/.test(word)
       const prev = out[out.length - 1]
       if (isBare && prev !== undefined && prev.startsWith('-') && !prev.includes('=')) out.pop()
       continue
@@ -294,11 +830,12 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
 
 export type CopilotRunOptions = { model?: string; autoTier?: string; maxAiCredits?: number }
 
-const isFusionModel = (model: string | undefined) => COPILOT_FUSION.some(f => f.id === model)
+export const isFusionModel = (model: string | undefined): boolean =>
+  !!model && (COPILOT_FUSION.some(f => f.id === model) || /^hydrafusion(?:$|[-_])/.test(model))
 
 const copilotRouting = (h: Harness, v: CopilotRunOptions) => {
   const model = v.autoTier && !v.model ? 'auto' : (v.model ?? h.model)
-  const tier = v.autoTier ?? (isFusionModel(model) ? model : v.model && v.model !== 'auto' ? undefined : h.autoTier)
+  const tier = v.autoTier ?? (v.model && v.model !== 'auto' ? undefined : isFusionModel(model) ? undefined : h.autoTier)
   return { model, tier }
 }
 
@@ -312,7 +849,7 @@ export const copilotOptionsError = (h: Harness, v: CopilotRunOptions = {}): stri
   const { model, tier } = copilotRouting(h, v)
   if (tier !== undefined && (!tier.trim() || /\s/.test(tier))) return 'Give an Auto routing profile id without spaces.'
   if (h.provider && (tier || model === 'auto' || isFusionModel(model))) return 'Auto and Fusion use GitHub models, not your own API.'
-  if (tier && model && model !== 'auto' && !isFusionModel(model)) return 'Pick Auto to use an Auto routing profile.'
+  if (tier && model && model !== 'auto') return 'Pick Auto to use an Auto routing profile.'
   if (limit !== undefined && (!Number.isFinite(limit) || limit < 30)) return 'The AI credit limit must be at least 30.'
   return undefined
 }
@@ -359,9 +896,17 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
   const error = copilotOptionsError(h, v)
   if (error) throw new Error(error)
   const { model, tier } = copilotRouting(h, v)
-  if (h.parser !== 'copilot') return { args: expandArgs(h.args, { ...v, model }) }
-  const values = { prompt: v.prompt, model: tier ? 'auto' : model, session: v.session, cwd: v.cwd }
-  const markers = { prompt: '\0agent-deck-prompt\0', model: '\0agent-deck-model\0', session: '\0agent-deck-session\0', cwd: '\0agent-deck-cwd\0' }
+  // An effort the CLI doesn't take is left out; one the arguments place themselves goes through {effort}.
+  const effort = v.effort && harnessEfforts(h).includes(v.effort) ? v.effort : undefined
+  const hasEffortSlot = /\{effort\}/.test(h.args)
+  const promptMark = '\0agent-deck-prompt\0'
+  if (h.parser !== 'copilot') {
+    const args = expandArgs(h.args, { ...v, model, effort, prompt: v.prompt ? promptMark : v.prompt })
+    if (effort && !hasEffortSlot) placeEffort(args, h.parser, effort, promptMark)
+    return { args: args.map(a => a.split(promptMark).join(v.prompt)) }
+  }
+  const values = { prompt: v.prompt, model: tier ? 'auto' : model, session: v.session, cwd: v.cwd, effort }
+  const markers = { prompt: promptMark, model: '\0agent-deck-model\0', session: '\0agent-deck-session\0', cwd: '\0agent-deck-cwd\0', effort: '\0agent-deck-effort\0' }
   const expand = (arg: string) =>
     (Object.keys(markers) as (keyof typeof markers)[]).reduce((word, name) => word.split(markers[name]).join(values[name] ?? ''), arg)
   const args = expandArgs(h.args, {
@@ -369,6 +914,7 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
     model: values.model ? markers.model : undefined,
     session: values.session ? markers.session : undefined,
     cwd: values.cwd ? markers.cwd : undefined,
+    effort: values.effort ? markers.effort : undefined,
   })
   for (let i = 0; i < args.length - 1; i++) {
     const prompt = args[i + 1]
@@ -383,12 +929,13 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
       for (let i = args.length - 1; i >= 0; i--) if (args[i] === '--no-experimental') args.splice(i, 1)
       if (!args.includes('--experimental')) args.push('--experimental')
     }
-  } else if (v.model) {
-    setArg(args, '--model', v.model)
-    if (v.model !== 'auto') removeArg(args, '--auto-tier')
+  } else if (v.model || isFusionModel(model)) {
+    if (model) setArg(args, '--model', model)
+    if (model !== 'auto') removeArg(args, '--auto-tier')
   }
   const limit = v.maxAiCredits ?? h.maxAiCredits
   if (limit !== undefined) setArg(args, '--max-ai-credits', String(limit))
+  if (effort && !hasEffortSlot) placeEffort(args, h.parser, effort, markers.prompt)
   protectCopilotKey(args)
   if (v.usageFile && !args.some(a => a === '--usage-output-file' || a.startsWith('--usage-output-file='))) args.push('--usage-output-file', v.usageFile)
   let usageIndex = -1
@@ -436,6 +983,17 @@ export const harnessError = (h: Harness, others: readonly Harness[]): string | u
 /** A model group's short name: "Gemini Models" → "Gemini", "Claude and GPT models" → "Claude & GPT". */
 const agyGroupName = (name: string) => name.replace(/\s+models$/i, '').replace(/\s+and\s+/i, ' & ').trim()
 
+export type AgyFamily = 'gemini' | 'argon' | 'other'
+
+/**
+ * A bucket's model family, keyed on agy's bucket id (gemini-5h, gemini-weekly, gemini-argon-…, 3p-5h),
+ * which stays put where the group's display name may not; the display name only when there is no id.
+ */
+const agyFamilyOf = (key: string): AgyFamily => {
+  const s = key.toLowerCase()
+  return s.includes('argon') ? 'argon' : s.startsWith('gemini') ? 'gemini' : 'other'
+}
+
 /**
  * The windows of agy's RetrieveUserQuotaSummary (what `/usage` shows), as meters: each group's
  * weekly and 5-hour limit, used rather than remaining, so they read like the other providers'.
@@ -454,6 +1012,8 @@ export const agyLimits = (quota: unknown): LimitWindow[] => {
         name: `${name} · ${window === '5h' ? '5-hour limit' : window === '7d' ? 'Weekly limit' : `${window} limit`}`,
         percent: Math.min(100, Math.max(0, Math.round((1 - b.remainingFraction) * 1000) / 10)),
         resetsAt: Number.isFinite(reset) ? reset : undefined,
+        group: agyFamilyOf(str(b.bucketId) ?? str(group.displayName) ?? ''),
+        span: window,
       })
     }
   }
@@ -472,7 +1032,7 @@ export type HarnessEvent =
   | { kind: 'session'; id: string }
   | { kind: 'credits'; credits: number }
   | { kind: 'copilot-usage'; models?: Record<string, CopilotModelUsage>; credits?: number; creditsStatus?: CopilotModelUsage['aiCreditsStatus']; isAdded?: boolean }
-  | { kind: 'error'; text: string }
+  | { kind: 'error'; text: string; isExitCode?: boolean }
   | { kind: 'final'; text: string }
 
 type J = Record<string, unknown>
@@ -601,7 +1161,7 @@ const copilot = (e: J): HarnessEvent[] => {
       const out: HarnessEvent[] = []
       if (str(e.sessionId)) out.push({ kind: 'session', id: e.sessionId as string })
       out.push(...copilotTotals(obj(e.usage)))
-      if (typeof e.exitCode === 'number' && e.exitCode !== 0) out.push({ kind: 'error', text: `Copilot exited ${e.exitCode}` })
+      if (typeof e.exitCode === 'number' && e.exitCode !== 0) out.push({ kind: 'error', text: `Copilot exited ${e.exitCode}`, isExitCode: true })
       return out
     }
   }
@@ -895,7 +1455,7 @@ const append = (card: AgentCard, text: string) => {
 }
 
 /** Folds one event into a harness card. */
-export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
+export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent, knownSecrets?: readonly string[]) => {
   switch (ev.kind) {
     case 'model':
       card.model = ev.model
@@ -963,7 +1523,7 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
       break
     }
     case 'error':
-      card.error = ev.text
+      if (!ev.isExitCode || !card.error) card.error = redactSecrets(stripAnsi(ev.text), knownSecrets).trim() || ev.text
       break
     case 'final':
       break
@@ -973,6 +1533,304 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
 const sumTokens = (a: Tokens, b: Tokens): Tokens => ({
   input: a.input + b.input, output: a.output + b.output, cacheRead: a.cacheRead + b.cacheRead, cacheWrite: a.cacheWrite + b.cacheWrite, reasoning: a.reasoning + b.reasoning,
 })
+
+// ---------- persisting cards across restarts ----------
+
+export const CARD_TTL_MS = 3 * 86_400_000
+export const CARD_STALE_MS = 2 * 60_000
+/** Total serialized JSON byte budget for persisted cards across all sessions (safely under the 4 MiB store limit). */
+export const CARD_MAX_BYTES = 1_500_000
+export const CARDS_KEY_PREFIX = 'cards:'
+export const cardsKey = (sessionId: string): string => `${CARDS_KEY_PREFIX}${sessionId}`
+
+export type SavedSessionCards = { savedAt: number; cards: AgentCard[] }
+export type SavedCards = Record<string, SavedSessionCards>
+export type CardsIndexEntry = { savedAt: number; bytes: number }
+export type CardsIndex = Record<string, CardsIndexEntry>
+
+const utf8Encoder = new TextEncoder()
+export const jsonBytes = (value: unknown): number => utf8Encoder.encode(JSON.stringify(value)).length
+
+const snapshotCard = (c: AgentCard, maxOutput: number): AgentCard => {
+  const output = typeof c.output === 'string' ? c.output : ''
+  return {
+    ...c,
+    output: output.length > maxOutput ? output.slice(-maxOutput) : output,
+    tokens: c.tokens ? { ...c.tokens } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+    activity: Array.isArray(c.activity) ? c.activity.map(a => ({ ...a })) : [],
+    ...(c.modelUsage
+      ? {
+          modelUsage: Object.fromEntries(
+            Object.entries(c.modelUsage).map(([k, u]) => [k, { ...u, tokens: { ...u.tokens } }]),
+          ),
+        }
+      : {}),
+  }
+}
+
+const cleanCardList = (raw: unknown, maxOutput: number): AgentCard[] =>
+  Array.isArray(raw)
+    ? raw
+        .filter((c): c is AgentCard => {
+          const o = obj(c)
+          return typeof o.id === 'string' && !!o.id && typeof o.provider === 'string' && typeof o.status === 'string'
+        })
+        .map(c => snapshotCard(c, maxOutput))
+    : []
+
+/**
+ * Fits one session's cards into `maxBytes`: trims output of the oldest finished cards first,
+ * then drops the oldest finished cards (and then oldest cards), and finally shrinks any single
+ * remaining card's output and optional metadata until serialized JSON fits.
+ */
+const fitSessionCards = (
+  cards: readonly AgentCard[],
+  now: number,
+  opts: { maxCards: number; maxOutput: number; maxBytes: number },
+): SavedSessionCards => {
+  const list = cards.slice(-opts.maxCards).map(c => snapshotCard(c, opts.maxOutput))
+  const entry: SavedSessionCards = { savedAt: now, cards: list }
+  if (jsonBytes(entry) <= opts.maxBytes) return entry
+  // First, trim output of the oldest finished cards so cards stay listed while shedding bulk.
+  for (const card of list) {
+    if (jsonBytes(entry) <= opts.maxBytes) return entry
+    if (card.status === 'running' || !card.output) continue
+    let out = card.output
+    while (out.length > 0 && jsonBytes(entry) > opts.maxBytes) {
+      out = out.length <= 16 ? '' : out.slice(-Math.floor(out.length / 2))
+      card.output = out
+    }
+  }
+  if (jsonBytes(entry) <= opts.maxBytes) return entry
+  // Next, drop oldest finished cards first, then oldest remaining cards while more than one remains.
+  while (list.length > 1 && jsonBytes(entry) > opts.maxBytes) {
+    const finishedIdx = list.findIndex(c => c.status !== 'running')
+    list.splice(finishedIdx >= 0 ? finishedIdx : 0, 1)
+  }
+  // If a single card still exceeds the budget, trim its output, then optional fields.
+  if (list.length === 1 && jsonBytes(entry) > opts.maxBytes) {
+    const card = list[0]!
+    let out = card.output
+    while (out.length > 0 && jsonBytes(entry) > opts.maxBytes) {
+      out = out.length <= 16 ? '' : out.slice(-Math.floor(out.length / 2))
+      card.output = out
+    }
+    if (jsonBytes(entry) > opts.maxBytes && card.activity.length > 0) card.activity = []
+    if (jsonBytes(entry) > opts.maxBytes && card.modelUsage) card.modelUsage = undefined
+    if (jsonBytes(entry) > opts.maxBytes && card.error && card.error.length > 120) card.error = card.error.slice(0, 120)
+    if (jsonBytes(entry) > opts.maxBytes) list.length = 0
+  }
+  return entry
+}
+
+/**
+ * Merges one session's cards into the stored per-session map, trimming each card's
+ * output to maxOutput, capping to maxCards, pruning entries older than ttlMs, and
+ * enforcing a total serialized byte budget (dropping oldest sessions, then oldest
+ * cards and their output).
+ */
+export const mergeSavedCards = (
+  stored: unknown,
+  sessionId: string,
+  cards: readonly AgentCard[],
+  now: number,
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number; maxBytes?: number } = {},
+): SavedCards => {
+  const maxCards = opts.maxCards ?? 40
+  const maxOutput = opts.maxOutput ?? MAX_OUTPUT
+  const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const maxBytes = opts.maxBytes ?? CARD_MAX_BYTES
+  const next: SavedCards = {}
+  if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+    for (const [sid, entry] of Object.entries(stored as Record<string, unknown>)) {
+      if (!sid || sid === sessionId) continue
+      const o = obj(entry)
+      const savedAt = typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : undefined
+      if (savedAt === undefined || !Array.isArray(o.cards) || now - savedAt > ttlMs) continue
+      next[sid] = { savedAt, cards: o.cards as AgentCard[] }
+    }
+  }
+  if (sessionId && cards.length > 0) {
+    next[sessionId] = {
+      savedAt: now,
+      cards: cards.slice(-maxCards).map(c => snapshotCard(c, maxOutput)),
+    }
+  }
+  if (jsonBytes(next) > maxBytes) {
+    const others = Object.entries(next)
+      .filter(([sid]) => sid !== sessionId)
+      .sort((a, b) => a[1].savedAt - b[1].savedAt)
+    for (const [sid] of others) {
+      if (jsonBytes(next) <= maxBytes) break
+      delete next[sid]
+    }
+    if (sessionId && next[sessionId] && jsonBytes(next) > maxBytes) {
+      const overhead = jsonBytes({ [sessionId]: { savedAt: now, cards: [] } }) - jsonBytes({ savedAt: now, cards: [] })
+      const fitted = fitSessionCards(next[sessionId]!.cards, now, {
+        maxCards,
+        maxOutput,
+        maxBytes: Math.max(0, maxBytes - overhead),
+      })
+      if (fitted.cards.length > 0) next[sessionId] = fitted
+      else delete next[sessionId]
+    }
+  }
+  return next
+}
+
+/** Reads one session's saved cards from the legacy shared map; empty when absent or unreadable. */
+export const loadSessionCards = (stored: unknown, sessionId: string, maxOutput = MAX_OUTPUT): AgentCard[] => {
+  if (!sessionId || !stored || typeof stored !== 'object' || Array.isArray(stored)) return []
+  return loadSingleSessionCards((stored as Record<string, unknown>)[sessionId], maxOutput)
+}
+
+/** Reads one session's saved cards from its own `cards:<sessionId>` store value. */
+export const loadSingleSessionCards = (stored: unknown, maxOutput = MAX_OUTPUT): AgentCard[] => {
+  const entry = obj(stored)
+  return cleanCardList(entry.cards, maxOutput)
+}
+
+/** Parses the small `cards-index` map (`sessionId -> { savedAt, bytes }`), ignoring malformed entries. */
+export const parseCardsIndex = (stored: unknown): CardsIndex => {
+  const out: CardsIndex = {}
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return out
+  for (const [sid, raw] of Object.entries(stored as Record<string, unknown>)) {
+    if (!sid) continue
+    const o = obj(raw)
+    const savedAt = typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : undefined
+    const bytes = typeof o.bytes === 'number' && Number.isFinite(o.bytes) && o.bytes >= 0 ? o.bytes : undefined
+    if (savedAt === undefined || bytes === undefined) continue
+    out[sid] = { savedAt, bytes }
+  }
+  return out
+}
+
+/**
+ * Plans a per-session card save: trims this session's entry, prunes expired sessions and
+ * oldest other sessions until the indexed total fits within `maxBytes`, and returns the
+ * entry to write to `cards:<sessionId>`, the updated `cards-index`, and session ids to delete.
+ */
+export const planCardsSave = (
+  indexStored: unknown,
+  sessionId: string,
+  cards: readonly AgentCard[],
+  now: number,
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number; maxBytes?: number } = {},
+): { entry?: SavedSessionCards; index: CardsIndex; prune: string[] } => {
+  const maxCards = opts.maxCards ?? 40
+  const maxOutput = opts.maxOutput ?? MAX_OUTPUT
+  const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const maxBytes = opts.maxBytes ?? CARD_MAX_BYTES
+  const prev = parseCardsIndex(indexStored)
+  const index: CardsIndex = {}
+  const prune: string[] = []
+  for (const [sid, meta] of Object.entries(prev)) {
+    if (sid === sessionId) continue
+    if (now - meta.savedAt > ttlMs) prune.push(sid)
+    else index[sid] = meta
+  }
+  let entry: SavedSessionCards | undefined
+  if (sessionId && cards.length > 0) {
+    entry = fitSessionCards(cards, now, { maxCards, maxOutput, maxBytes })
+    if (entry.cards.length > 0) {
+      index[sessionId] = { savedAt: now, bytes: jsonBytes(entry) }
+    } else {
+      entry = undefined
+    }
+  }
+  const totalBytes = () =>
+    Object.values(index).reduce((sum, e) => sum + e.bytes, 0) + jsonBytes(index)
+  if (totalBytes() > maxBytes) {
+    const others = Object.entries(index)
+      .filter(([sid]) => sid !== sessionId)
+      .sort((a, b) => a[1].savedAt - b[1].savedAt)
+    for (const [sid] of others) {
+      if (totalBytes() <= maxBytes) break
+      delete index[sid]
+      prune.push(sid)
+    }
+    if (entry && totalBytes() > maxBytes) {
+      const indexBytes = jsonBytes(index)
+      const fitted = fitSessionCards(entry.cards, now, {
+        maxCards,
+        maxOutput,
+        maxBytes: Math.max(0, maxBytes - indexBytes),
+      })
+      if (fitted.cards.length > 0) {
+        entry = fitted
+        index[sessionId] = { savedAt: now, bytes: jsonBytes(fitted) }
+      } else {
+        entry = undefined
+        delete index[sessionId]
+      }
+    }
+  }
+  return { entry, index, prune }
+}
+
+/**
+ * Migrates the legacy shared `cards` map into per-session `cards:<sessionId>` entries and
+ * a `cards-index`, pruning expired entries and keeping total serialized bytes within `maxBytes`.
+ */
+export const migrateLegacyCards = (
+  legacyStored: unknown,
+  existingIndexStored: unknown,
+  now: number,
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number; maxBytes?: number } = {},
+): { sessions: Record<string, SavedSessionCards>; index: CardsIndex } => {
+  const maxCards = opts.maxCards ?? 40
+  const maxOutput = opts.maxOutput ?? MAX_OUTPUT
+  const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const maxBytes = opts.maxBytes ?? CARD_MAX_BYTES
+  const index = parseCardsIndex(existingIndexStored)
+  for (const [sid, meta] of Object.entries(index)) {
+    if (now - meta.savedAt > ttlMs) delete index[sid]
+  }
+  const sessions: Record<string, SavedSessionCards> = {}
+  if (legacyStored && typeof legacyStored === 'object' && !Array.isArray(legacyStored)) {
+    const entries = Object.entries(legacyStored as Record<string, unknown>)
+      .map(([sid, raw]) => {
+        const o = obj(raw)
+        const savedAt = typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : undefined
+        const cards = cleanCardList(o.cards, maxOutput).slice(-maxCards)
+        return savedAt !== undefined && cards.length > 0 && now - savedAt <= ttlMs ? { sid, savedAt, cards } : undefined
+      })
+      .filter((x): x is { sid: string; savedAt: number; cards: AgentCard[] } => !!x)
+      .sort((a, b) => b.savedAt - a.savedAt)
+    let used = Object.values(index).reduce((s, e) => s + e.bytes, 0) + jsonBytes(index)
+    for (const item of entries) {
+      if (index[item.sid] && index[item.sid]!.savedAt >= item.savedAt) continue
+      const remaining = maxBytes - used
+      if (remaining <= 0) break
+      const fitted = fitSessionCards(item.cards, item.savedAt, { maxCards, maxOutput, maxBytes: remaining })
+      if (!fitted.cards.length) continue
+      const bytes = jsonBytes(fitted)
+      if (used + bytes > maxBytes) continue
+      sessions[item.sid] = fitted
+      index[item.sid] = { savedAt: item.savedAt, bytes }
+      used += bytes
+    }
+  }
+  return { sessions, index }
+}
+
+/**
+ * Adjusts a restored card's status after a reload or restart. On a hot reload
+ * (`isSameProcess`), Claude Code is still running, so running Claude subagents stay
+ * running; on a fresh start they can't outlive the old process and become aborted.
+ * A running external Codex card with no recent rollout event shouldn't spin forever.
+ */
+export const restoreCard = (card: AgentCard, now: number, staleMs = CARD_STALE_MS, isSameProcess = false): AgentCard => {
+  if (card.status !== 'running') return card
+  if (card.provider === 'claude') {
+    return isSameProcess ? card : { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? now }
+  }
+  if (card.isExternal && card.provider === 'codex') {
+    const last = card.lastEventAt ?? card.startedAt
+    if (now - last > staleMs) return { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? last }
+  }
+  return card
+}
 
 // ---------- the tools ----------
 
@@ -994,10 +1852,10 @@ export const agentRunSpec = (enabled: readonly Harness[], routes: readonly Route
       'The run is its own process and survives session drops; its live output, model and tokens show in the Agents pane. ' +
       "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
       (enabled.length
-        ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${modelsHint(h)})`).join('; ')}. `
+        ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${harnessEfforts(h).length ? `, effort ${harnessEfforts(h).join('|')}` : ''}${modelsHint(h)})`).join('; ')}. `
         : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
       (tasks.length
-        ? `Task routing is on: pass \`task\` instead of harness and model to use the person's pick (${tasks.map(r => `${r.task} → ${r.harness}${r.model ? ` ${r.model}` : ''}`).join('; ')}). `
+        ? `Task routing is on: pass \`task\` instead of harness and model to use the person's pick (${tasks.map(r => `${r.task} → ${r.harness}${r.model ? ` ${r.model}` : ''}${r.effort ? ` effort ${r.effort}` : ''}`).join('; ')}). `
         : '') +
       'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
     inputSchema: {
@@ -1012,6 +1870,7 @@ export const agentRunSpec = (enabled: readonly Harness[], routes: readonly Route
         prompt: { type: 'string', description: 'The task.' },
         title: { type: 'string', description: 'A few words shown on the card.' },
         model: { type: 'string', description: "Model override; the harness's default when unset." },
+        effort: { type: 'string', description: "Reasoning effort, for a harness whose CLI takes one (the levels are listed with each harness). With `task`, the route's effort applies unless this is set." },
         autoTier: { type: 'string', description: 'Copilot Auto routing profile, such as efficiency, balance, intelligence, hydrafusion or hydrafusion-max. Requires Auto and account support; not BYOK.' },
         maxAiCredits: { type: 'number', minimum: 30, description: 'Copilot session-wide soft AI credit limit, including subagents. Overrides the harness limit; at least 30.' },
         cwd: { type: 'string', description: 'Working directory; defaults to the session cwd.' },
@@ -1052,16 +1911,24 @@ export const loadRouting = (stored: unknown): Routing => {
     const task = typeof r.task === 'string' ? taskSlug(r.task) : ''
     if (!task || seen.has(task)) continue
     seen.add(task)
-    routes.push({ task, target: typeof r.target === 'string' ? r.target : '', ...(str(r.model) ? { model: r.model as string } : {}) })
+    routes.push({ task, target: typeof r.target === 'string' ? r.target : '', ...(str(r.model) ? { model: r.model as string } : {}), ...(str(r.effort) ? { effort: r.effort as string } : {}) })
   }
   return { isOn: o.isOn === true, routes }
 }
 
 /** A route that can run now, as Claude is told about it. */
 export type RoutedTask =
-  | { kind: 'harness'; task: string; harness: string; name: string; model?: string }
-  | { kind: 'codex'; task: string; model?: string }
-  | { kind: 'claude'; task: string; model?: string }
+  | { kind: 'harness'; task: string; harness: string; name: string; model?: string; effort?: string }
+  | { kind: 'codex'; task: string; model?: string; effort?: string }
+  | { kind: 'claude'; task: string; model?: string; effort?: string }
+
+/** A route's effort, when its agent takes that effort; a stale pick (another harness, another CLI) is left out. */
+export const routeEffort = (r: TaskRoute, harnesses: readonly Harness[]): string | undefined => {
+  const effort = r.effort?.trim()
+  if (!effort) return undefined
+  const choices = routeEffortChoices(r.target, harnesses.find(h => h.id === r.target))
+  return choices && 'levels' in choices && choices.levels.includes(effort) ? effort : undefined
+}
 
 /** Why a route can't run now; undefined when it can, or has no target. */
 export const routeProblem = (r: TaskRoute, harnesses: readonly Harness[], isCodexOn: boolean): string | undefined => {
@@ -1079,8 +1946,9 @@ export const routedTasks = (routing: Routing, harnesses: readonly Harness[], isC
   for (const r of routing.routes) {
     if (!r.target || routeProblem(r, harnesses, isCodexOn)) continue
     const model = r.model?.trim() || undefined
-    if (r.target === 'codex' || r.target === 'claude') out.push({ kind: r.target, task: r.task, model })
-    else out.push({ kind: 'harness', task: r.task, harness: r.target, name: harnesses.find(h => h.id === r.target)?.name ?? r.target, model })
+    const effort = routeEffort(r, harnesses)
+    if (r.target === 'codex' || r.target === 'claude') out.push({ kind: r.target, task: r.task, model, effort })
+    else out.push({ kind: 'harness', task: r.task, harness: r.target, name: harnesses.find(h => h.id === r.target)?.name ?? r.target, model, effort })
   }
   return out
 }
@@ -1088,10 +1956,10 @@ export const routedTasks = (routing: Routing, harnesses: readonly Harness[], isC
 const routeLine = (r: RoutedTask): string => {
   const hint = taskHint(r.task)
   const what = `${r.task}${hint ? ` (${hint})` : ''}`
-  const model = r.model ? `, model ${r.model}` : ''
-  if (r.kind === 'codex') return `- ${what}: the codex tool${model}.`
-  if (r.kind === 'claude') return `- ${what}: a Claude subagent (the Agent tool${model}).`
-  return `- ${what}: agent_run with task "${r.task}" (${r.name}${model}).`
+  const picks = `${r.model ? `, model ${r.model}` : ''}${r.effort ? `, effort ${r.effort}` : ''}`
+  if (r.kind === 'codex') return `- ${what}: the codex tool${picks}.`
+  if (r.kind === 'claude') return `- ${what}: a Claude subagent (the Agent tool${picks}).`
+  return `- ${what}: agent_run with task "${r.task}" (${r.name}${picks}).`
 }
 
 /** The note that tells the main thread who does what; undefined when routing is off or nothing is routed. */
@@ -1117,26 +1985,251 @@ export const routingContext = (want: string | undefined, last: string | undefine
  * then the task's route. An error tells Claude what to do instead.
  */
 export const resolveRun = (
-  input: { harness?: string; task?: string; model?: string },
+  input: { harness?: string; task?: string; model?: string; effort?: string },
   routing: Routing,
   harnesses: readonly Harness[],
   isCodexOn: boolean,
-): { harness: string; model?: string } | { error: string } => {
-  if (!input.task) return input.harness ? { harness: input.harness, model: input.model } : { error: 'Name a harness, or a routed task.' }
+): { harness: string; model?: string; effort?: string } | { error: string } => {
+  const asked = { harness: input.harness!, model: input.model, effort: input.effort }
+  if (!input.task) return input.harness ? asked : { error: 'Name a harness, or a routed task.' }
   const task = taskSlug(input.task)
   const r = routing.routes.find(x => x.task === task)
   if (!routing.isOn || !r?.target) {
-    if (input.harness) return { harness: input.harness, model: input.model }
+    if (input.harness) return asked
     return { error: `No route for the task "${input.task}"${routing.isOn ? '' : ': task routing is off'}. Name a harness instead.` }
   }
-  if (input.harness) return { harness: input.harness, model: input.model ?? (input.harness === r.target ? r.model?.trim() || undefined : undefined) }
+  const isSame = !input.harness || input.harness === r.target
+  const model = input.model ?? (isSame ? r.model?.trim() || undefined : undefined)
+  const targetHarness = harnesses.find(h => h.id === (input.harness ?? r.target))
+  const effectiveModel = model ?? targetHarness?.model
+  // Plans may restrict Copilot Fusion effort to the CLI's default, so don't inherit a route's effort onto Fusion unless set explicitly.
+  const inheritedEffort =
+    isSame && !(targetHarness?.parser === 'copilot' && isFusionModel(effectiveModel)) ? routeEffort(r, harnesses) : undefined
+  const effort = input.effort ?? inheritedEffort
+  if (input.harness) return { harness: input.harness, model, effort }
   const problem = routeProblem(r, harnesses, isCodexOn)
   if (problem) return { error: `The "${task}" route can't run: ${problem}. Tell the person, and ask before using another agent.` }
-  const model = input.model ?? (r.model?.trim() || undefined)
-  if (r.target === 'codex') return { error: `The "${task}" task goes to the built-in Codex: use the codex tool${model ? ` with model ${model}` : ''}.` }
-  if (r.target === 'claude') return { error: `The "${task}" task goes to a Claude subagent: use the Agent tool${model ? ` with model ${model}` : ''}.` }
-  return { harness: r.target, model }
+  const picks = [model ? `model ${model}` : '', effort ? `effort ${effort}` : ''].filter(Boolean).join(' and ')
+  if (r.target === 'codex') return { error: `The "${task}" task goes to the built-in Codex: use the codex tool${picks ? ` with ${picks}` : ''}.` }
+  if (r.target === 'claude') return { error: `The "${task}" task goes to a Claude subagent: use the Agent tool${picks ? ` with ${picks}` : ''}.` }
+  return { harness: r.target, model, effort }
 }
+
+/** Why an effort can't go to a harness; undefined when it can, or none was asked. */
+export const effortProblem = (h: Pick<Harness, 'name' | 'parser' | 'args'>, effort: string | undefined): string | undefined => {
+  if (!effort) return undefined
+  const levels = harnessEfforts(h)
+  if (!levels.length) return `${h.name}'s CLI takes no effort setting; leave effort out.`
+  return levels.includes(effort) ? undefined : `${h.name} takes effort ${levels.join(', ')}, not "${effort}".`
+}
+
+// ---------- usage limits: how old a reading is ----------
+
+/** A reading older than this says how old it is. */
+export const STALE_READING_MS = 15 * 60_000
+
+/** 42m, 3h, 2d: a span in its largest whole unit, rounded. */
+export const fmtSpan = (ms: number): string => {
+  const mins = Math.max(0, Math.round(ms / 60000))
+  return mins < 60 ? `${mins}m` : mins < 2880 ? `${Math.round(mins / 60)}h` : `${Math.round(mins / 1440)}d`
+}
+
+/** "updated 3h ago" for a reading older than a quarter hour (or always, with `isAlways`); undefined while fresh or never read. */
+export const readingAge = (at: number | undefined, now: number, isAlways = false): string | undefined =>
+  at === undefined || (!isAlways && now - at < STALE_READING_MS) ? undefined : `updated ${fmtSpan(now - at)} ago`
+
+/** Whether a window's reset time has passed: the reading predates the reset, so it no longer says how much is used. */
+export const isResetPast = (w: LimitWindow, now: number): boolean => w.resetsAt !== undefined && w.resetsAt <= now
+
+/** What a window says about its reset: when it comes, or, once that time has passed, that it reset since this reading. */
+export const resetNote = (w: LimitWindow, now: number): string | undefined =>
+  w.resetsAt === undefined ? undefined : isResetPast(w, now) ? 'reset since this reading' : `resets in ${fmtSpan(w.resetsAt - now)}`
+
+/** Each provider's highest percent, for the one-line view of collapsed usage limits; a window past its reset doesn't count. */
+export const limitSummary = (rows: readonly { name: string; windows: readonly LimitWindow[] }[], now: number): { name: string; percent?: number }[] =>
+  rows.map(r => {
+    const live = r.windows.filter(w => !isResetPast(w, now))
+    return { name: r.name, percent: live.length ? Math.max(...live.map(w => w.percent)) : undefined }
+  })
+
+// ---------- which usage windows show, and in what order ----------
+
+/** The Antigravity meter views: the Select at the right of its title row. */
+export const AGY_VIEWS: readonly { value: AgyView; label: string }[] = [
+  { value: 'basic', label: 'Basic' },
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'all', label: 'All' },
+]
+
+/** A window's length: its stable span, else the last word of its tag (a reading saved before spans were kept). */
+const spanOf = (w: LimitWindow): string => w.span ?? w.label.split(' ').pop() ?? w.label
+const SPAN_RANK: Record<string, number> = { '5h': 0, '7d': 1 }
+const spanRank = (w: LimitWindow) => SPAN_RANK[spanOf(w)] ?? 2
+
+/** An Antigravity window's model family: its stable group, else read from its tag (a reading saved before groups were kept). */
+export const agyFamily = (w: LimitWindow): AgyFamily =>
+  w.group === 'gemini' || w.group === 'argon' || w.group === 'other' ? w.group : agyFamilyOf(w.label)
+const FAMILY_RANK: Record<AgyFamily, number> = { gemini: 0, argon: 1, other: 2 }
+
+/**
+ * A provider's windows in the order the meters show them: the 5-hour window before the weekly one,
+ * anything else after, as it came. `byFamily` groups Antigravity's by model family first: Gemini,
+ * then Argon, then the rest (Claude & GPT).
+ */
+export const orderWindows = (ws: readonly LimitWindow[], byFamily = false): LimitWindow[] =>
+  ws
+    .map((w, i) => ({ w, i }))
+    .sort((a, b) => (byFamily ? FAMILY_RANK[agyFamily(a.w)] - FAMILY_RANK[agyFamily(b.w)] : 0) || spanRank(a.w) - spanRank(b.w) || a.i - b.i)
+    .map(x => x.w)
+
+/** The Antigravity windows a view shows, in order. Basic: Gemini's. Gemini: Gemini's and Argon's. All: every one. */
+export const agyWindows = (ws: readonly LimitWindow[], view: AgyView = 'basic'): LimitWindow[] =>
+  orderWindows(
+    ws.filter(w => view === 'all' || agyFamily(w) === 'gemini' || (view === 'gemini' && agyFamily(w) === 'argon')),
+    true,
+  )
+
+/** The windows a provider's meters show: Antigravity's by its view, every other provider's all of them; each in order. */
+export const shownWindows = (p: MeterProvider, ws: readonly LimitWindow[], agyView?: AgyView): LimitWindow[] =>
+  p === 'antigravity' ? agyWindows(ws, agyView) : orderWindows(ws)
+
+/**
+ * Orders usage-meter entries: Claude first (this is Claude Code), then the rest
+ * alphabetically by their shown name so any future provider slots in automatically.
+ */
+export const orderMeters = <T extends { name: string }>(items: readonly T[]): T[] =>
+  [...items].sort((a, b) => {
+    const ac = a.name.toLowerCase() === 'claude'
+    const bc = b.name.toLowerCase() === 'claude'
+    if (ac !== bc) return ac ? -1 : 1
+    return a.name.localeCompare(b.name, 'en', { sensitivity: 'base' })
+  })
+
+/** The single ordered list of usage-meter providers: Claude first, then alphabetical by shown name. */
+export const METER_PROVIDERS: readonly { id: MeterProvider; name: string }[] = orderMeters([
+  { id: 'claude' as const, name: 'Claude' },
+  { id: 'codex' as const, name: 'Codex' },
+  { id: 'copilot' as const, name: 'Copilot' },
+  { id: 'antigravity' as const, name: 'Antigravity' },
+])
+
+/**
+ * Whether an incoming Codex usage reading replaces the one already shown.
+ * Newer timestamps win; at the same timestamp a live reading beats a rollout fallback.
+ */
+export const shouldTakeCodexLimits = (
+  currentAt: number | undefined,
+  currentSource: CodexLimitSource | undefined,
+  incomingAt: number,
+  incomingSource?: CodexLimitSource,
+): boolean => {
+  if (currentAt === undefined) return true
+  if (incomingAt !== currentAt) return incomingAt > currentAt
+  return !(currentSource === 'live' && incomingSource === 'rollout')
+}
+
+const CODEX_ERROR_MAX = 80
+
+/** Short, safe reason for a failed live Codex limits read: max 80 chars, no raw responses or tokens. */
+export const codexLiveError = (raw: string | undefined): string => {
+  const s = redactSecrets(stripAnsi(raw ?? ''))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!s) return 'could not read live'
+  if (/timed? ?out|timeout/i.test(s)) return 'timed out'
+  if (/enoent|not found|no such file/i.test(s)) return 'no codex CLI found'
+  if (/not logged in|not signed in|unauthenticated|unauthorized/i.test(s)) return 'not logged in'
+  return s.length <= CODEX_ERROR_MAX ? s : `${s.slice(0, CODEX_ERROR_MAX - 1).trimEnd()}…`
+}
+
+export type ParsedCodexLimits = {
+  reading?: {
+    ts: number
+    limits: { windows: { minutes?: number; percent: number; resetsAt?: number }[]; plan?: string }
+    source: CodexLimitSource
+  }
+  liveError?: string
+}
+
+/** Reads `bin/codex-limits.mjs`'s stdout and exit code into a reading and/or a short live failure reason. */
+export const parseCodexLimitsOutput = (stdout: string, exitCode?: number, stderr?: string): ParsedCodexLimits => {
+  try {
+    const j = JSON.parse(stdout) as {
+      ts?: unknown
+      limits?: { windows?: unknown; plan?: string }
+      source?: unknown
+      liveError?: unknown
+      error?: unknown
+    }
+    if (typeof j.ts === 'number' && Array.isArray(j.limits?.windows)) {
+      const source: CodexLimitSource = j.source === 'rollout' ? 'rollout' : 'live'
+      return {
+        reading: {
+          ts: j.ts,
+          limits: j.limits as { windows: { minutes?: number; percent: number; resetsAt?: number }[]; plan?: string },
+          source,
+        },
+        liveError: source === 'rollout' ? codexLiveError(str(j.liveError) ?? 'could not read live') : undefined,
+      }
+    }
+    if (typeof j.error === 'string' && j.error.trim()) {
+      return { liveError: codexLiveError(j.error) }
+    }
+  } catch {}
+  if (typeof exitCode === 'number' && exitCode !== 0) {
+    if (stderr && /enoent|not found/i.test(stderr)) return { liveError: 'no codex CLI found' }
+    return { liveError: `reader exited ${exitCode}` }
+  }
+  return { liveError: 'no answer from Codex' }
+}
+
+// ---------- handing a finished run's report over, once ----------
+
+/**
+ * What a run's delivered.txt says: nothing yet (missing or empty), delivered (a time, as every
+ * version has written it), or claimed by a copy of agent-deck that is handing the report over now.
+ */
+export type DeliveryMark = { state: 'none' } | { state: 'delivered' } | { state: 'claimed'; token: string; at: number }
+
+/** A claim older than this is from a copy that stopped mid-delivery: another copy may take it over. */
+export const DELIVERY_CLAIM_TTL_MS = 10 * 60_000
+
+export const deliveryClaim = (token: string, at: number) => `claim ${token} ${at}`
+
+export const readDeliveryMark = (text: string | undefined): DeliveryMark => {
+  const t = (text ?? '').trim()
+  if (!t) return { state: 'none' }
+  const m = t.match(/^claim (\S+) (-?\d+)$/)
+  return m ? { state: 'claimed', token: m[1]!, at: Number(m[2]) } : { state: 'delivered' }
+}
+
+/** Whether a copy should leave the report alone: it went out, or another copy is handing it over now. */
+export const isDeliveryTaken = (mark: DeliveryMark, now: number): boolean =>
+  mark.state === 'delivered' || (mark.state === 'claimed' && now - mark.at < DELIVERY_CLAIM_TTL_MS)
+
+export const MAX_DELIVERED_RUNS = 200
+
+/** Stable delivery identity for a background run, shared across reloads and concurrent copies. */
+export const deliveryRunKey = (kind: 'codex' | 'harness', runId: string): string => `${kind}:${runId}`
+
+/** Extracts the stable run key from a submitted `[agent-deck]` completion report, if any. */
+export const reportRunKey = (text: string | undefined): string | undefined => {
+  if (!text || !text.startsWith('[agent-deck] ')) return undefined
+  const harnessFooterMatch = text.match(/\[[^\n\]]+ run (\S+) · harness [^\n\]]+\]\s*$/)
+  if (harnessFooterMatch) return deliveryRunKey('harness', harnessFooterMatch[1]!)
+  const codexFooterMatch = text.match(/\[codex run (\S+) · [^\n\]]+\]\s*$/)
+  if (codexFooterMatch) return deliveryRunKey('codex', codexFooterMatch[1]!)
+  const codexHeadMatch = text.match(/^\[agent-deck\] Background Codex run (\S+) \(/)
+  if (codexHeadMatch) return deliveryRunKey('codex', codexHeadMatch[1]!)
+  const harnessHeadMatch = text.match(/^\[agent-deck\] Background .+ run (\S+) \(/)
+  if (harnessHeadMatch) return deliveryRunKey('harness', harnessHeadMatch[1]!)
+  return undefined
+}
+
+/** Appends a delivered run key to a bounded history list (deduplicated). */
+export const rememberDeliveredRun = (list: readonly string[], key: string, max = MAX_DELIVERED_RUNS): string[] =>
+  list.includes(key) ? [...list] : [...list, key].slice(-max)
 
 export const AGENT_RESULT_SPEC: ToolSpec = {
   name: 'agent_result',
@@ -1202,7 +2295,131 @@ export const codexModelProblem = (model: string | undefined, f: CodexFind, chose
     .join(' ')
 }
 
-// ---------- why a Codex run failed ----------
+// ---------- why a run failed (ANSI stripping, secret redaction, stderr summary) ----------
+
+const ANSI_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g
+
+/** Strips terminal escape codes (CSI, OSC, and 2-byte ESC sequences). */
+export const stripAnsi = (text: string): string => text.replace(ANSI_RE, '')
+
+const CRED_FIELD_PART =
+  '(?:[A-Za-z0-9_-]*(?:api[-_]?key|[-_]token|[-_]secret|[-_]password|[-_]passwd)|(?:x-)?(?:api[-_]?key|authorization|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token|bearer[-_]?token|client[-_]?secret|api[-_]?secret|token|secret|password|passwd))'
+const JSON_CRED_RE = new RegExp(`"(${CRED_FIELD_PART})"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, 'gi')
+const KV_CRED_RE = new RegExp(
+  `\\b(${CRED_FIELD_PART})\\s*=\\s*(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s&;,'"\`)\\]}]+)`,
+  'gi',
+)
+const HEADER_CRED_RE = new RegExp(
+  `\\b(${CRED_FIELD_PART})\\s*:\\s*(?:(?:Bearer|Basic|Token)\\s+)?(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;'"\`)\\]}]+)`,
+  'gi',
+)
+const BEARER_SECRET_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
+const PREFIXED_SECRET_RE =
+  /\b(?:sk-[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9._-]{8,}|eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g
+const LONG_HEX_RE = /\b[0-9a-fA-F]{32,}\b/g
+const LONG_TOKEN_RE = /(?<![:/\\A-Za-z0-9_+-])([A-Za-z0-9+/_-]{32,}={0,2})(?![A-Za-z0-9+/_=-])/g
+
+/**
+ * Redacts API keys, tokens, credential fields (header, JSON and key=value forms),
+ * exact known credential values, Bearer credentials and long hex/base64 secrets while
+ * leaving ordinary error messages, file paths, URLs and UUIDs readable.
+ */
+export const redactSecrets = (text: string, knownSecrets?: readonly string[]): string => {
+  let out = text
+  if (knownSecrets?.length) {
+    const sorted = [...new Set(knownSecrets.map(s => s.trim()).filter(Boolean))].sort((a, b) => b.length - a.length)
+    for (const secret of sorted) {
+      if (out.includes(secret)) out = out.split(secret).join('[redacted]')
+    }
+  }
+  return out
+    .replace(JSON_CRED_RE, '"$1": "[redacted]"')
+    .replace(KV_CRED_RE, '$1=[redacted]')
+    .replace(HEADER_CRED_RE, '$1: [redacted]')
+    .replace(BEARER_SECRET_RE, '[redacted]')
+    .replace(PREFIXED_SECRET_RE, '[redacted]')
+    .replace(LONG_HEX_RE, '[redacted]')
+    .replace(LONG_TOKEN_RE, match => {
+      if (match.includes('/') && !/[+=]/.test(match) && match.split('/').every(seg => seg.length < 24)) return match
+      const hasUpper = /[A-Z]/.test(match)
+      const hasLower = /[a-z]/.test(match)
+      const hasDigit = /\d/.test(match)
+      const hasB64Punct = /[+/=]/.test(match)
+      if ((hasUpper && hasLower && hasDigit) || (hasB64Punct && (hasUpper || hasLower) && (hasDigit || match.endsWith('=')))) {
+        return '[redacted]'
+      }
+      return match
+    })
+}
+
+const STDERR_SUMMARY_MAX = 500
+const STDERR_NOISE_RE = /^(?:at\s+\S|Node\.js\s+v\d|[\^~]+$)/
+
+/**
+ * Turns a failed run's stderr.log into a short, safe reason: ANSI-stripped, secrets redacted,
+ * last meaningful lines trimmed and capped to `maxChars` (default 500).
+ */
+export const summarizeStderr = (stderr: string, maxChars = STDERR_SUMMARY_MAX, knownSecrets?: readonly string[]): string => {
+  const all = stripAnsi(stderr)
+    .split(/\r?\n/)
+    .map(raw => {
+      const parts = raw.split('\r').map(p => p.trim()).filter(Boolean)
+      return (parts.at(-1) ?? '').replace(/\s+/g, ' ')
+    })
+    .filter(Boolean)
+  if (!all.length) return ''
+  const meaningful = all.filter(l => !STDERR_NOISE_RE.test(l))
+  const lines = (meaningful.length ? meaningful : all).map(l => redactSecrets(l, knownSecrets))
+  const picked: string[] = []
+  let len = 0
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    const extra = picked.length ? line.length + 1 : line.length
+    if (picked.length > 0 && len + extra > maxChars) break
+    picked.unshift(line)
+    len += extra
+    if (picked.length >= 6) break
+  }
+  const joined = picked.join(' ')
+  return joined.length <= maxChars ? joined : `${joined.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+}
+
+const BARE_EXIT_RE = /^.+\s+exited\s+(?:-?\d+|\?)$/i
+const COPILOT_PLAN_UNAVAILABLE_RE = /not available for the user's copilot plan|is disabled/i
+
+export const COPILOT_MODEL_HINT = 'Pick another Copilot model in ⚙ Settings → Harnesses → Copilot.'
+
+/** Plain next-step hint when a Copilot error says the chosen model or profile is disabled on the user's plan. */
+export const copilotFailureHint = (parser: HarnessParser | undefined, message: string): string | undefined =>
+  parser === 'copilot' && COPILOT_PLAN_UNAVAILABLE_RE.test(message) && !message.includes(COPILOT_MODEL_HINT)
+    ? COPILOT_MODEL_HINT
+    : undefined
+
+/**
+ * The error line for a failed harness run: its parsed event error when the events carried one,
+ * otherwise "<name> exited <code>" followed by the summarized stderr.log when present.
+ */
+export const harnessFailure = (
+  name: string,
+  code: number | undefined,
+  eventError: string | undefined,
+  stderr: string,
+  parser?: HarnessParser,
+  knownSecrets?: readonly string[],
+): string => {
+  const cleaned = eventError ? redactSecrets(stripAnsi(eventError), knownSecrets).trim() : ''
+  let message: string
+  if (cleaned && !BARE_EXIT_RE.test(cleaned)) {
+    message = cleaned
+  } else {
+    const base = cleaned || `${name} exited ${code !== undefined && !Number.isNaN(code) ? code : '?'}`
+    const detail = summarizeStderr(stderr, STDERR_SUMMARY_MAX, knownSecrets)
+    message = detail ? `${base}: ${detail}` : base
+  }
+  const hint = copilotFailureHint(parser, message)
+  if (!hint) return message
+  return /[.!?]$/.test(message) ? `${message} ${hint}` : `${message}. ${hint}`
+}
 
 /** A Codex error message, unwrapped when it is the API's JSON error body: "message (code)". */
 export const codexErrorText = (message: string): string => {
@@ -1220,7 +2437,7 @@ export const codexErrorText = (message: string): string => {
  * The real reason a `codex exec --json` run failed: its turn.failed / error events first,
  * then stderr's last error lines (timestamped log lines included, MCP transport noise not).
  */
-export const codexFailure = (events: string, stderr: string, code: number | undefined): string => {
+export const codexFailure = (events: string, stderr: string, code: number | undefined, knownSecrets?: readonly string[]): string => {
   const fromEvents: string[] = []
   for (const line of events.split('\n')) {
     if (!line.startsWith('{')) continue
@@ -1228,17 +2445,44 @@ export const codexFailure = (events: string, stderr: string, code: number | unde
       const e = JSON.parse(line) as J
       const msg = e.type === 'turn.failed' ? str(obj(e.error).message) : e.type === 'error' ? str(e.message) : undefined
       if (msg) {
-        const text = codexErrorText(msg)
-        if (fromEvents.at(-1) !== text) fromEvents.push(text)
+        const text = redactSecrets(stripAnsi(codexErrorText(msg)), knownSecrets).trim()
+        if (text && fromEvents.at(-1) !== text) fromEvents.push(text)
       }
     } catch {}
   }
   if (fromEvents.length) return fromEvents.slice(-2).join(' · ').slice(0, 800)
-  const lines = stderr
-    .split('\n')
+  const filtered = stripAnsi(stderr)
+    .split(/\r?\n/)
     .map(l => l.trim())
     .filter(l => l && !l.startsWith('Reading additional input') && !/rmcp::transport/.test(l))
     .filter(l => !/^\d{4}-\d\d-\d\dT\S+\s+(INFO|DEBUG|TRACE|WARN)\b/.test(l))
     .map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s+ERROR\s+/, ''))
-  return lines.slice(-4).join(' ').slice(0, 800) || `codex exited ${code ?? '?'} with no error output`
+    .join('\n')
+  return summarizeStderr(filtered, STDERR_SUMMARY_MAX, knownSecrets) || `codex exited ${code ?? '?'} with no error output`
+}
+
+// ---------- detecting a harness runner process that died without writing exit.txt ----------
+
+export const DEAD_RUNNER_REASON = 'The runner stopped without finishing (the process is gone).'
+
+/** Parses a run folder's pid.txt into a positive integer PID, or undefined when missing or invalid. */
+export const parseRunPid = (text: string | undefined): number | undefined => {
+  const trimmed = (text ?? '').trim()
+  if (!/^\d+$/.test(trimmed)) return undefined
+  const pid = Number.parseInt(trimmed, 10)
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}
+
+/**
+ * Decides whether a running harness run whose exit.txt is still absent has lost its runner process.
+ * Returns the plain failure reason once `pid` is confirmed dead (and no exit file appeared),
+ * or undefined when the run should keep polling.
+ */
+export const deadRunnerFailure = (opts: {
+  hasExit: boolean
+  pid: number | undefined
+  isPidAlive: boolean | undefined
+}): string | undefined => {
+  if (opts.hasExit || opts.pid === undefined || opts.isPidAlive !== false) return undefined
+  return DEAD_RUNNER_REASON
 }

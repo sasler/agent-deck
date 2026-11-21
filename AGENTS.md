@@ -15,6 +15,7 @@ agent-deck is a Claude Code plugin (a "mod"). It shows every background agent in
 | `bin/launch.mjs` | Starts a CLI without a shell; shared by both scripts |
 | `bin/watch.mjs` | Codex session watcher |
 | `bin/agy-quota.mjs` | Reads Antigravity's usage limits from agy's own language server |
+| `bin/codex-limits.mjs` | Reads Codex's usage limits from its newest rollout file (Refresh, and the watcher's first reading) |
 | `tests/agent-deck.test.tsx` | Mod and UI tests |
 | `tests/runner.test.mjs` | Detached runner and model-query tests |
 | `.claude-plugin/plugin.json` | Manifest and version |
@@ -28,6 +29,18 @@ node --test tests/runner.test.mjs
 ```
 
 `tsc -p . --noEmit` works only once the engine has written `.claude-plugin/types/`, which happens when it loads the mod.
+
+## Trying changes live (dev copy)
+
+Run the repo's own code in your session instead of the released plugin, so each edit shows in the pane at the end of the turn, with no PR or release.
+
+1. Turn the released plugin off for this repo only (it writes the gitignored `.claude/settings.local.json`; other projects keep the release): `claude plugin disable agent-deck@agent-deck --scope local`
+2. Load the `plugin-authoring` skill. It names this session's mods folder, `~/.claude/dev-mods/<session id>/`.
+3. Link the repo into it (PowerShell): `New-Item -ItemType Junction -Path "$HOME\.claude\dev-mods\<session id>\agent-deck" -Target "C:\src\agent-deck"`
+4. When the turn ends, Claude Code asks to turn on the session's mods: the user picks **Turn them on**. From then on, each change to the repo reloads the mod when the turn that made it ends, or right before one of its tools runs. A failed load or hook shows as a dim line in the transcript.
+5. The dev copy keeps its own settings (harnesses, task routing, meters) in `~/.claude/plugins/store/agent-deck_inline-*.json`, separate from the release's `agent-deck_agent-deck-*.json`. Copy the `harnesses`, `meters`, `codex-enabled` and `routing` keys across, or set them up again in its ⚙ Settings.
+
+When done: `claude plugin enable agent-deck@agent-deck --scope local`, then remove the junction with `Remove-Item` on the link only (never `-Recurse`, which would follow it into the repo).
 
 ## Rules
 

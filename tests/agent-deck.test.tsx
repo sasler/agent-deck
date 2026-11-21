@@ -23,7 +23,9 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, resolveRun, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
+import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, buildModelTree, capSelectOptions, cardModelName, codexLiveError, effortLabel, filterModels, groupModels, orderWindows, parseCodexLimitsOutput, pickerLevels, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
+import { CARD_STALE_MS, CARD_TTL_MS, COPILOT_MODEL_HINT, DEAD_RUNNER_REASON, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, deadRunnerFailure, loadRouting, loadSessionCards, mergeSavedCards, parseRunPid, planCardsSave, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotFailureHint, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, harnessFailure, isFusionModel, modelQuery, parseLine, parseModels, providerEnv, redactSecrets, slugId, stripAnsi, summarizeStderr, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -117,7 +119,7 @@ test('a Claude subagent gets a card in the Agents pane', async ($, on) => {
     })
     expect(await ui.find({ text: /Explore · scan repo/ })).toBeDefined()
     expect(await ui.find({ text: /CLAUDE/ })).toBeDefined()
-    expect(await ui.find({ text: /claude-haiku-5-5/ })).toBeDefined()
+    expect(await ui.find({ text: /◆ Haiku 5\.5/ })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -273,7 +275,7 @@ test('a long title wraps on its own line on an open card', async ($, on) => {
     return found[found.length - 1]?.text
   }
   expect(await leaf()).toBe('general-purpose · Build Display and Graphics settings for the station glass cockpit panes')
-  expect(await ui.find({ text: /◆ claude-sonnet-5-5/ })).toBeDefined()
+  expect(await ui.find({ text: /◆ Sonnet 5\.5/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -351,8 +353,15 @@ test('harness edits are checked', () => {
 
 test('Copilot routing and limits use current flags, also with old saved templates', () => {
   const h = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
+  // Fusion model ids pass straight through as --model <id>, with no --auto-tier and no --experimental.
   expect(harnessArgs(h, { prompt: 'fix %PATH% and "$x"', model: 'hydrafusion' })).toEqual([
-    '-p', 'fix %PATH% and "$x"', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'hydrafusion', '--experimental', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+    '-p', 'fix %PATH% and "$x"', '--output-format', 'json', '--allow-all-tools', '--model', 'hydrafusion', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, model: 'hydrafusion' }, { prompt: 'hello' })).toEqual([
+    '-p', 'hello', '--output-format', 'json', '--allow-all-tools', '--model', 'hydrafusion', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
+  ])
+  expect(harnessArgs({ ...h, args: '-p {prompt}', model: 'hydrafusion-max' }, { prompt: 'hello' })).toEqual([
+    '-p', 'hello', '--model', 'hydrafusion-max', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
   ])
   expect(harnessArgs({ ...h, model: 'auto', autoTier: 'balance', maxAiCredits: 30 }, { prompt: 'x', autoTier: 'intelligence', maxAiCredits: 60 })).toEqual([
     '-p', 'x', '--output-format', 'json', '--allow-all-tools', '--model', 'auto', '--auto-tier', 'intelligence', '--max-ai-credits', '60', '--secret-env-vars=COPILOT_PROVIDER_API_KEY',
@@ -365,6 +374,7 @@ test('Copilot routing and limits use current flags, also with old saved template
   expect(copilotOptionsError(h, { maxAiCredits: Infinity })).toMatch(/at least 30/)
   expect(copilotOptionsError(h, { autoTier: 'two words' })).toMatch(/without spaces/)
   expect(copilotOptionsError({ ...h, model: 'gpt-5.4', autoTier: 'balance' })).toMatch(/Pick Auto/)
+  expect(copilotOptionsError(h, { model: 'hydrafusion', autoTier: 'balance' })).toMatch(/Pick Auto/)
   expect(copilotOptionsError({ ...h, parser: 'claude' }, { autoTier: 'balance' })).toMatch(/Copilot harness/)
   expect(copilotOptionsError({ ...h, provider: { type: 'openai', baseUrl: 'http://localhost/v1' } }, { model: 'auto' })).toMatch(/not your own API/)
   expect(copilotOptionsError(h, { autoTier: 'future-profile', maxAiCredits: 30.5 })).toBeUndefined()
@@ -474,8 +484,8 @@ test('the edit form sets up a Copilot on its own API', async ($, on) => {
   })
   // Settings has a visible label as well as a gear.
   const gear = (await ui.findAll({ type: 'Button' } as never)).find(b => (b as { key?: string }).key === 'h-open') as { text?: string; props?: { label?: string } } | undefined
-  expect(gear?.text).toBe('⚙ Settings')
-  expect(gear?.props?.label).toBe('⚙ Settings')
+  expect(gear?.text).toBe('⚙\uFE0E Settings')
+  expect(gear?.props?.label).toBe('⚙\uFE0E Settings')
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
   expect(await ui.find({ text: 'Settings' })).toBeDefined()
@@ -763,6 +773,7 @@ test('a reloaded Copilot run rebuilds its final per-model usage from events', as
   const files: Record<string, string> = {
     [`${dir}/meta.json`]: JSON.stringify({ id: 'run-reload', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Reloaded run', cwd: 'project', sessionId: 'reload-session', startedAt: 9000, model: 'auto' }),
     [`${dir}/exit.txt`]: '0',
+    [`${dir}/delivered.txt`]: '9500',
     [`${dir}/stderr.log`]: '',
     [`${dir}/events.jsonl`]: [
       JSON.stringify({ type: 'assistant.message', data: { content: 'Finished.' } }),
@@ -771,6 +782,7 @@ test('a reloaded Copilot run rebuilds its final per-model usage from events', as
     ].join('\n'),
     [`${missingDir}/meta.json`]: JSON.stringify({ id: 'run-missing', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Missing subtotal', cwd: 'project', sessionId: 'reload-session', startedAt: 9000, model: 'auto' }),
     [`${missingDir}/exit.txt`]: '0',
+    [`${missingDir}/delivered.txt`]: '9500',
     [`${missingDir}/stderr.log`]: '',
     [`${missingDir}/events.jsonl`]: [
       JSON.stringify({ type: 'assistant.message', data: { content: 'Finished without billing.' } }),
@@ -1023,6 +1035,10 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
   await ui.press({ key: 'cx-edit' } as never)
   await ui.redraw()
+  expect(await ui.find({ text: /Edit ● Codex/ })).toBeDefined()
+  expect(await ui.find({ key: 's-tab-harnesses' })).toBeUndefined()
+  expect(await ui.find({ key: 'cx-find' })).toBeDefined()
+  expect(await ui.find({ key: 'cx-update' })).toBeDefined()
   await ui.select({ key: 'cx-mode', value: 'custom' })
   await ui.redraw()
   expect(await ui.find({ text: /exec --json --skip-git-repo-check/ })).toBeDefined()
@@ -1032,6 +1048,8 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   await ui.press({ key: 'cx-edit' } as never)
   await ui.redraw()
   await ui.select({ key: 'cx-mode', value: 'builtin' })
+  await ui.redraw()
+  await ui.press({ key: 'cx-done' } as never)
   await ui.redraw()
   expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
   expect((await ui.findAll({ type: 'Button' } as never)).some(b => (b as { key?: string }).key === 'h-toggle-codex-cli' && (b as { text?: string }).text === 'Off')).toBe(true)
@@ -1147,6 +1165,8 @@ test('the meter choice is set in the Harnesses view', async ($, on) => {
     props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
   })
   await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-meters' } as never)
   await ui.redraw()
   expect(await ui.find({ text: /Usage meters/ })).toBeDefined()
   await ui.select({ key: 'm-mode', value: 'selected' })
@@ -1346,6 +1366,8 @@ test('the Task routing section switches routing and picks an agent per task', as
   })
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
+  await ui.redraw()
   expect(await ui.find({ text: /Task routing/ })).toBeDefined()
   expect(await ui.find({ text: /^Off: Claude places work as usual/ })).toBeDefined()
   await ui.select({ key: 'r-target-review', value: 'copilot' })
@@ -1388,6 +1410,8 @@ test('a routed harness with a model list offers its models in the Task routing t
   })
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
+  await ui.redraw()
   await ui.select({ key: 'r-target-research', value: 'antigravity' })
   await ui.redraw()
   expect(await ui.find({ key: 'r-model-research' })).toBeDefined()
@@ -1403,7 +1427,9 @@ test('routed tasks offer named Claude models, the Codex model list and a harness
   expect(routeModelChoices('claude', undefined).map(c => c.value)).toEqual(['fable', 'opus', 'sonnet', 'haiku'])
   expect(routeModelChoices('codex', undefined, ['gpt-6.1-terra'])).toEqual([{ value: 'gpt-6.1-terra', label: 'gpt-6.1-terra' }])
   const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
-  expect(routeModelChoices('antigravity', agy)).toEqual([{ value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High) (gemini-4-neon-high)' }])
+  expect(routeModelChoices('antigravity', agy)).toEqual([{ value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High)', detail: 'gemini-4-neon-high' }])
+  const copilot = { ...fromPreset(PRESETS.find(p => p.id === 'copilot')!), models: withFusion({ parser: 'copilot' }, []) }
+  expect(routeModelChoices('copilot', copilot)[0]).toEqual({ value: 'auto', label: 'Auto', detail: 'auto · picks a model per prompt' })
 })
 
 test('the routing switch sits next to Settings in the main view', async ($, on) => {
@@ -1419,11 +1445,13 @@ test('the routing switch sits next to Settings in the main view', async ($, on) 
     props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
   })
   const label = async (key: string) => ((await ui.findAll({ type: 'Button' } as never)) as { key?: string; text?: string }[]).find(b => b.key === key)?.text
-  expect(await label('r-toggle-main')).toBe('Routing off')
+  expect(await label('r-toggle-main')).toBe('⇄ Routing off')
   await ui.press({ key: 'r-toggle-main' } as never)
   await ui.redraw()
-  expect(await label('r-toggle-main')).toBe('Routing on')
+  expect(await label('r-toggle-main')).toBe('⇄ Routing on')
   await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
   await ui.redraw()
   expect(await label('r-toggle')).toBe('On')
   await ui.unmount()
@@ -1447,10 +1475,10 @@ const AGY_QUOTA = {
 
 test("Antigravity's quota summary becomes used-percent meters per model group", () => {
   expect(agyLimits(AGY_QUOTA)).toEqual([
-    { label: 'Gemini 7d', name: 'Gemini · Weekly limit', percent: 1.6, resetsAt: Date.parse('2026-11-27T13:51:35Z') },
-    { label: 'Gemini 5h', name: 'Gemini · 5-hour limit', percent: 2.4, resetsAt: Date.parse('2026-11-20T18:51:35Z') },
-    { label: 'Claude & GPT 5h', name: 'Claude & GPT · 5-hour limit', percent: 0, resetsAt: Date.parse('2026-11-20T19:54:37Z') },
-    { label: 'Gemini 4 Argon 7d', name: 'Gemini 4 Argon · Weekly limit', percent: 50, resetsAt: undefined },
+    { label: 'Gemini 7d', name: 'Gemini · Weekly limit', percent: 1.6, resetsAt: Date.parse('2026-11-27T13:51:35Z'), group: 'gemini', span: '7d' },
+    { label: 'Gemini 5h', name: 'Gemini · 5-hour limit', percent: 2.4, resetsAt: Date.parse('2026-11-20T18:51:35Z'), group: 'gemini', span: '5h' },
+    { label: 'Claude & GPT 5h', name: 'Claude & GPT · 5-hour limit', percent: 0, resetsAt: Date.parse('2026-11-20T19:54:37Z'), group: 'other', span: '5h' },
+    { label: 'Gemini 4 Argon 7d', name: 'Gemini 4 Argon · Weekly limit', percent: 50, resetsAt: undefined, group: 'argon', span: '7d' },
   ])
   expect(agyLimits({})).toEqual([])
   expect(agyLimits({ response: { groups: [{ displayName: 'X', buckets: [{ window: '5h' }] }] } })).toEqual([])
@@ -1489,9 +1517,2679 @@ test('an Antigravity harness brings its usage meters into the pane, and keeps th
   expect(quotaCalls[0]).toEqual(['agy', 'saved-1'])
   expect(await ui.find({ text: /^Antigravity$/ })).toBeDefined()
   expect(await ui.find({ text: /Gemini · Weekly limit/ })).toBeDefined()
+  // Basic, the default view, shows Gemini's windows only; the switch on Antigravity's title row shows more.
+  expect(await ui.find({ text: /Gemini 4 Argon · Weekly limit/ })).toBeUndefined()
+  await ui.select({ key: 'lim-agy-view', value: 'gemini' })
+  await ui.redraw()
   expect(await ui.find({ text: /Gemini 4 Argon · Weekly limit/ })).toBeDefined()
+  expect(await ui.find({ text: /Claude & GPT · 5-hour limit/ })).toBeUndefined()
   // The next check reopens the session the last one reported.
   await clock.advance(10 * 60_000)
   expect(quotaCalls.at(-1)).toEqual(['agy', 'saved-2'])
   await ui.unmount()
+})
+
+// ---------- persisting cards across restarts ----------
+
+const sampleCard = (overrides: Partial<AgentCard>): AgentCard => ({
+  id: 'card-1',
+  provider: 'codex',
+  title: 'Review branch',
+  model: 'gpt-6.1-sol',
+  status: 'done',
+  startedAt: 1000,
+  output: '',
+  isThinking: false,
+  activity: [],
+  tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+  ...overrides,
+})
+
+test('saved cards merge, trim, prune entries older than 3 days, and restore statuses', () => {
+  const now = 10 * 86_400_000
+  const old = sampleCard({ id: 'old-card', title: 'Old session card' })
+  const other = sampleCard({ id: 'other-card', title: 'Other session card' })
+  const big = sampleCard({ id: 'big-card', output: 'x'.repeat(200) })
+  const stored = {
+    'sid-old': { savedAt: now - CARD_TTL_MS - 1, cards: [old] },
+    'sid-other': { savedAt: now - 60_000, cards: [other] },
+    'sid-bad': { savedAt: 'nope', cards: [old] },
+  }
+  const merged = mergeSavedCards(stored, 'sid-1', [sampleCard({ id: 'c1' }), big], now, { maxCards: 1, maxOutput: 50 })
+  expect(Object.keys(merged).sort()).toEqual(['sid-1', 'sid-other'])
+  expect(merged['sid-1']?.savedAt).toBe(now)
+  expect(merged['sid-1']?.cards.map(c => c.id)).toEqual(['big-card'])
+  expect(merged['sid-1']?.cards[0]?.output.length).toBe(50)
+
+  expect(loadSessionCards(merged, 'sid-other').map(c => c.id)).toEqual(['other-card'])
+  expect(loadSessionCards(merged, 'sid-missing')).toEqual([])
+  expect(loadSessionCards(null, 'sid-1')).toEqual([])
+
+  const runningClaude = sampleCard({ id: 'cl-1', provider: 'claude', status: 'running', isThinking: true })
+  // Fresh start (new process): running Claude subagent becomes aborted.
+  expect(restoreCard(runningClaude, now)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now })
+  // Hot reload (same process): running Claude subagent keeps running.
+  const keptClaude = restoreCard(runningClaude, now, CARD_STALE_MS, true)
+  expect(keptClaude).toMatchObject({ status: 'running', isThinking: true })
+  expect(keptClaude.endedAt).toBeUndefined()
+  expect(restoreCard({ ...runningClaude, status: 'done' }, now).status).toBe('done')
+
+  const staleExt = sampleCard({ id: 'codex-t1', provider: 'codex', isExternal: true, status: 'running', isThinking: true, lastEventAt: now - CARD_STALE_MS - 1000 })
+  expect(restoreCard(staleExt, now)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now - CARD_STALE_MS - 1000 })
+  expect(restoreCard(staleExt, now, CARD_STALE_MS, true)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now - CARD_STALE_MS - 1000 })
+
+  const freshExt = sampleCard({ id: 'codex-t2', provider: 'codex', isExternal: true, status: 'running', lastEventAt: now - 30_000 })
+  expect(restoreCard(freshExt, now).status).toBe('running')
+
+  const managedRun = sampleCard({ id: 'codex-run-r1', provider: 'codex', runId: 'r1', status: 'running', lastEventAt: now - CARD_STALE_MS - 1000 })
+  expect(restoreCard(managedRun, now).status).toBe('running')
+})
+
+test('saving cards writes the session to the store and prunes entries older than 3 days', async ($, on) => {
+  const startNow = 10 * 86_400_000
+  const clock = mock.clock(on, { now: startNow })
+  const otherCard = sampleCard({ id: 'codex-other', provider: 'codex', isExternal: true, title: 'Other session work', status: 'done', startedAt: startNow - 60_000, endedAt: startNow - 30_000 })
+  const expiredCard = sampleCard({ id: 'codex-expired', title: 'Expired work' })
+  const store = new Map<string, unknown>(Object.entries({
+    harnesses: [],
+    'codex-enabled': false,
+    cards: {
+      'sid-expired': { savedAt: startNow - CARD_TTL_MS - 1000, cards: [expiredCard] },
+      'sid-other': { savedAt: startNow - 60_000, cards: [otherCard] },
+    },
+  }))
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('session.id', () => ({ value: 'sid-keep' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-keep' }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({
+    tool_use_id: 't-keep', prompt: 'scan', description: 'Inspect routes', subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await clock.advance(250)
+
+  expect(store.has('cards')).toBe(false)
+  expect(store.has('cards:sid-expired')).toBe(false)
+  const index = store.get('cards-index') as Record<string, { savedAt: number; bytes: number }>
+  expect(Object.keys(index).sort()).toEqual(['sid-keep', 'sid-other'])
+  const savedKeep = store.get('cards:sid-keep') as { savedAt: number; cards: AgentCard[] }
+  expect(savedKeep.cards.map(c => [c.id, c.title, c.status])).toEqual([
+    ['agent-keep', 'Explore · Inspect routes', 'running'],
+  ])
+})
+
+test('a reopened session restores its saved cards after a restart, aborts stale ones, and hides other sessions', async ($, on) => {
+  const startNow = 10 * 86_400_000
+  const restartNow = startNow + 5 * 60_000
+  mock.clock(on, { now: restartNow })
+  const claudeRunning = sampleCard({ id: 'agent-keep', provider: 'claude', title: 'Explore · Inspect routes', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow, isThinking: true })
+  const extDone = sampleCard({ id: 'codex-th-done', provider: 'codex', isExternal: true, threadId: 'th-done', title: 'Review diff via Bash', model: 'gpt-6.1-sol', status: 'done', startedAt: startNow, endedAt: startNow + 2000, lastEventAt: startNow + 2000 })
+  const extStale = sampleCard({ id: 'codex-th-stale', provider: 'codex', isExternal: true, threadId: 'th-stale', title: 'Abandoned Codex exec', model: 'gpt-6.1-sol', status: 'running', startedAt: startNow, lastEventAt: startNow + 1000, isThinking: true })
+  const otherCard = sampleCard({ id: 'codex-other', provider: 'codex', isExternal: true, title: 'Other session work', status: 'done', startedAt: startNow, endedAt: startNow + 500 })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: {
+      'sid-keep': { savedAt: startNow + 2000, cards: [claudeRunning, extDone, extStale] },
+      'sid-other': { savedAt: startNow + 500, cards: [otherCard] },
+    },
+  })
+  on('session.id', () => ({ value: 'sid-keep' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  // Fresh test starts with an empty agents atom, simulating an app restart.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  // All 3 cards came back as finished (the running Claude card and stale external Codex card became aborted).
+  expect(await ui.find({ text: /Finished · 3/ })).toBeDefined()
+  expect(await ui.find({ text: /Review diff via Bash/ })).toBeDefined()
+  expect(await ui.find({ text: /Explore · Inspect routes/ })).toBeDefined()
+  expect(await ui.find({ text: /Abandoned Codex exec/ })).toBeDefined()
+  expect(await ui.find({ text: /Other session work/ })).toBeUndefined()
+  // The two aborted cards show the ■ glyph; the done external Codex card shows ✓.
+  expect((await ui.findAll({ text: /^■$/ })).length).toBe(2)
+  expect((await ui.findAll({ text: /^✓$/ })).length).toBe(1)
+  await ui.unmount()
+
+  // The band above the prompt confirms nothing is left spinning as running.
+  const band = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 100, scroll: { offset: 0, bodyRows: 3 }, view: {} },
+  })
+  expect(await band.find({ text: /no agents running/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('a hot reload keeps a running Claude subagent running, and late events revive or finish an aborted one', async ($, on) => {
+  const startNow = 10 * 86_400_000
+  const clock = mock.clock(on, { now: startNow })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-reload-claude' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-live' }))
+  on('turn.complete', () => ({ text: '' }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({
+    tool_use_id: 't-live', prompt: 'edit repo', description: 'Refactor parser', subagentType: 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await clock.advance(60_000)
+
+  // Hot reload: session.start runs again while the agents atom still holds the running card.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  expect(await ui.find({ text: /general-purpose · Refactor parser/ })).toBeDefined()
+  expect(await ui.find({ text: /^running$/ })).toBeDefined()
+  expect(await ui.find({ text: /^■$/ })).toBeUndefined()
+
+  // The real turn.complete arrives later and marks it done.
+  await clock.advance(120_000)
+  await $.turn.complete({ agentId: 'agent-live', answer: 'all done', reason: 'end_turn', durationMs: 180_000, isAborted: false } as never)
+  await clock.advance(250)
+  await ui.redraw()
+  expect(await ui.find({ text: /Finished · 1/ })).toBeDefined()
+  expect(await ui.find({ text: /^✓$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('turn.complete finishes an aborted Claude card without touching done cards, and turn.step/tool.call revive aborted ones', async ($, on) => {
+  const startNow = 20 * 86_400_000
+  const restartNow = startNow + 5 * 60_000
+  const clock = mock.clock(on, { now: restartNow })
+  const agentFinish = sampleCard({ id: 'agent-finish', provider: 'claude', title: 'Explore · Finish me', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow })
+  const agentStep = sampleCard({ id: 'agent-step', provider: 'claude', title: 'Explore · Step me', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow })
+  const agentTool = sampleCard({ id: 'agent-tool', provider: 'claude', title: 'Explore · Tool me', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow })
+  const agentDone = sampleCard({ id: 'agent-done', provider: 'claude', title: 'Explore · Already done', model: 'claude-haiku-5-5', status: 'done', startedAt: startNow, endedAt: startNow + 10_000 })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: { 'sid-revive': { savedAt: startNow + 10_000, cards: [agentFinish, agentStep, agentTool, agentDone] } },
+  })
+  on('session.id', () => ({ value: 'sid-revive' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('turn.step', async function* (_$, e) {
+    yield { kind: 'text', text: 'still working', index: 0 } as never
+    return { turnId: e.turnId, index: e.index, answer: 'still working', toolUses: [], stopReason: 'end_turn' }
+  })
+  on('tool.call', () => ({ result: 'ok' }) as never)
+
+  // Loaded from store (empty atom): the three running Claude cards start as aborted.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  // 1. turn.complete on an aborted Claude card marks it done; on an already-done card does nothing.
+  await clock.advance(10_000)
+  await $.turn.complete({ agentId: 'agent-finish', answer: 'finished', reason: 'end_turn', durationMs: 60_000, isAborted: false } as never)
+  await $.turn.complete({ agentId: 'agent-done', answer: '', reason: 'error', durationMs: 60_000, isAborted: false } as never)
+
+  // 2. turn.step revives an aborted Claude card back to running.
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, agentId: 'agent-step', model: 'claude-haiku-5-5', messageCount: 2 })) {
+    // consume stream
+  }
+
+  // 3. tool.call revives an aborted Claude card back to running.
+  await $.tool.call({ agentId: 'agent-tool', tool: 'Read', tool_use_id: 'tu-revive', file_path: 'README.md' } as never)
+  await clock.advance(250)
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  // Two cards are running (agent-step and agent-tool), two are finished as done (agent-finish and agent-done).
+  expect((await ui.findAll({ text: /^running$/ })).length).toBe(2)
+  expect(await ui.find({ text: /still working/ })).toBeDefined()
+  expect(await ui.find({ text: /Finished · 2/ })).toBeDefined()
+  expect((await ui.findAll({ text: /^✓$/ })).length).toBe(2)
+  expect(await ui.find({ text: /^■$/ })).toBeUndefined()
+  expect(await ui.find({ text: /^✗$/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('restored harness run cards are not duplicated when loadHarnessRuns reloads them from disk', async ($, on) => {
+  const now = 20_000
+  const clock = mock.clock(on, { now })
+  const savedExternal = sampleCard({ id: 'codex-th-1', provider: 'codex', isExternal: true, threadId: 'th-1', title: 'Bash Codex review', status: 'done', startedAt: 10_000, endedAt: 15_000 })
+  const savedHarness = sampleCard({ id: 'h-run-run-1', provider: 'harness', harness: 'antigravity', providerName: 'Antigravity', runId: 'run-1', title: 'Agy research', model: 'gemini', status: 'done', startedAt: 11_000, endedAt: 16_000, output: 'stale copy' })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: { 'sid-mix': { savedAt: now - 1000, cards: [savedExternal, savedHarness] } },
+  })
+  on('session.id', () => ({ value: 'sid-mix' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  const root = '/test-home/.claude/agent-deck/harness-runs'
+  const dir = `${root}/run-1`
+  const files: Record<string, string> = {
+    [`${dir}/meta.json`]: JSON.stringify({ id: 'run-1', harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: 'Agy research', cwd: 'project', sessionId: 'sid-mix', startedAt: 11_000, model: 'gemini' }),
+    [`${dir}/exit.txt`]: '0',
+    [`${dir}/delivered.txt`]: '17000',
+    [`${dir}/stderr.log`]: '',
+    [`${dir}/events.jsonl`]: JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'Fresh from disk' } }) + '\n',
+  }
+  on('fs.list', (_$, e) => {
+    const p = e.path.replace(/\\/g, '/')
+    return { value: p.endsWith(root) ? [{ name: 'run-1', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [] }
+  })
+  on('fs.read', (_$, e) => {
+    const p = e.path.replace(/\\/g, '/')
+    const key = Object.keys(files).find(f => p.endsWith(f))
+    return key ? { value: files[key]! } : { deny: 'not found' }
+  })
+  on('fs.exists', () => ({ value: true }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.advance(1000)
+  await clock.advance(250)
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  expect(await ui.find({ text: /Finished · 2/ })).toBeDefined()
+  expect(await ui.find({ text: /Bash Codex review/ })).toBeDefined()
+  await ui.press({ key: 't-h-run-run-1' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Fresh from disk/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('delivered.txt reads as nothing yet, delivered, or a claim another copy holds', () => {
+  expect(readDeliveryMark(undefined)).toEqual({ state: 'none' })
+  expect(readDeliveryMark('')).toEqual({ state: 'none' })
+  expect(readDeliveryMark('1763700000000')).toEqual({ state: 'delivered' })
+  expect(readDeliveryMark(deliveryClaim('abc-1', 5000))).toEqual({ state: 'claimed', token: 'abc-1', at: 5000 })
+  expect(isDeliveryTaken({ state: 'delivered' }, 0)).toBe(true)
+  expect(isDeliveryTaken({ state: 'none' }, 0)).toBe(false)
+  expect(isDeliveryTaken({ state: 'claimed', token: 'x', at: 1000 }, 1000 + DELIVERY_CLAIM_TTL_MS - 1)).toBe(true)
+  // A copy that stopped mid-delivery leaves an old claim: another may take it over.
+  expect(isDeliveryTaken({ state: 'claimed', token: 'x', at: 1000 }, 1000 + DELIVERY_CLAIM_TTL_MS)).toBe(false)
+})
+
+test("a finished run's report is claimed before it is handed over, and a run another copy claimed is left alone", async ($, on) => {
+  const start = 50_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-deliver' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>()
+  for (const id of ['run-a', 'run-b', 'run-c']) {
+    files.set(`${root}/${id}/meta.json`, JSON.stringify({ id, harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: `job ${id}`, cwd: 'project', sessionId: 'sid-deliver', startedAt: start - 5000 }))
+    files.set(`${root}/${id}/exit.txt`, '0')
+    files.set(`${root}/${id}/events.jsonl`, JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: `report of ${id}` } }) + '\n')
+  }
+  // run-b: another copy of agent-deck is handing it over right now.
+  files.set(`${root}/run-b/delivered.txt`, deliveryClaim('other-copy', start))
+  // The kit hands paths over absolute: a file is known by the end of its path.
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? ['run-a', 'run-b', 'run-c'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    const path = key(e.path)
+    // run-c: another copy claims it in the same moment as this one.
+    files.set(path, path.endsWith('run-c/delivered.txt') && e.text.startsWith('claim ') ? deliveryClaim('other-copy', start) : e.text)
+    return { value: undefined }
+  })
+  const submits: { text: string; mark?: string }[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push({ text: e.text, mark: files.get(`${root}/run-a/delivered.txt`) })
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 10; i++) await clock.advance(500)
+
+
+  expect(submits.map(s => s.text.match(/run (run-\w)/)?.[1])).toEqual(['run-a'])
+  // The claim was on disk while the report went in, so another copy would have left it alone.
+  expect(submits[0]?.mark).toMatch(/^claim \S+ \d+$/)
+  expect(readDeliveryMark(files.get(`${root}/run-a/delivered.txt`))).toEqual({ state: 'delivered' })
+
+  // The other copies finish handing theirs over; nothing goes out a second time.
+  files.set(`${root}/run-b/delivered.txt`, String(start + 1000))
+  files.set(`${root}/run-c/delivered.txt`, String(start + 1000))
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+  expect(submits.length).toBe(1)
+})
+
+test('agent_run with a task reads the stored routing, also before session.start has loaded it', async ($, on) => {
+  mock.clock(on, { now: 70_000 })
+  mock.store(on, { harnesses: [routedCopilot()], 'codex-enabled': false, routing: { isOn: true, routes: [{ task: 'review', target: 'copilot', model: 'claude-opus-5-5' }] } })
+  on('session.id', () => ({ value: 'sid-reload' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.exists', () => ({ value: false }))
+  const started: string[][] = []
+  on('process.run', (_$, e) => {
+    started.push([...((e as { argv?: string[] }).argv ?? [])])
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  // No session.start: a reloaded copy of the mod can get the call before it has read its settings.
+  const r = JSON.stringify(await $.tool.call({ tool: 'mcp__agent-deck__agent_run', tool_use_id: 'route-1', task: 'review', prompt: 'review the branch' } as never))
+  expect(r).not.toMatch(/routing is off/)
+  expect(r).toMatch(/Copilot run \S+ started in the background \(model claude-opus-5-5\)/)
+  expect(started.some(argv => argv.some(a => a.endsWith('/bin/run.mjs')))).toBe(true)
+})
+
+// ---------- effort levels, model names, usage limits, the top row ----------
+
+const preset = (id: string) => fromPreset(PRESETS.find(p => p.id === id)!)
+
+test('each CLI gets its own effort flag in front of the prompt, and only one it takes', () => {
+  expect(harnessArgs(preset('antigravity'), { prompt: 'go', effort: 'high' })).toEqual([
+    '--output-format', 'stream-json', '--disable-slash-commands', '--dangerously-skip-permissions', '--effort', 'high', '-p', 'go',
+  ])
+  expect(harnessArgs(preset('copilot'), { prompt: 'go', effort: 'xhigh' }).slice(0, 4)).toEqual(['--reasoning-effort', 'xhigh', '-p', 'go'])
+  expect(harnessArgs(preset('claude-cli'), { prompt: 'go', effort: 'max' })).toEqual(['--effort', 'max', '-p', 'go', '--output-format', 'stream-json', '--verbose'])
+  expect(harnessArgs(preset('opencode'), { prompt: 'go', effort: 'high' })).toEqual(['run', '--format', 'json', '--variant', 'high', 'go'])
+  expect(harnessArgs(preset('codex-cli'), { prompt: 'go', effort: 'low' })).toEqual(['exec', '--json', '-c', 'model_reasoning_effort=low', '--skip-git-repo-check', 'go'])
+  // Gemini's CLI has none, and a level a CLI doesn't list is left out.
+  expect(harnessArgs(preset('gemini'), { prompt: 'go', effort: 'high' })).toEqual(['-p', 'go', '--output-format', 'stream-json', '--yolo'])
+  expect(harnessArgs(preset('claude-cli'), { prompt: 'go', effort: 'none' })).not.toContain('--effort')
+  // An effort already in the arguments is replaced, and {effort} places it where the arguments say.
+  expect(harnessArgs({ ...preset('claude-cli'), args: '-p {prompt} --effort low' }, { prompt: 'go', effort: 'high' })).toEqual(['--effort', 'high', '-p', 'go'])
+  const custom = { ...preset('custom'), command: 'mycli', args: '{prompt} --think {effort}' }
+  expect(harnessArgs(custom, { prompt: 'go', effort: 'high' })).toEqual(['go', '--think', 'high'])
+  expect(harnessArgs(custom, { prompt: 'go' })).toEqual(['go'])
+  expect(harnessEfforts(preset('copilot'))).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+  expect(harnessEfforts(preset('cursor'))).toEqual([])
+  expect(effortProblem(preset('gemini'), 'high')).toMatch(/Gemini's CLI takes no effort setting/)
+  expect(effortProblem(preset('antigravity'), 'ultra')).toMatch(/takes effort low, medium, high, xhigh, max/)
+  expect(effortProblem(preset('antigravity'), 'high')).toBeUndefined()
+})
+
+test('a route keeps its effort, the note names it, and agent_run with the task applies it', () => {
+  const agy = preset('antigravity')
+  const hs = [agy, preset('gemini')]
+  expect(routeEffortChoices('codex', undefined)).toEqual({ levels: CODEX_EFFORTS })
+  expect(routeEffortChoices('claude', undefined)).toEqual({ levels: SUBAGENT_EFFORTS })
+  expect(routeEffortChoices('gemini', hs[1])).toEqual({ reason: "Gemini's CLI has none." })
+  expect(routeEffortChoices('', undefined)).toBeUndefined()
+  const routing = loadRouting({
+    isOn: true,
+    routes: [
+      { task: 'ui', target: 'antigravity', model: 'claude-opus-5-5-high', effort: 'high' },
+      { task: 'implement', target: 'codex', model: 'gpt-6', effort: 'xhigh' },
+      { task: 'research', target: 'claude', model: 'opus', effort: 'max' },
+      { task: 'review', target: 'gemini', effort: 'high' },
+    ],
+  })
+  expect(routing.routes[0]).toEqual({ task: 'ui', target: 'antigravity', model: 'claude-opus-5-5-high', effort: 'high' })
+  const routes = routedTasks(routing, hs, true)
+  const note = routingNote(routes)!
+  expect(note).toMatch(/agent_run with task "ui" \(Antigravity, model claude-opus-5-5-high, effort high\)\./)
+  expect(note).toMatch(/the codex tool, model gpt-6, effort xhigh\./)
+  expect(note).toMatch(/a Claude subagent \(the Agent tool, model opus, effort max\)\./)
+  // Gemini takes no effort, so a stale pick isn't passed on.
+  expect(note).toMatch(/agent_run with task "review" \(Gemini\)\./)
+  expect(resolveRun({ task: 'ui' }, routing, hs, true)).toEqual({ harness: 'antigravity', model: 'claude-opus-5-5-high', effort: 'high' })
+  expect(resolveRun({ task: 'ui', effort: 'low' }, routing, hs, true)).toEqual({ harness: 'antigravity', model: 'claude-opus-5-5-high', effort: 'low' })
+  expect(resolveRun({ task: 'ui', harness: 'gemini' }, routing, hs, true)).toEqual({ harness: 'gemini', model: undefined, effort: undefined })
+  expect(resolveRun({ task: 'implement' }, routing, hs, true)).toEqual({ error: expect.stringMatching(/use the codex tool with model gpt-6 and effort xhigh/) })
+  expect(resolveRun({ task: 'research' }, routing, hs, true)).toEqual({ error: expect.stringMatching(/use the Agent tool with model opus and effort max/) })
+  const spec = agentRunSpec(hs, routes)
+  expect(spec.description).toMatch(/ui → antigravity claude-opus-5-5-high effort high/)
+  expect(spec.description).toMatch(/antigravity \(Antigravity, effort low\|medium\|high\|xhigh\|max\)/)
+  expect((spec.inputSchema as { properties: Record<string, unknown> }).properties.effort).toBeDefined()
+})
+
+test('a card shows its model by the name the model pickers use', () => {
+  const agy = { ...preset('antigravity'), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  expect(cardModelName({ provider: 'harness', harness: 'antigravity', model: 'gemini-4-neon-high' }, [agy])).toBe('Gemini 4 Neon (High)')
+  expect(cardModelName({ provider: 'harness', harness: 'antigravity', model: 'gemini-9' }, [agy])).toBe('gemini-9')
+  expect(cardModelName({ provider: 'claude', model: 'claude-opus-5-5' }, [])).toBe('Opus 5.5')
+  expect(cardModelName({ provider: 'harness', harness: 'claude-cli', model: 'claude-haiku-5-5' }, [preset('claude-cli')])).toBe('Haiku 5.5')
+  expect(cardModelName({ provider: 'codex', model: 'gpt-6.1-sol' }, [agy])).toBe('gpt-6.1-sol')
+})
+
+test('a usage reading says how old it is, a window past its reset says reset since this reading, and live errors stay short and safe', () => {
+  const now = 10 * 3_600_000
+  expect(readingAge(undefined, now)).toBeUndefined()
+  expect(readingAge(now - 5 * 60_000, now)).toBeUndefined()
+  expect(readingAge(now - 5 * 60_000, now, true)).toBe('updated 5m ago')
+  expect(readingAge(now - 3 * 3_600_000, now)).toBe('updated 3h ago')
+  const past = { label: '5h', percent: 14, resetsAt: now - 60_000 }
+  const live = { label: '7d', percent: 80, resetsAt: now + 2 * 3_600_000 }
+  expect(isResetPast(past, now)).toBe(true)
+  expect(resetNote(past, now)).toBe('reset since this reading')
+  expect(resetNote(live, now)).toBe('resets in 2h')
+  expect(resetNote({ label: 'x', percent: 1 }, now)).toBeUndefined()
+  expect(limitSummary([{ name: 'Codex', windows: [past, live] }, { name: 'Copilot', windows: [past] }], now)).toEqual([
+    { name: 'Codex', percent: 80 },
+    { name: 'Copilot', percent: undefined },
+  ])
+
+  expect(codexLiveError('request timed out after 20s')).toBe('timed out')
+  expect(codexLiveError('ENOENT codex')).toBe('no codex CLI found')
+  expect(codexLiveError('not logged in Bearer secret-token-12345')).toBe('not logged in')
+  const longErr = codexLiveError(`bad gateway Bearer abcdefghij123456 sk-secretkey1234567890 ${'x'.repeat(120)}`)
+  expect(longErr.length).toBeLessThanOrEqual(80)
+  expect(longErr.includes('abcdefghij')).toBe(false)
+  expect(longErr.includes('sk-secretkey')).toBe(false)
+
+  expect(parseCodexLimitsOutput('', 0, '')).toEqual({ liveError: 'no answer from Codex' })
+  expect(parseCodexLimitsOutput(JSON.stringify({ error: 'not logged in' }), 0, '')).toEqual({ liveError: 'not logged in' })
+  const parsedFallback = parseCodexLimitsOutput(
+    JSON.stringify({ ts: 1000, source: 'rollout', liveError: 'timed out', limits: { windows: [{ minutes: 300, percent: 10 }] } }),
+    0,
+    '',
+  )
+  expect(parsedFallback.reading?.source).toBe('rollout')
+  expect(parsedFallback.liveError).toBe('timed out')
+})
+
+test('usage meters put Claude first, then the rest alphabetically, and newer Codex readings win', () => {
+  expect(METER_PROVIDERS.map(m => m.id)).toEqual(['claude', 'antigravity', 'codex', 'copilot'])
+  expect(
+    orderMeters([
+      { name: 'Zed' },
+      { name: 'Codex' },
+      { name: 'Copilot' },
+      { name: 'Claude' },
+      { name: 'Antigravity' },
+      { name: 'Bedrock' },
+    ]).map(m => m.name),
+  ).toEqual(['Claude', 'Antigravity', 'Bedrock', 'Codex', 'Copilot', 'Zed'])
+
+  // A live reading wins over an older rollout reading; a newer rollout reading updates it.
+  expect(shouldTakeCodexLimits(undefined, undefined, 1000, 'rollout')).toBe(true)
+  expect(shouldTakeCodexLimits(1000, 'rollout', 2000, 'live')).toBe(true)
+  expect(shouldTakeCodexLimits(2000, 'live', 1000, 'rollout')).toBe(false)
+  expect(shouldTakeCodexLimits(2000, 'live', 2000, 'rollout')).toBe(false)
+  expect(shouldTakeCodexLimits(2000, 'rollout', 2000, 'live')).toBe(true)
+  expect(shouldTakeCodexLimits(2000, 'live', 3000, 'rollout')).toBe(true)
+})
+
+type TestEngine = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0]
+
+const mountPane = ($: TestEngine, bodyColumns = 50) =>
+  $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns, placement: 'dock' } as never,
+  })
+
+test('the top row holds keep-warm, Routing and Settings in that order, above the prompt cache', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-top' }))
+  on('env.get', () => ({ value: undefined }))
+  const ui = await mountPane($, 44)
+  const order = (await ui.findAll({})).map(e => (e as { key?: string }).key).filter(k => ['kw-window', 'r-toggle-main', 'h-open', 'cache'].includes(k ?? ''))
+  expect(order).toEqual(['kw-window', 'r-toggle-main', 'h-open', 'cache'])
+  expect(((await ui.find({ key: 'kw-window' })) as { props?: { label?: string } } | undefined)?.props?.label).toBe('♨\uFE0E Keep warm')
+  expect(await ui.find({ text: /keep-warm off · pick a window with Keep warm above/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('usage limits fold into one line, switch views, and Refresh reads them live, Codex too', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  const clock = mock.clock(on, { now })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-limits' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  let claudePercent = 40
+  on('session.usage', () => ({
+    value: { startedAt: now, context: { tokens: 0 }, rateLimits: [{ kind: 'five_hour', percentUsed: claudePercent, resetsAt: new Date(now + 3_600_000).toISOString() }] } as never,
+  }))
+  // Codex's last rollout reading is three hours old, from before its 5-hour window reset.
+  const old = { windows: [{ minutes: 300, percent: 14, resetsAt: now - 30 * 60_000 }, { minutes: 10080, percent: 80, resetsAt: now + 86_400_000 }], plan: 'plus' }
+  const oldTs = now - 3 * 3_600_000
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout', text: `${JSON.stringify({ t: 'limits', ts: oldTs, limits: old, source: 'rollout' })}\n` } as never
+    return { value: { exitCode: 0 } } as never
+  })
+  let liveReady = false
+  const asked: string[][] = []
+  on('process.run', async (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) {
+      asked.push(argv.slice(2))
+      if (!liveReady) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ ts: oldTs, limits: old, source: 'rollout', liveError: 'not logged in' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      await clock.sleep(1000)
+      const fresh = { windows: [{ minutes: 300, percent: 30, resetsAt: now + 4 * 3_600_000 }, { minutes: 10080, percent: 81, resetsAt: now + 86_400_000 }], plan: 'plus' }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ ts: now, limits: fresh, source: 'live' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await mountPane($)
+  // Fallback case: shows age without "from last session", past window shows 0% dimmed with "reset since this reading", and one failure line with Retry.
+  expect(asked.length).toBe(1)
+  expect(asked[0]).toEqual(['C:\\Users\\me/.codex/sessions', 'codex'])
+  expect(await ui.find({ text: /Codex · plus · updated 3h ago/ })).toBeDefined()
+  expect(await ui.find({ text: /from last session/ })).toBeUndefined()
+  const resetEl = await ui.find({ type: 'Text', text: 'reset since this reading' })
+  expect(resetEl).toBeDefined()
+  expect((resetEl as { props?: { dimColor?: boolean; color?: string } } | undefined)?.props?.dimColor).toBe(true)
+  expect((resetEl as { props?: { color?: string } } | undefined)?.props?.color).toBeUndefined()
+  const zeroEl = await ui.find({ type: 'Text', text: /^0%$/ })
+  expect(zeroEl).toBeDefined()
+  expect((zeroEl as { props?: { dimColor?: boolean; color?: string } } | undefined)?.props?.dimColor).toBe(true)
+  expect((zeroEl as { props?: { color?: string } } | undefined)?.props?.color).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^14%$/ })).toBeUndefined()
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
+  expect(await ui.find({ text: /resets in 0m/ })).toBeUndefined()
+  expect(await ui.find({ text: /Could not read Codex's limits live/ })).toBeUndefined()
+  expect(await ui.find({ text: 'Live reading failed: not logged in' })).toBeDefined()
+  expect((await ui.find({ key: 'lim-codex-retry' }))?.text).toBe('Retry')
+
+  // Live read via Refresh: replaces the older rollout reading, drops the age and failure line.
+  liveReady = true
+  claudePercent = 55
+  await ui.press({ key: 'lim-refresh' } as never)
+  await ui.redraw()
+  expect((await ui.find({ key: 'lim-refresh' }))?.text).toBe('↻ Refreshing…')
+  await clock.advance(1000)
+  await ui.redraw()
+  expect((await ui.find({ key: 'lim-refresh' }))?.text).toBe('↻ Refresh')
+  expect(asked.length).toBe(2)
+  expect(await ui.find({ text: 'reset since this reading' })).toBeUndefined()
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
+  expect(await ui.find({ text: /updated 3h ago/ })).toBeUndefined()
+  expect(await ui.find({ text: /from last session/ })).toBeUndefined()
+  expect(await ui.find({ text: /Live reading failed/ })).toBeUndefined()
+  expect(await ui.find({ key: 'lim-codex-retry' })).toBeUndefined()
+  expect(await ui.find({ text: 'resets in 4h' })).toBeDefined()
+  expect(await ui.find({ text: '55%' })).toBeDefined()
+
+  // Folded summary puts Claude first, then Codex.
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^Claude 55% · Codex 81%$/ })).toBeDefined()
+  expect(await ui.find({ text: /5-hour limit/ })).toBeUndefined()
+  expect((await ui.find({ key: 'lim-toggle' }))?.text).toBe('▸ Usage limits')
+
+  // Ten minutes later, the poller asks again; an older fallback must not replace the newer live reading.
+  liveReady = false
+  await clock.advance(10 * 60_000)
+  await ui.redraw()
+  expect(asked.length).toBe(3)
+  expect(await ui.find({ type: 'Text', text: /^Claude 55% · Codex 81%$/ })).toBeDefined()
+
+  // The header's view switch and Settings → Usage meters are one setting.
+  await ui.select({ key: 'lim-view', value: 'selected' })
+  await ui.redraw()
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-meters' } as never)
+  await ui.redraw()
+  expect(((await ui.find({ key: 'm-mode' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('selected')
+  await ui.select({ key: 'm-mode', value: 'session' })
+  await ui.press({ key: 'h-done' } as never)
+  await ui.redraw()
+  expect(((await ui.find({ key: 'lim-view' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('session')
+  await ui.unmount()
+})
+
+test('a hung first Codex limits read times out and does not block Refresh or Retry, and never waits on codex-find', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  const clock = mock.clock(on, { now })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-stuck-codex' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: { startedAt: now, context: { tokens: 0 }, rateLimits: [] } as never,
+  }))
+  // Both windows of the 16-hour-old rollout reading have passed their reset time.
+  const old = {
+    windows: [
+      { minutes: 300, percent: 14, resetsAt: now - 11 * 3_600_000 },
+      { minutes: 10080, percent: 80, resetsAt: now - 3_600_000 },
+    ],
+    plan: 'plus',
+  }
+  const oldTs = now - 16 * 3_600_000
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout', text: `${JSON.stringify({ t: 'limits', ts: oldTs, limits: old, source: 'rollout' })}\n` } as never
+    return { value: { exitCode: 0 } } as never
+  })
+
+  let codexCalls = 0
+  let mode: 'hang' | 'fail' | 'live' = 'hang'
+  on('process.run', async (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    // Simulate a slow/hung codex-find.mjs: readCodexLimits must NOT block on it.
+    if (argv.some(a => a.endsWith('/bin/codex-find.mjs'))) {
+      return await new Promise(() => {})
+    }
+    if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) {
+      codexCalls++
+      if (mode === 'hang') return await new Promise(() => {})
+      if (mode === 'fail') {
+        return {
+          value: {
+            exitCode: 0,
+            stdout: JSON.stringify({ ts: oldTs, limits: old, source: 'rollout', liveError: 'not logged in' }),
+            stderr: '',
+            isStdoutTruncated: false,
+            isStderrTruncated: false,
+          },
+        }
+      }
+      const fresh = {
+        windows: [
+          { minutes: 300, percent: 22, resetsAt: now + 4 * 3_600_000 },
+          { minutes: 10080, percent: 35, resetsAt: now + 5 * 86_400_000 },
+        ],
+        plan: 'plus',
+      }
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({ ts: now + 60_000, limits: fresh, source: 'live' }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  // The first codex-limits call started immediately without waiting on codex-find.
+  expect(codexCalls).toBe(1)
+
+  // Advance past the 25s overall deadline so the hung first read settles and clears codexLimitsCheck.
+  await clock.advance(25_000)
+  const ui = await mountPane($)
+  expect(await ui.find({ text: /Codex · plus · updated 16h ago/ })).toBeDefined()
+  expect(await ui.find({ text: 'Live reading failed: timed out' })).toBeDefined()
+  expect((await ui.find({ key: 'lim-codex-retry' }))?.text).toBe('Retry')
+  // Both past-reset windows show 0% dimmed with "reset since this reading", not "out of date".
+  expect((await ui.findAll({ type: 'Text', text: /^reset since this reading$/ })).length).toBe(2)
+  expect((await ui.findAll({ type: 'Text', text: /^0%$/ })).length).toBe(2)
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
+
+  // Folded summary when all windows have reset shows 0% dimmed, not "out of date".
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^Codex 0%$/ })).toBeDefined()
+  expect(await ui.find({ text: 'out of date' })).toBeUndefined()
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+
+  // Second Refresh is NOT blocked by the hung first promise; it runs a fresh read and shows the new reason.
+  mode = 'fail'
+  await ui.press({ key: 'lim-refresh' } as never)
+  await clock.settle()
+  await ui.redraw()
+  expect(codexCalls).toBe(2)
+  expect(await ui.find({ text: 'Live reading failed: not logged in' })).toBeDefined()
+
+  // Pressing Retry on the failure line triggers a fresh live read and clears the failure line.
+  mode = 'live'
+  await ui.press({ key: 'lim-codex-retry' } as never)
+  await clock.settle()
+  await ui.redraw()
+  expect(codexCalls).toBe(3)
+  expect(await ui.find({ text: /Live reading failed/ })).toBeUndefined()
+  expect(await ui.find({ key: 'lim-codex-retry' })).toBeUndefined()
+  expect(await ui.find({ text: '22%' })).toBeDefined()
+  expect(await ui.find({ text: '35%' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('usage meters keep the same order (Claude, Antigravity, Codex, Copilot) in expanded rows, folded summary and Settings', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  const clock = mock.clock(on, { now })
+  mock.store(on, { harnesses: [preset('antigravity')], 'codex-enabled': true, 'codex-path': 'C:\\custom\\codex.exe' })
+  on('session.id', () => ({ value: 'sid-order' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: { startedAt: now, context: { tokens: 0 }, rateLimits: [{ kind: 'five_hour', percentUsed: 15, resetsAt: new Date(now + 3_600_000).toISOString() }] } as never,
+  }))
+  on('process.spawn', async function* () {
+    return { value: { exitCode: 0 } } as never
+  })
+  let codexLimitsArgv: string[] = []
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv[0] === 'gh') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            token_based_billing: true,
+            quota_reset_date_utc: new Date(now + 10 * 86_400_000).toISOString(),
+            quota_snapshots: { premium_interactions: { unlimited: false, entitlement: 1000, remaining: 580, percent_remaining: 58 } },
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    if (argv.some(a => a.endsWith('agy-quota.mjs'))) {
+      return { value: { exitCode: 0, stdout: JSON.stringify({ sessionId: 's1', quota: AGY_QUOTA }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (argv.some(a => a.endsWith('codex-limits.mjs'))) {
+      codexLimitsArgv = [...argv]
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            ts: now,
+            source: 'live',
+            limits: { windows: [{ minutes: 300, percent: 25, resetsAt: now + 3_600_000 }], plan: 'plus' },
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(codexLimitsArgv.slice(2)).toEqual(['C:\\Users\\me/.codex/sessions', 'C:\\custom\\codex.exe'])
+  const ui = await mountPane($, 60)
+
+  // 1. Expanded rows order
+  const rowKeys = (await ui.findAll({}))
+    .map(el => (el as { key?: string }).key)
+    .filter((k): k is string => typeof k === 'string' && k.startsWith('lim-row-'))
+  expect(rowKeys).toEqual(['lim-row-claude', 'lim-row-antigravity', 'lim-row-codex', 'lim-row-copilot'])
+
+  // 2. Folded one-line summary order
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  // Antigravity's highest counts only the windows its view shows: Basic, Gemini's.
+  expect(await ui.find({ type: 'Text', text: /^Claude 15% · Antigravity 2% · Codex 25% · Copilot 42%$/ })).toBeDefined()
+
+  // 3. Settings → Usage meters Selected buttons order
+  await ui.select({ key: 'lim-view', value: 'selected' })
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-meters' } as never)
+  await ui.redraw()
+  const meterButtons = (await ui.findAll({ type: 'Button' } as never))
+    .map(b => (b as { key?: string }).key)
+    .filter((k): k is string => typeof k === 'string' && /^m-(claude|antigravity|codex|copilot)$/.test(k))
+  expect(meterButtons).toEqual(['m-claude', 'm-antigravity', 'm-codex', 'm-copilot'])
+  await ui.unmount()
+})
+
+test('Task routing offers an effort per route where the agent takes one, and says why where not', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [preset('antigravity'), preset('gemini')], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-effort' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  const ui = await mountPane($, 60)
+  await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'r-target-ui', value: 'antigravity' })
+  await ui.redraw()
+  const effort = async (task: string) => (await ui.find({ key: `r-effort-${task}` })) as { props?: { value?: string; options?: { value: string }[] } } | undefined
+
+  expect((await effort('ui'))?.props?.options?.map(o => o.value)).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max'])
+  await ui.select({ key: 'r-effort-ui', value: 'high' })
+  await ui.redraw()
+  expect((await effort('ui'))?.props?.value).toBe('high')
+  await ui.select({ key: 'r-target-review', value: 'gemini' })
+  await ui.redraw()
+  expect(await effort('review')).toBeUndefined()
+  expect(await ui.find({ text: 'No effort setting' })).toBeDefined()
+  expect(await ui.find({ text: "Gemini's CLI has none." })).toBeDefined()
+  await ui.select({ key: 'r-target-implement', value: 'claude' })
+  await ui.redraw()
+  expect((await effort('implement'))?.props?.options?.map(o => o.value)).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max'])
+  // Efforts read in sentence case; the stored values stay as they are.
+  expect(((await effort('implement')) as { props?: { options?: { label?: string }[] } } | undefined)?.props?.options?.map(o => o.label)).toEqual(["Claude's choice", 'Low', 'Medium', 'High', 'Extra high', 'Max'])
+  // Another agent starts the route over: its effort goes with the old one.
+  await ui.select({ key: 'r-target-ui', value: 'claude' })
+  await ui.redraw()
+  expect((await effort('ui'))?.props?.value).toBe('')
+  await ui.unmount()
+})
+
+test("agent_run with a task runs with the route's effort, a passed effort wins, and a CLI without one refuses it", async ($, on) => {
+  mock.clock(on, { now: 80_000 })
+  mock.store(on, {
+    harnesses: [preset('antigravity'), preset('gemini')],
+    'codex-enabled': false,
+    routing: { isOn: true, routes: [{ task: 'ui', target: 'antigravity', model: 'gemini-4-neon-high', effort: 'high' }] },
+  })
+  on('session.id', () => ({ value: 'sid-run-effort' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('fs.exists', () => ({ value: false }))
+  const specs: string[][] = []
+  on('fs.write', (_$, e) => {
+    if (e.path.replace(/\\/g, '/').endsWith('/spec.json')) specs.push((JSON.parse(e.text) as { argv: string[] }).argv)
+    return { value: undefined }
+  })
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const call = async (input: Record<string, unknown>) =>
+    JSON.stringify(await $.tool.call({ tool: 'mcp__agent-deck__agent_run', tool_use_id: `e-${specs.length}`, prompt: 'draw it', ...input } as never))
+  expect(await call({ task: 'ui' })).toMatch(/Antigravity run \S+ started in the background \(model gemini-4-neon-high, effort high\)/)
+  expect(specs.at(-1)).toEqual(expect.arrayContaining(['--effort', 'high', '--model', 'gemini-4-neon-high']))
+  await call({ task: 'ui', effort: 'low' })
+  expect(specs.at(-1)?.slice(specs.at(-1)!.indexOf('--effort'), specs.at(-1)!.indexOf('--effort') + 2)).toEqual(['--effort', 'low'])
+  const before = specs.length
+  expect(await call({ harness: 'gemini', effort: 'high' })).toMatch(/not started\. Gemini's CLI takes no effort setting/)
+  expect(specs.length).toBe(before)
+})
+
+test('an open card keeps a compact header, its model by name, and its last output lines with Show all', async ($, on) => {
+  const now = 30_000
+  const clock = mock.clock(on, { now })
+  const agy = { ...preset('antigravity'), isEnabled: false, models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  mock.store(on, { harnesses: [agy], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-card' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join('\n')
+  const files: Record<string, string> = {
+    [`${root}/run-card/meta.json`]: JSON.stringify({ id: 'run-card', harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: 'Sketch the settings screen', cwd: 'project', sessionId: 'sid-card', startedAt: now - 65_000, model: 'gemini-4-neon-high', effort: 'high' }),
+    [`${root}/run-card/events.jsonl`]: JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: lines } }) + '\n',
+  }
+  const at = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({ value: at(e.path).endsWith(root) ? [{ name: 'run-card', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [] }))
+  on('fs.read', (_$, e) => {
+    const text = files[at(e.path)]
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.advance(1000)
+  await clock.advance(250)
+  const ui = await mountPane($, 60)
+  expect(await ui.find({ text: '◆ Gemini 4 Neon (High)' })).toBeDefined()
+  expect(await ui.find({ text: ' high ' })).toBeDefined()
+  expect(await ui.find({ text: 'running' })).toBeDefined()
+  expect(await ui.find({ text: 'Sketch the settings screen' })).toBeDefined()
+  expect(await ui.find({ text: 'line 20' })).toBeDefined()
+  expect(await ui.find({ text: 'line 8' })).toBeUndefined()
+  expect(await ui.find({ text: '8 earlier lines' })).toBeDefined()
+  expect((await ui.find({ key: 'out-h-run-run-card' }))?.text).toBe('Show all')
+  await ui.press({ key: 'out-h-run-run-card' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: 'line 1' })).toBeDefined()
+  expect((await ui.find({ key: 'out-h-run-run-card' }))?.text).toBe('Show less')
+  await ui.unmount()
+})
+
+test('the Codex watcher starts with the session project root, not the shell cwd', async ($, on) => {
+  mock.clock(on, { now: 60 * 60_000 })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-watch-root' }))
+  on('session.root', () => ({ value: 'C:\\src\\JumpInn' }))
+  on('session.cwd', () => ({ value: 'C:\\src\\JumpInn\\test-results\\crown-walk' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  const spawned: (readonly string[])[] = []
+  on('process.spawn', async function* (_$, e) {
+    spawned.push(e.argv)
+    return { value: { exitCode: 0 } }
+  })
+
+  await $.session.start({ cwd: 'C:\\src\\JumpInn\\test-results\\crown-walk', surface: 'desktop', isInteractive: true })
+
+  const watchArgv = spawned.find(argv => argv.some(a => a.endsWith('/bin/watch.mjs')))
+  expect(watchArgv).toBeDefined()
+  expect(watchArgv?.[4]).toBe('C:\\src\\JumpInn')
+})
+
+// ---------- settings in their own pane ----------
+
+const mountSettings = ($: TestEngine, bodyColumns = 60) =>
+  $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck-settings',
+    props: { title: 'Agent Deck settings', isFocused: true, bodyColumns, placement: 'dock' } as never,
+  })
+
+/** A store in memory the test can read back. */
+type TestOn = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
+
+const memStore = (on: TestOn, entries: Record<string, unknown>) => {
+  const store = new Map<string, unknown>(Object.entries(entries))
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  return store
+}
+
+/** The hooks a session start needs, with no CLI found. */
+const quietSession = (on: TestOn, sid: string) => {
+  on('session.id', () => ({ value: sid }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+}
+
+test('Settings open in their own pane beside the deck, and Done closes it', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [routedCopilot()], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-settings' }))
+  on('env.get', () => ({ value: undefined }))
+  let staleCodex = false
+  on('state.get', (_$, e, next) =>
+    staleCodex && e.key === 'settingsSection' ? ({ value: { value: 'codex', version: 1 } } as never) : next(e),
+  )
+  const opened: unknown[] = []
+  const closed: string[] = []
+  on('ui.open', (_$, e) => {
+    opened.push({ ...e })
+    return { value: { isPlaced: true } } as never
+  })
+  on('ui.close', (_$, e) => {
+    closed.push(e.id)
+    return { value: undefined } as never
+  })
+  const deck = await mountPane($, 60)
+  await deck.press({ key: 'h-open' } as never)
+  await deck.redraw()
+  expect(opened.at(-1)).toEqual({ id: 'agent-deck-settings', title: 'Agent Deck settings', focus: true, closeOnEscape: true })
+  // The deck stays the deck: no settings in it.
+  expect(await deck.find({ key: 'h-done' })).toBeUndefined()
+  expect(await deck.find({ key: 'h-open' })).toBeDefined()
+
+  const settings = await mountSettings($)
+  const tabs = ((await settings.findAll({ type: 'Button' } as never)) as { key?: string }[]).map(b => b.key).filter(k => k?.startsWith('s-tab-'))
+  expect(tabs).toEqual(['s-tab-harnesses', 's-tab-routing', 's-tab-meters'])
+  expect(await settings.find({ key: 'cx-toggle' })).toBeDefined()
+  // An old settingsSection: 'codex' left in session state maps back to Harnesses.
+  staleCodex = true
+  await settings.redraw()
+  expect(await settings.find({ key: 'cx-toggle' })).toBeDefined()
+  expect(await settings.find({ key: 'cx-edit' })).toBeDefined()
+  expect(((await settings.find({ key: 's-tab-harnesses' })) as { props?: { variant?: string } } | undefined)?.props?.variant).toBe('primary')
+  staleCodex = false
+  await settings.press({ key: 's-tab-routing' } as never)
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-target-review' })).toBeDefined()
+  expect(await settings.find({ key: 'cx-toggle' })).toBeUndefined()
+  await settings.press({ key: 'h-done' } as never)
+  expect(closed).toEqual(['agent-deck-settings'])
+  await deck.redraw()
+  expect(await deck.find({ key: 'h-done' })).toBeUndefined()
+  await settings.unmount()
+  await deck.unmount()
+})
+
+test('where a second pane cannot open, settings draw in the main pane until Done', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-inline' }))
+  on('env.get', () => ({ value: undefined }))
+  const closed: string[] = []
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'no-surface' } }) as never)
+  on('ui.close', (_$, e) => {
+    closed.push(e.id)
+    return { value: undefined } as never
+  })
+  const deck = await mountPane($, 60)
+  await deck.press({ key: 'h-open' } as never)
+  await deck.redraw()
+  // The pane that would wait undrawn is closed, and the deck draws settings instead.
+  expect(closed).toEqual(['agent-deck-settings'])
+  expect(await deck.find({ key: 's-tab-routing' })).toBeDefined()
+  expect(await deck.find({ key: 'cache' })).toBeUndefined()
+  await deck.press({ key: 'h-done' } as never)
+  await deck.redraw()
+  expect(closed).toEqual(['agent-deck-settings'])
+  expect(await deck.find({ key: 'cache' })).toBeDefined()
+  await deck.unmount()
+})
+
+test('Task routing draws a card per task, and its Agent, Model and Effort pickers save by key', async ($, on) => {
+  mock.clock(on)
+  const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  const store = memStore(on, { harnesses: [agy, preset('gemini')], 'codex-enabled': false })
+  quietSession(on, 'sid-cards')
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  const settings = await mountSettings($, 40)
+  await settings.press({ key: 's-tab-routing' } as never)
+  await settings.redraw()
+  const card = (await settings.find({ key: 'r-research' })) as { props?: { borderStyle?: string } } | undefined
+  expect(card?.props?.borderStyle).toBe('round')
+  expect(await settings.find({ text: 'finding things out from docs, the web or a codebase' })).toBeDefined()
+  expect(await settings.find({ key: 'r-remove-research' })).toBeDefined()
+
+  await settings.select({ key: 'r-target-research', value: 'antigravity' })
+  await settings.redraw()
+  const model = (await settings.find({ key: 'r-model-research' })) as { props?: { options?: { value: string; label?: string }[] } } | undefined
+  // The label is the model's name; its id goes on a dim line under the field.
+  expect(model?.props?.options).toEqual([
+    { value: '', label: 'Default' },
+    { value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High)' },
+    { value: '__other__', label: 'Other…' },
+  ])
+  expect(await settings.find({ key: 'r-refresh-research' })).toBeDefined()
+  await settings.select({ key: 'r-model-research', value: 'gemini-4-neon-high' })
+  await settings.redraw()
+  expect(await settings.find({ text: 'gemini-4-neon-high' })).toBeDefined()
+  await settings.select({ key: 'r-effort-research', value: 'xhigh' })
+  await settings.redraw()
+  const effort = (await settings.find({ key: 'r-effort-research' })) as { props?: { value?: string; options?: { value: string; label?: string }[] } } | undefined
+  expect(effort?.props?.value).toBe('xhigh')
+  expect(effort?.props?.options?.find(o => o.value === 'xhigh')?.label).toBe('Extra high')
+  const saved = store.get('routing') as { routes: { task: string; target: string; model?: string; effort?: string }[] }
+  expect(saved.routes.find(r => r.task === 'research')).toEqual({ task: 'research', target: 'antigravity', model: 'gemini-4-neon-high', effort: 'xhigh' })
+
+  // An agent without an effort setting says so in place of the field.
+  await settings.select({ key: 'r-target-review', value: 'gemini' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-effort-review' })).toBeUndefined()
+  expect(await settings.find({ text: 'No effort setting' })).toBeDefined()
+
+  // Add a task: the field and its Add button.
+  await settings.input({ key: 'r-add', text: 'Docs', kind: 'change' })
+  await settings.redraw()
+  await settings.press({ key: 'r-add-button' } as never)
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-target-docs' })).toBeDefined()
+  expect(((await settings.find({ key: 'r-add' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('')
+  await settings.unmount()
+})
+
+test('capSelectOptions stays within max while keeping head, tail and the selected value in order', () => {
+  const head = [{ value: '', label: 'Default' }]
+  const tail = [{ value: '__other__', label: 'Other…' }]
+  const small = [
+    { value: 'm1', label: 'M1' },
+    { value: 'm2', label: 'M2' },
+  ]
+  expect(capSelectOptions(small, { max: 5, fixedHead: head, fixedTail: tail })).toEqual({
+    options: [head[0], small[0], small[1], tail[0]],
+    shown: 2,
+    total: 2,
+    isCapped: false,
+  })
+
+  const many = Array.from({ length: 100 }, (_, i) => ({ value: `m-${i}`, label: `Model ${i}` }))
+  const capped = capSelectOptions(many, { keep: 'm-90', fixedHead: head, fixedTail: tail })
+  expect(capped.options.length).toBe(64)
+  expect(capped.shown).toBe(62)
+  expect(capped.total).toBe(100)
+  expect(capped.isCapped).toBe(true)
+  expect(capped.options[0]).toEqual(head[0])
+  expect(capped.options.at(-1)).toEqual(tail[0])
+  expect(capped.options.some(o => o.value === 'm-90')).toBe(true)
+  expect(capped.options.slice(1, 62).map(o => o.value)).toEqual(many.slice(0, 61).map(o => o.value))
+  expect(capped.options[62]?.value).toBe('m-90')
+})
+
+test('model picker helpers group 300 models across providers and sub-groups, preselect paths, filter, and split flat lists into runs', () => {
+  // 300 models across 3 providers; litellm has 150 split across bedrock (90) and vertex (60).
+  const models = [
+    ...Array.from({ length: 90 }, (_, i) => ({ id: `litellm/bedrock/us.anthropic.claude-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 60 }, (_, i) => ({ id: `litellm/vertex/gemini-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `openai/gpt-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `github-copilot/model-${String(i).padStart(2, '0')}` })),
+  ]
+  expect(models.length).toBe(300)
+
+  // Every level stays <= 64, and a selected model preselects its full path with prefix dropped from labels.
+  const pre = pickerLevels(models, { selected: 'litellm/vertex/gemini-42' })
+  expect(pre.showSearch).toBe(true)
+  expect(pre.group).toEqual(['litellm', 'vertex'])
+  expect(pre.levels.map(l => l.kind)).toEqual(['group', 'group', 'model'])
+  for (const level of pre.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+  expect(pre.levels[0]?.value).toBe('litellm')
+  expect(pre.levels[0]?.options.map(o => o.label)).toEqual(['github-copilot (75)', 'litellm (150)', 'openai (75)'])
+  expect(pre.levels[1]?.value).toBe('vertex')
+  expect(pre.levels[1]?.options.map(o => o.label)).toEqual(['bedrock (90)', 'vertex (60)'])
+  const leaf = pre.levels[2]!
+  expect(leaf.value).toBe('litellm/vertex/gemini-42')
+  expect(leaf.options.find(o => o.value === 'litellm/vertex/gemini-42')?.label).toBe('gemini-42')
+
+  // Browsing another provider keeps the currently selected model visible and selected in the leaf.
+  const browsed = pickerLevels(models, { selected: 'litellm/vertex/gemini-42', group: ['openai'] })
+  const browsedLeaf = browsed.levels.at(-1)!
+  expect(browsedLeaf.options.length).toBeLessThanOrEqual(64)
+  expect(browsedLeaf.value).toBe('litellm/vertex/gemini-42')
+  expect(browsedLeaf.options.some(o => o.value === 'litellm/vertex/gemini-42')).toBe(true)
+
+  // Bedrock (90 models > 61) splits into balanced runs; every level stays <= 64.
+  const bedrock = pickerLevels(models, { selected: 'litellm/bedrock/us.anthropic.claude-85' })
+  expect(bedrock.levels.map(l => l.kind)).toEqual(['group', 'group', 'group', 'model'])
+  for (const level of bedrock.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+  expect(bedrock.levels.at(-1)?.value).toBe('litellm/bedrock/us.anthropic.claude-85')
+  expect(bedrock.levels.at(-1)?.options.find(o => o.value === 'litellm/bedrock/us.anthropic.claude-85')?.label).toBe('us.anthropic.claude-85')
+
+  // Filter: <= 61 matches collapses to one Select; > 61 keeps group Selects with a narrow hint.
+  expect(filterModels(models, 'VERTEX').length).toBe(60)
+  const narrow = pickerLevels(models, { filter: 'gemini-4', selected: 'openai/gpt-01' })
+  expect(narrow.levels.length).toBe(1)
+  expect(narrow.narrowHint).toBeUndefined()
+  expect(narrow.matchCount).toBe(10)
+  expect(narrow.levels[0]?.options.some(o => o.value === 'openai/gpt-01')).toBe(true)
+
+  const broad = pickerLevels(models, { filter: 'litellm' })
+  expect(broad.narrowHint).toBe('150 matches · type more to narrow')
+  expect(broad.levels.length).toBeGreaterThan(1)
+  // Every match starts with litellm/, so the shared prefix is skipped down to bedrock / vertex.
+  expect(broad.levels[0]?.options.map(o => o.value)).toEqual(['bedrock', 'vertex'])
+  for (const level of broad.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+
+  // Single models gather under "other models", and shared prefixes skip a level.
+  const withSingletons = [
+    ...Array.from({ length: 70 }, (_, i) => ({ id: `acme/m-${i}` })),
+    { id: 'solo-a/one' },
+    { id: 'solo-b/two' },
+  ]
+  const grouped = groupModels(withSingletons, 0)
+  expect(grouped.kind).toBe('split')
+  if (grouped.kind === 'split') {
+    expect(grouped.groups.map(g => g.label)).toEqual(['acme (70)', 'other models (2)'])
+  }
+
+  // Flat ids without '/' fall back to name-ordered runs ("a … f (45)"), every level <= 64.
+  const letters = 'abcdefghijklmnopqrstuvwxyz'
+  const flat = Array.from({ length: 130 }, (_, i) => ({ id: `${letters[i % 26]}-model-${String(i).padStart(3, '0')}` }))
+  const flatState = pickerLevels(flat, { selected: 'z-model-129' })
+  expect(flatState.levels.length).toBe(2)
+  expect(flatState.levels[0]?.options.every(o => /^[a-z] … [a-z] \(\d+\)$/.test(o.label))).toBe(true)
+  expect(flatState.levels[1]?.value).toBe('z-model-129')
+  expect(flatState.levels[1]?.options.length).toBeLessThanOrEqual(64)
+
+  // More than 63 child groups wrap those children into runs too.
+  const manyProviders = Array.from({ length: 140 }, (_, i) => [
+    { id: `p${String(i).padStart(3, '0')}/m1` },
+    { id: `p${String(i).padStart(3, '0')}/m2` },
+  ]).flat()
+  const wrappedTree = buildModelTree(manyProviders)
+  expect(wrappedTree.kind).toBe('branch')
+  if (wrappedTree.kind === 'branch') expect(wrappedTree.children.length).toBeLessThanOrEqual(63)
+  const wrappedState = pickerLevels(manyProviders, { selected: 'p139/m2' })
+  for (const level of wrappedState.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+  expect(wrappedState.levels.at(-1)?.value).toBe('p139/m2')
+
+  // Under 64 models keeps a single ungrouped Select without search.
+  const small = Array.from({ length: 20 }, (_, i) => ({ id: `a/m-${i}` }))
+  const smallState = pickerLevels(small, { selected: 'a/m-5' })
+  expect(smallState.showSearch).toBe(false)
+  expect(smallState.levels.length).toBe(1)
+  expect(smallState.levels[0]?.value).toBe('a/m-5')
+})
+
+test('settings model pickers reach every model through provider groups, sub-groups and search in both edit view and Task routing', async ($, on) => {
+  mock.clock(on)
+  const models = [
+    ...Array.from({ length: 90 }, (_, i) => ({ id: `litellm/bedrock/us.anthropic.claude-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 60 }, (_, i) => ({ id: `litellm/vertex/gemini-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `openai/gpt-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `github-copilot/model-${String(i).padStart(2, '0')}` })),
+  ]
+  const oc = { ...fromPreset(PRESETS.find(p => p.id === 'opencode')!), model: 'openai/gpt-70', models }
+  const store = memStore(on, {
+    harnesses: [oc],
+    'codex-enabled': false,
+    routing: { isOn: true, routes: [{ task: 'implement', target: 'opencode', model: 'openai/gpt-65' }] },
+  })
+  quietSession(on, 'sid-many-models')
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  // 1. Harness edit view: preselected on openai/gpt-70, no "Showing 62 of" hint; pick litellm -> vertex -> gemini-55 and save.
+  const settings = await mountSettings($, 56)
+  await settings.press({ key: 'h-edit-opencode' } as never)
+  await settings.redraw()
+  expect(await settings.find({ text: /Showing 62 of/ })).toBeUndefined()
+  expect(await settings.find({ key: 'h-model-pick-search' })).toBeDefined()
+  expect(((await settings.find({ key: 'h-model-pick-g-0' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai')
+  expect(((await settings.find({ key: 'h-model-pick' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai/gpt-70')
+
+  await settings.select({ key: 'h-model-pick-g-0', value: 'litellm' })
+  await settings.redraw()
+  await settings.select({ key: 'h-model-pick-g-1', value: 'vertex' })
+  await settings.redraw()
+  const editLeaf = (await settings.find({ key: 'h-model-pick' })) as { props?: { options?: { value: string; label?: string }[] } } | undefined
+  expect(editLeaf?.props?.options?.length).toBeLessThanOrEqual(64)
+  expect(editLeaf?.props?.options?.find(o => o.value === 'litellm/vertex/gemini-55')?.label).toBe('gemini-55')
+  await settings.select({ key: 'h-model-pick', value: 'litellm/vertex/gemini-55' })
+  await settings.redraw()
+
+  // Search in edit view narrows across all groups to one Select when <= 61 matches.
+  await settings.input({ key: 'h-model-pick-search', text: 'claude-8', kind: 'change' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'h-model-pick-g-0' })).toBeUndefined()
+  const editSearchLeaf = (await settings.find({ key: 'h-model-pick' })) as { props?: { options?: { value: string; label?: string }[] } } | undefined
+  expect(editSearchLeaf?.props?.options?.some(o => o.value === 'litellm/bedrock/us.anthropic.claude-88')).toBe(true)
+  expect(editSearchLeaf?.props?.options?.some(o => o.value === 'litellm/vertex/gemini-55')).toBe(true)
+  await settings.press({ key: 'h-save' } as never)
+  await settings.redraw()
+  const savedHarnesses = store.get('harnesses') as { id: string; model?: string }[]
+  expect(savedHarnesses.find(h => h.id === 'opencode')?.model).toBe('litellm/vertex/gemini-55')
+
+  // 2. Task routing card: provider -> sub-group -> model saves, search narrows, and Other… still lets you type any id.
+  await settings.press({ key: 's-tab-routing' } as never)
+  await settings.redraw()
+  expect(await settings.find({ text: /Showing 62 of/ })).toBeUndefined()
+  expect(await settings.find({ key: 'r-model-implement-search' })).toBeDefined()
+  expect(((await settings.find({ key: 'r-model-implement-g-0' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai')
+  expect(((await settings.find({ key: 'r-model-implement' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai/gpt-65')
+
+  await settings.select({ key: 'r-model-implement-g-0', value: 'litellm' })
+  await settings.redraw()
+  await settings.select({ key: 'r-model-implement-g-1', value: 'vertex' })
+  await settings.redraw()
+  await settings.select({ key: 'r-model-implement', value: 'litellm/vertex/gemini-33' })
+  await settings.redraw()
+  let savedRouting = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(savedRouting.routes.find(r => r.task === 'implement')?.model).toBe('litellm/vertex/gemini-33')
+
+  // Search narrows on the routing card too (> 61 shows hint, <= 61 collapses to one Select).
+  await settings.input({ key: 'r-model-implement-search', text: 'litellm', kind: 'change' })
+  await settings.redraw()
+  expect(await settings.find({ text: '150 matches · type more to narrow' })).toBeDefined()
+  await settings.input({ key: 'r-model-implement-search', text: 'claude-88', kind: 'change' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-model-implement-g-0' })).toBeUndefined()
+  await settings.select({ key: 'r-model-implement', value: 'litellm/bedrock/us.anthropic.claude-88' })
+  await settings.redraw()
+  savedRouting = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(savedRouting.routes.find(r => r.task === 'implement')?.model).toBe('litellm/bedrock/us.anthropic.claude-88')
+
+  await settings.select({ key: 'r-model-implement', value: '__other__' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-model-input-implement' })).toBeDefined()
+  await settings.input({ key: 'r-model-input-implement', text: 'provider/custom-999', kind: 'submit' })
+  await settings.redraw()
+  savedRouting = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(savedRouting.routes.find(r => r.task === 'implement')?.model).toBe('provider/custom-999')
+  await settings.unmount()
+})
+
+test('efforts read in sentence case', () => {
+  expect(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'turbo'].map(effortLabel)).toEqual(['None', 'Minimal', 'Low', 'Medium', 'High', 'Extra high', 'Max', 'Turbo'])
+})
+
+// ---------- Antigravity's meter view ----------
+
+test("Antigravity's view picks its windows by model family, and every provider shows its 5-hour window first", () => {
+  const ws = agyLimits(AGY_QUOTA)
+  const names = (xs: { name?: string }[]) => xs.map(w => w.name)
+  expect(AGY_VIEWS.map(v => v.value)).toEqual(['basic', 'gemini', 'all'])
+  expect(names(agyWindows(ws))).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit'])
+  expect(names(agyWindows(ws, 'gemini'))).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit', 'Gemini 4 Argon · Weekly limit'])
+  expect(names(agyWindows(ws, 'all'))).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit', 'Gemini 4 Argon · Weekly limit', 'Claude & GPT · 5-hour limit'])
+  // A reading saved before groups and spans were kept is sorted by its tags.
+  const old = ws.map(({ group: _g, span: _s, ...w }) => w)
+  expect(names(agyWindows(old, 'all'))).toEqual(names(agyWindows(ws, 'all')))
+  // The filter keys on agy's bucket ids, not on the group's display name.
+  const renamed = agyLimits({ response: { groups: [{ displayName: 'Flash models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.5 }] }] } })
+  expect(agyWindows(renamed).map(w => w.percent)).toEqual([50])
+  const claude = [
+    { label: '7d', percent: 10 },
+    { label: 'Opus', percent: 5 },
+    { label: '5h', percent: 20 },
+  ]
+  expect(orderWindows(claude).map(w => w.label)).toEqual(['5h', '7d', 'Opus'])
+  expect(shownWindows('claude', claude).map(w => w.label)).toEqual(['5h', '7d', 'Opus'])
+  expect(shownWindows('antigravity', ws, 'gemini').length).toBe(3)
+  // The folded summary's highest percent counts only the shown windows.
+  expect(limitSummary([{ name: 'Antigravity', windows: agyWindows(ws) }], 0)).toEqual([{ name: 'Antigravity', percent: 2.4 }])
+  expect(limitSummary([{ name: 'Antigravity', windows: agyWindows(ws, 'gemini') }], 0)).toEqual([{ name: 'Antigravity', percent: 50 }])
+})
+
+test('the Antigravity view switch sits on its title row, persists, and sets the folded summary', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-11-20T12:00:00Z') })
+  const store = memStore(on, { harnesses: [fromPreset(PRESETS.find(p => p.id === 'antigravity')!)], 'codex-enabled': false })
+  quietSession(on, 'sid-agy-view')
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv.some(a => a.endsWith('agy-quota.mjs'))) {
+      return { value: { exitCode: 0, stdout: JSON.stringify({ sessionId: 's1', quota: AGY_QUOTA }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await mountPane($, 60)
+  await ui.redraw()
+  const rowText = async () =>
+    ((await ui.findAll({ type: 'Text' } as never)) as { text?: string }[]).map(t => t.text ?? '').filter(t => /^[^·]+ · (5-hour|Weekly) limit$/.test(t))
+  expect(((await ui.find({ key: 'lim-agy-view' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('basic')
+  expect(await rowText()).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit'])
+  await ui.select({ key: 'lim-agy-view', value: 'all' })
+  await ui.redraw()
+  expect(await rowText()).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit', 'Gemini 4 Argon · Weekly limit', 'Claude & GPT · 5-hour limit'])
+  expect((store.get('meters') as { agyView?: string }).agyView).toBe('all')
+  await ui.select({ key: 'lim-agy-view', value: 'basic' })
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /Antigravity 2%/ })).toBeDefined()
+  // Folded, the switch is out of sight: open, pick Gemini, fold again.
+  expect(await ui.find({ key: 'lim-agy-view' })).toBeUndefined()
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'lim-agy-view', value: 'gemini' })
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /Antigravity 50%/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('every settings tab draws on every surface, a narrow pane too', async ($, on) => {
+  mock.clock(on)
+  const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  memStore(on, { harnesses: [agy, preset('gemini')], 'codex-enabled': false, routing: { isOn: true, routes: [{ task: 'ui', target: 'antigravity', model: 'gemini-4-neon-high', effort: 'xhigh' }, { task: 'review', target: 'gemini' }] } })
+  quietSession(on, 'sid-surfaces')
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.spawn', async function* () {
+    return { value: { exitCode: 1 } } as never
+  } as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    for (const bodyColumns of [36, 90]) {
+      const ui = await $.ui.mount({
+        plugin: 'agent-deck',
+        surface,
+        component: 'Pane',
+        requestId: 'agent-deck-settings',
+        props: { title: 'Agent Deck settings', isFocused: true, bodyColumns, placement: 'dock' } as never,
+      })
+      for (const tab of ['harnesses', 'routing', 'meters']) {
+        await ui.press({ key: `s-tab-${tab}` } as never)
+        await ui.redraw()
+        expect(await ui.find({ key: 'h-done' })).toBeDefined()
+      }
+      await ui.press({ key: 's-tab-harnesses' } as never)
+      await ui.redraw()
+      await ui.press({ key: 'cx-edit' } as never)
+      await ui.redraw()
+      expect(await ui.find({ key: 'cx-done' })).toBeDefined()
+      await ui.press({ key: 'cx-done' } as never)
+      await ui.redraw()
+      await ui.press({ key: 's-tab-routing' } as never)
+      await ui.redraw()
+      expect(await ui.find({ text: 'Task routing' })).toBeDefined()
+      // Mobile draws no Select: each route reads as one line.
+      expect(await ui.find({ text: surface === 'mobile' ? 'Antigravity · gemini-4-neon-high · effort Extra high' : 'gemini-4-neon-high' })).toBeDefined()
+      if (surface !== 'mobile') expect(((await ui.find({ key: 'r-effort-ui' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('xhigh')
+      await ui.unmount()
+    }
+  }
+})
+
+// ---------- failed runs: stderr reason, secret redaction, once-only delivery ----------
+
+test('stderr summarising strips ANSI codes, redacts keys and tokens, keeps ordinary paths/messages, and caps around 500 chars', () => {
+  expect(stripAnsi('\x1b[31mError:\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x07 failed')).toBe('Error: link failed')
+
+  // Redacts every secret/token pattern while preserving normal text, URLs, paths and UUIDs.
+  const secrets = [
+    'sk-proj-abc123def456ghi789',
+    'sk-ant-api03-1234567890abcdef',
+    'ghp_1234567890abcdefABCDEF1234567890ab',
+    'gho_abcdef1234567890ABCDEF1234567890',
+    'github_pat_11ABCDEFG0123456789_xyzABCDEF0123456789',
+    'glpat-aBcDeFgHiJkLmNoPqRsT1234',
+    'Bearer eyJhbGciOiJIUzI1NiJ9.payload12345.sig67890',
+    'bearer my-raw-token-value',
+    '0123456789abcdef0123456789abcdef01234567',
+    'YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY=',
+    'aGVsbG8gd29ybGQgdGhpcyBpcyBhIHNlY3JldCBrZXk',
+  ]
+  for (const secret of secrets) {
+    const out = redactSecrets(`auth failed with ${secret} at step 1`)
+    expect(out).toContain('[redacted]')
+    expect(out.includes(secret.replace(/^bearer /i, ''))).toBe(false)
+  }
+
+  const benign =
+    'Error executing prompt: Error: model resolution leaf failed: Auto preference "hydrafusion" is disabled at https://api.github.com/copilot/v1/models (/Users/alice/agent-deck/hooks/harness.ts) session 605c0f8e-5314-4c46-8658-6c3b7078873b'
+  expect(redactSecrets(benign)).toBe(benign)
+
+  // Drops stack frames when meaningful lines exist, strips ANSI, and stays <= 500 chars.
+  const noisy = [
+    '\x1b[33mwarn: priming\x1b[0m',
+    '\x1b[31mError executing prompt: bad token sk-secretkey1234567890\x1b[0m',
+    '    at resolveModel (/app/cli.js:12:3)',
+    '    at main (/app/cli.js:99:1)',
+    'Node.js v22.14.0',
+  ].join('\n')
+  const summary = summarizeStderr(noisy)
+  expect(summary).toContain('Error executing prompt: bad token [redacted]')
+  expect(summary).not.toContain('sk-secretkey')
+  expect(summary).not.toContain('at resolveModel')
+  expect(summary).not.toContain('\x1b[')
+
+  const veryLong = Array.from({ length: 30 }, (_, i) => `line ${i}: ${'detail '.repeat(12)}`).join('\n')
+  expect(summarizeStderr(veryLong).length).toBeLessThanOrEqual(500)
+  expect(summarizeStderr(veryLong)).toContain('line 29:')
+
+  // Real Copilot failure shape: result event has exitCode 1, reason lives only in stderr.log.
+  const copilotStderr =
+    'Error executing prompt: Error: model resolution leaf failed: Auto preference "hydrafusion" is disabled: This tier is not available for the user\'s Copilot plan.; choose an enabled Auto preference or another model'
+  expect(harnessFailure('Copilot', 1, 'Copilot exited 1', copilotStderr)).toBe(`Copilot exited 1: ${copilotStderr}`)
+  expect(harnessFailure('OpenCode', 1, undefined, '\x1b[31mpermission denied\x1b[0m')).toBe('OpenCode exited 1: permission denied')
+  expect(harnessFailure('Copilot', 1, 'Copilot exited 1', '')).toBe('Copilot exited 1')
+  expect(harnessFailure('Copilot', 1, 'Rate limit exceeded', 'ignored stderr')).toBe('Rate limit exceeded')
+
+  // A prior real Copilot error event is not overwritten by a trailing result exitCode 1.
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'auto', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  for (const l of [
+    '{"type":"session.error","data":{"message":"Model quota reached"}}',
+    '{"type":"result","exitCode":1}',
+  ]) {
+    for (const ev of parseLine('copilot', l)) applyHarnessEvent(card, ev)
+  }
+  expect(card.error).toBe('Model quota reached')
+
+  // Codex failure path also strips ANSI and redacts keys/tokens in stderr and events.
+  expect(codexFailure('', '\x1b[2m2026-11-21T10:00:00Z\x1b[0m \x1b[31mERROR\x1b[0m auth failed: Bearer topsecret123456\n', 1)).toBe(
+    'auth failed: [redacted]',
+  )
+  expect(codexFailure(JSON.stringify({ type: 'error', message: 'invalid key sk-codexsecret123456' }), '', 1)).toBe(
+    'invalid key [redacted]',
+  )
+})
+
+test('a failed harness run shows stderr in its card and report, marks delivered.txt with a timestamp, and delivers once even after 11 minutes', async ($, on) => {
+  const start = 100_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-fail-harness' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const stderrReason =
+    'Error executing prompt: Error: model resolution leaf failed: Auto preference "hydrafusion" is disabled: This tier is not available for the user\'s Copilot plan.; choose an enabled Auto preference or another model'
+  const files = new Map<string, string>([
+    [
+      `${root}/run-fail/meta.json`,
+      JSON.stringify({
+        id: 'run-fail',
+        harness: 'copilot',
+        name: 'Copilot',
+        color: '#8957E5',
+        parser: 'copilot',
+        title: 'Smoke test: Copilot',
+        cwd: 'project',
+        sessionId: 'sid-fail-harness',
+        startedAt: start - 4000,
+        model: 'hydrafusion',
+      }),
+    ],
+    [`${root}/run-fail/exit.txt`, '1'],
+    [
+      `${root}/run-fail/events.jsonl`,
+      [
+        '{"type":"session.start","data":{"sessionId":"605c0f8e-5314-4c46-8658-6c3b7078873b"}}',
+        '{"type":"result","sessionId":"605c0f8e-5314-4c46-8658-6c3b7078873b","exitCode":1}',
+      ].join('\n') + '\n',
+    ],
+    [`${root}/run-fail/stderr.log`, `\x1b[31m${stderrReason} (token ghp_1234567890abcdef123456)\x1b[0m\n`],
+    // A second already-delivered failed run whose timestamp is older than DELIVERY_CLAIM_TTL_MS must never re-deliver.
+    [
+      `${root}/run-old/meta.json`,
+      JSON.stringify({
+        id: 'run-old',
+        harness: 'copilot',
+        name: 'Copilot',
+        color: '#8957E5',
+        parser: 'copilot',
+        title: 'Old failed run',
+        cwd: 'project',
+        sessionId: 'sid-fail-harness',
+        startedAt: start - 15 * 60_000,
+        model: 'hydrafusion',
+      }),
+    ],
+    [`${root}/run-old/exit.txt`, '1'],
+    [`${root}/run-old/events.jsonl`, '{"type":"result","exitCode":1}\n'],
+    [`${root}/run-old/stderr.log`, 'old error\n'],
+    [`${root}/run-old/delivered.txt`, String(start - 12 * 60_000)],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root)
+      ? ['run-fail', 'run-old'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))
+      : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  // Fail the first timestamp write to delivered.txt to verify we retry writing the marker without re-submitting.
+  let failTimestampWriteOnce = true
+  on('fs.write', (_$, e) => {
+    const path = key(e.path)
+    if (path === `${root}/run-fail/delivered.txt` && /^\d+$/.test(e.text) && failTimestampWriteOnce) {
+      failTimestampWriteOnce = false
+      return { deny: 'transient write error' }
+    }
+    files.set(path, e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 8; i++) await clock.advance(500)
+
+  // Delivered exactly once with the real stderr reason, redacted token, and plain Copilot model hint.
+  expect(submits.length).toBe(1)
+  expect(submits[0]).toContain(`Copilot exited 1: ${stderrReason} (token [redacted]). ${COPILOT_MODEL_HINT}`)
+  expect(submits[0]).not.toContain('ghp_1234567890')
+  expect(submits[0]).not.toContain('\x1b[')
+
+  // delivered.txt holds a timestamp (never left as a claim), even after a transient write failure.
+  const deliveredRaw = files.get(`${root}/run-fail/delivered.txt`) ?? ''
+  expect(deliveredRaw).toMatch(/^\d+$/)
+  expect(readDeliveryMark(deliveredRaw)).toEqual({ state: 'delivered' })
+  expect(isDeliveryTaken(readDeliveryMark(deliveredRaw), start + 11 * 60_000)).toBe(true)
+
+  // agent_result and the card's error line show the exact same reason and hint.
+  const res = (await $.tool.call({ tool: 'mcp__agent-deck__agent_result', tool_use_id: 'res-fail', id: 'run-fail' })) as { result?: string }
+  expect(res.result).toContain(`Copilot run run-fail failed: Copilot exited 1: ${stderrReason} (token [redacted]). ${COPILOT_MODEL_HINT}`)
+
+  const ui = await mountPane($, 80)
+  await ui.press({ key: 't-h-run-run-fail' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Copilot exited 1: Error executing prompt:.*Pick another Copilot model in ⚙ Settings → Harnesses → Copilot\./ })).toBeDefined()
+  await ui.unmount()
+
+  // Advance 11 minutes (past the 10-minute claim TTL) and poll/reload again: nothing is delivered a second time.
+  await clock.advance(11 * 60_000)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+  expect(submits.length).toBe(1)
+  expect(files.get(`${root}/run-fail/delivered.txt`)).toMatch(/^\d+$/)
+})
+
+test('a failed Codex run shows redacted stderr, marks delivered.txt with a timestamp, and delivers once even after 11 minutes', async ($, on) => {
+  const start = 200_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-fail-codex' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/runs'
+  const files = new Map<string, string>([
+    [
+      `${root}/cx-fail/meta.json`,
+      JSON.stringify({
+        id: 'cx-fail',
+        title: 'Failed Codex task',
+        cwd: 'project',
+        sessionId: 'sid-fail-codex',
+        startedAt: start - 5000,
+        model: 'gpt-6.1-sol',
+      }),
+    ],
+    [`${root}/cx-fail/exit.txt`, '1'],
+    [`${root}/cx-fail/events.jsonl`, '{"type":"thread.started","thread_id":"th-1"}\n'],
+    [`${root}/cx-fail/stderr.log`, '\x1b[31m2026-11-21T10:00:00Z ERROR codex_core: auth rejected sk-secretcodex123456\x1b[0m\n'],
+    // Already-delivered failed Codex run older than 11 minutes must never be delivered again.
+    [
+      `${root}/cx-old/meta.json`,
+      JSON.stringify({
+        id: 'cx-old',
+        title: 'Old Codex failure',
+        cwd: 'project',
+        sessionId: 'sid-fail-codex',
+        startedAt: start - 15 * 60_000,
+      }),
+    ],
+    [`${root}/cx-old/exit.txt`, '1'],
+    [`${root}/cx-old/events.jsonl`, ''],
+    [`${root}/cx-old/stderr.log`, 'old failure\n'],
+    [`${root}/cx-old/delivered.txt`, String(start - 12 * 60_000)],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root)
+      ? ['cx-fail', 'cx-old'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))
+      : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  // pollRuns ticks every 2000ms: poll 1 claims, poll 2 submits and writes timestamp.
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+
+  expect(submits.length).toBe(1)
+  expect(submits[0]).toContain('Background Codex run cx-fail ("Failed Codex task") failed')
+  expect(submits[0]).toContain('codex_core: auth rejected [redacted]')
+  expect(submits[0]).not.toContain('sk-secretcodex')
+  expect(submits[0]).not.toContain('\x1b[')
+
+  const deliveredRaw = files.get(`${root}/cx-fail/delivered.txt`) ?? ''
+  expect(deliveredRaw).toMatch(/^\d+$/)
+  expect(readDeliveryMark(deliveredRaw)).toEqual({ state: 'delivered' })
+  expect(isDeliveryTaken(readDeliveryMark(deliveredRaw), start + 11 * 60_000)).toBe(true)
+
+  const ui = await mountPane($, 80)
+  await ui.press({ key: 't-codex-run-cx-fail' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /codex_core: auth rejected \[redacted\]/ })).toBeDefined()
+  await ui.unmount()
+
+  // Advance 11 minutes and poll/reload again: nothing is delivered a second time.
+  await clock.advance(11 * 60_000)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+  expect(submits.length).toBe(1)
+  expect(files.get(`${root}/cx-fail/delivered.txt`)).toMatch(/^\d+$/)
+})
+
+test('a slow prompt.submit for one run does not leave another claimed run stuck as a claim', async ($, on) => {
+  const start = 300_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-concurrent' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>()
+  for (const id of ['run-slow', 'run-fast']) {
+    files.set(
+      `${root}/${id}/meta.json`,
+      JSON.stringify({ id, harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: id, cwd: 'project', sessionId: 'sid-concurrent', startedAt: start - 3000 }),
+    )
+    files.set(`${root}/${id}/exit.txt`, id === 'run-slow' ? '1' : '0')
+    files.set(`${root}/${id}/events.jsonl`, id === 'run-slow' ? '{"type":"result","exitCode":1}\n' : '{"type":"assistant.message","data":{"content":"ok"}}\n')
+    files.set(`${root}/${id}/stderr.log`, id === 'run-slow' ? 'slow error\n' : '')
+  }
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root)
+      ? ['run-slow', 'run-fast'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))
+      : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  let releaseSlow!: () => void
+  const submits: string[] = []
+  on('prompt.submit', async (_$, e) => {
+    submits.push(e.text)
+    if (e.text.includes('run-slow')) await new Promise<void>(r => { releaseSlow = r })
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+
+  // While run-slow is still waiting in prompt.submit, run-fast has already been submitted and stamped as delivered.
+  expect(submits.length).toBe(2)
+  expect(files.get(`${root}/run-fast/delivered.txt`)).toMatch(/^\d+$/)
+  expect(files.get(`${root}/run-slow/delivered.txt`)).toMatch(/^claim \S+ \d+$/)
+
+  // Once run-slow finishes prompt.submit, its delivered.txt becomes a timestamp too.
+  releaseSlow()
+  for (let i = 0; i < 4; i++) await clock.advance(500)
+  expect(files.get(`${root}/run-slow/delivered.txt`)).toMatch(/^\d+$/)
+  expect(submits.length).toBe(2)
+})
+
+test('Copilot Fusion runs as --model without --auto-tier, skips inherited route effort, and plan-disabled errors add a plain hint', () => {
+  const copilot = fromPreset(PRESETS.find(p => p.id === 'copilot')!)
+  expect(isFusionModel('hydrafusion')).toBe(true)
+  expect(isFusionModel('hydrafusion-max')).toBe(true)
+  expect(isFusionModel('auto')).toBe(false)
+
+  // Direct Fusion model: --model hydrafusion, no --auto-tier, no --experimental, no --reasoning-effort.
+  const direct = harnessArgs(copilot, { prompt: 'Hello', model: 'hydrafusion' })
+  expect(direct).toContain('--model')
+  expect(direct[direct.indexOf('--model') + 1]).toBe('hydrafusion')
+  expect(direct).not.toContain('--auto-tier')
+  expect(direct).not.toContain('--experimental')
+  expect(direct).not.toContain('--reasoning-effort')
+
+  // Explicit effort still passes through when asked directly.
+  const withEffort = harnessArgs(copilot, { prompt: 'Hello', model: 'hydrafusion', effort: 'low' })
+  expect(withEffort.slice(0, 2)).toEqual(['--reasoning-effort', 'low'])
+  expect(withEffort).not.toContain('--auto-tier')
+
+  // Task routing does not inherit a route's effort onto a Copilot Fusion model unless passed explicitly.
+  const hs = [{ ...copilot, model: 'hydrafusion' }]
+  const routing = {
+    isOn: true,
+    routes: [
+      { task: 'review', target: 'copilot', effort: 'high' },
+      { task: 'implement', target: 'copilot', model: 'gpt-6-luna', effort: 'high' },
+    ],
+  }
+  expect(resolveRun({ task: 'review' }, routing, hs, false)).toEqual({ harness: 'copilot', model: undefined, effort: undefined })
+  expect(resolveRun({ task: 'review', effort: 'low' }, routing, hs, false)).toEqual({ harness: 'copilot', model: undefined, effort: 'low' })
+  expect(resolveRun({ task: 'implement', model: 'hydrafusion' }, routing, hs, false)).toEqual({ harness: 'copilot', model: 'hydrafusion', effort: undefined })
+  expect(resolveRun({ task: 'implement' }, routing, hs, false)).toEqual({ harness: 'copilot', model: 'gpt-6-luna', effort: 'high' })
+
+  // Plan-disabled / unavailable Copilot errors get a plain hint; other parsers and unrelated errors do not.
+  expect(copilotFailureHint('copilot', 'This tier is not available for the user\'s Copilot plan.')).toBe(COPILOT_MODEL_HINT)
+  expect(copilotFailureHint('copilot', 'Auto preference "hydrafusion" is disabled')).toBe(COPILOT_MODEL_HINT)
+  expect(copilotFailureHint('copilot', 'network timed out')).toBeUndefined()
+  expect(copilotFailureHint('opencode', 'feature is disabled')).toBeUndefined()
+  expect(harnessFailure('Copilot', 1, 'Copilot exited 1', 'Model hydrafusion-max is disabled', 'copilot')).toBe(
+    `Copilot exited 1: Model hydrafusion-max is disabled. ${COPILOT_MODEL_HINT}`,
+  )
+  expect(harnessFailure('OpenCode', 1, undefined, 'feature is disabled', 'opencode')).toBe('OpenCode exited 1: feature is disabled')
+})
+
+test('session.end releases unsent delivery claims so a replacement copy delivers right away without waiting 10 minutes', async ($, on) => {
+  const start = 400_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-reload-claim' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', () => ({ sessionId: 'sid-reload-claim' }) as never)
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>([
+    [
+      `${root}/run-claim/meta.json`,
+      JSON.stringify({ id: 'run-claim', harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: 'Smoke test', cwd: 'project', sessionId: 'sid-reload-claim', startedAt: start - 5000 }),
+    ],
+    [`${root}/run-claim/exit.txt`, '0'],
+    [`${root}/run-claim/events.jsonl`, '{"event":"result","result":{"status":"SUCCESS","response":"0.17.5"}}\n'],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? [{ name: 'run-claim', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  // Poll 1 writes the claim, before Poll 2 submits.
+  await clock.advance(1000)
+  expect(files.get(`${root}/run-claim/delivered.txt`)).toMatch(/^claim \S+ \d+$/)
+  expect(submits.length).toBe(0)
+
+  // A reload/end before Poll 2 releases the unsent claim immediately.
+  await $.session.end({ reason: 'other' } as never)
+  expect(files.get(`${root}/run-claim/delivered.txt`)).toBe('')
+
+  // Next copy starts 2 seconds later and delivers right away (no 10-minute wait).
+  await clock.advance(2000)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+  expect(submits.length).toBe(1)
+  expect(files.get(`${root}/run-claim/delivered.txt`)).toMatch(/^\d+$/)
+})
+
+// ---------- review regression tests (0.17.6) ----------
+
+test('1a: a second copy paused after reading an empty delivered.txt never overwrites a delivered timestamp or submits twice', async ($, on) => {
+  const start = 500_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-race-copy' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const deliveredPath = `${root}/run-race/delivered.txt`
+  const files = new Map<string, string>([
+    [
+      `${root}/run-race/meta.json`,
+      JSON.stringify({ id: 'run-race', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Race test', cwd: 'project', sessionId: 'sid-race-copy', startedAt: start - 5000 }),
+    ],
+    [`${root}/run-race/exit.txt`, '0'],
+    [`${root}/run-race/events.jsonl`, '{"type":"assistant.message","data":{"content":"Done cleanly"}}\n'],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? [{ name: 'run-race', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [],
+  }))
+  // Pause Copy B right after it reads an empty delivered.txt while Copy A completes and stamps a timestamp.
+  let pauseFirstDeliveredRead = true
+  let releasePausedRead!: () => void
+  let readStarted!: () => void
+  const firstReadPending = new Promise<void>(r => { readStarted = r })
+  on('fs.read', async (_$, e) => {
+    const p = key(e.path)
+    if (p === deliveredPath && pauseFirstDeliveredRead) {
+      pauseFirstDeliveredRead = false
+      const stale = files.get(p)
+      readStarted()
+      await new Promise<void>(r => { releasePausedRead = r })
+      return stale === undefined ? { deny: 'not found' } : { value: stale }
+    }
+    const text = files.get(p)
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  // Poll 1 starts and pauses inside Copy B's read of empty delivered.txt.
+  const tick1 = clock.advance(1000)
+  await firstReadPending
+  // Meanwhile Copy A claims, submits, and stamps delivered.txt with a timestamp.
+  const copyAReport = '[agent-deck] Background Copilot run run-race ("Race test") finished after 5s. Its report:\n\nDone cleanly\n\n[Copilot run run-race · harness copilot · model default]'
+  await $.prompt.submit({ text: copyAReport, wait: false, origin: { kind: 'plugin', plugin: 'agent-deck-other' } } as never)
+  files.set(deliveredPath, String(start + 1200))
+  expect(submits.length).toBe(1)
+
+  // Resume Copy B with its stale empty read, then advance several polls.
+  releasePausedRead()
+  await tick1
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+
+  // Copy B must never overwrite the delivered timestamp with a claim or submit a second time.
+  expect(files.get(deliveredPath)).toBe(String(start + 1200))
+  expect(submits.length).toBe(1)
+})
+
+test('1b: a reload right after prompt acceptance before delivered.txt is stamped does not deliver a second time', async ($, on) => {
+  const start = 550_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-reload-accepted' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', () => ({ sessionId: 'sid-reload-accepted' }) as never)
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const deliveredPath = `${root}/run-accepted/delivered.txt`
+  const files = new Map<string, string>([
+    [
+      `${root}/run-accepted/meta.json`,
+      JSON.stringify({ id: 'run-accepted', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Accepted before stamp', cwd: 'project', sessionId: 'sid-reload-accepted', startedAt: start - 4000 }),
+    ],
+    [`${root}/run-accepted/exit.txt`, '0'],
+    [`${root}/run-accepted/events.jsonl`, '{"type":"assistant.message","data":{"content":"Report body"}}\n'],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? [{ name: 'run-accepted', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  // Block timestamp writes during the first copy so delivered.txt never gets stamped before reload.
+  let blockTimestampWrites = true
+  on('fs.write', (_$, e) => {
+    const p = key(e.path)
+    if (p === deliveredPath && /^\d+$/.test(e.text) && blockTimestampWrites) return { deny: 'reload cut off write' }
+    files.set(p, e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  // Simulate Copy A accepting the report right before a reload (before delivered.txt is stamped).
+  // After reload, Copy B has fresh empty module memory (deliveries Map is gone) while $.state/$.store survive.
+  const acceptedText = '[agent-deck] Background Copilot run run-accepted ("Accepted before stamp") finished after 4s. Its report:\n\nReport body\n\n[Copilot run run-accepted · harness copilot · model default]'
+  await $.prompt.submit({ text: acceptedText, wait: false, origin: { kind: 'plugin', plugin: 'agent-deck' } } as never)
+  expect(submits.length).toBe(1)
+  // delivered.txt was never stamped before the reload (still empty or stale claim).
+  files.set(deliveredPath, deliveryClaim('old-copy-before-reload', start - 11 * 60_000))
+
+  // Reloaded copy starts with empty module memory and polls the run folder.
+  blockTimestampWrites = false
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+
+  // Must NOT submit a second time, and delivered.txt gets stamped with a timestamp.
+  expect(submits.length).toBe(1)
+  expect(files.get(deliveredPath)).toMatch(/^\d+$/)
+})
+
+test('2: redacts credential fields by name regardless of value shape and scrubs known odd-shaped env secrets', () => {
+  const cases = [
+    ['x-api-key: fixture-key', 'fixture-key'],
+    ['X-API-Key: short1', 'short1'],
+    ['api-key: my-key-val', 'my-key-val'],
+    ['api_key: under_val', 'under_val'],
+    ['apikey: plainkey', 'plainkey'],
+    ['Authorization: Basic dXNlcjpwYXNz', 'dXNlcjpwYXNz'],
+    ['authorization: custom-auth-val', 'custom-auth-val'],
+    ['{"apiKey": "short-json-key", "status": 401}', 'short-json-key'],
+    ['{"x-api-key": "hdr-json-key"}', 'hdr-json-key'],
+    ['{"access_token": "tok-123", "secret": "sec-456", "password": "pw-789"}', 'tok-123'],
+    ['OPENAI_API_KEY=plainshort', 'plainshort'],
+    ['ANTHROPIC_API_KEY="quoted key"', 'quoted key'],
+    ['access_token=abc123&mode=fast', 'abc123'],
+    ['token: shorttok', 'shorttok'],
+    ['secret=mysec', 'mysec'],
+    ['password: hunter2', 'hunter2'],
+  ] as const
+  for (const [input, secret] of cases) {
+    const out = redactSecrets(input)
+    expect(out).toContain('[redacted]')
+    expect(out.includes(secret)).toBe(false)
+  }
+  // Known env secret of an odd short shape with no prefix or field label is still redacted.
+  const odd = 'q7!z'
+  const out = (redactSecrets as (s: string, secrets?: readonly string[]) => string)(`gateway rejected ${odd} on request`, [odd])
+  expect(out).toContain('[redacted]')
+  expect(out.includes(odd)).toBe(false)
+})
+
+test('3: evicting a finished harness card mid-delivery does not strand its report', async ($, on) => {
+  const start = 600_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-evict' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  let spawnCount = 0
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: `filler-${++spawnCount}` }))
+  on('turn.complete', () => ({ text: '' }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>([
+    [
+      `${root}/run-evict/meta.json`,
+      JSON.stringify({ id: 'run-evict', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Evicted mid-delivery', cwd: 'project', sessionId: 'sid-evict', startedAt: start - 5000 }),
+    ],
+    [`${root}/run-evict/exit.txt`, '0'],
+    [`${root}/run-evict/events.jsonl`, '{"type":"assistant.message","data":{"content":"Must still arrive"}}\n'],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? [{ name: 'run-evict', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  // Poll 1 finishes the run and writes a claim; delivery is still pending.
+  await clock.advance(1000)
+  expect(files.get(`${root}/run-evict/delivered.txt`)).toMatch(/^claim /)
+  expect(submits.length).toBe(0)
+
+  // Spawn 40 other cards so h-run-run-evict (oldest finished card) is evicted past MAX_CARDS (40).
+  for (let i = 0; i < 40; i++) {
+    await $.agent.spawn({
+      tool_use_id: `tu-${i}`, prompt: 'work', description: `job ${i}`, subagentType: 'Explore',
+      provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+    })
+  }
+
+  // Subsequent polls must still deliver run-evict's report once.
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+  expect(submits.length).toBe(1)
+  expect(submits[0]).toContain('Must still arrive')
+  expect(files.get(`${root}/run-evict/delivered.txt`)).toMatch(/^\d+$/)
+})
+
+test('5a: mergeSavedCards enforces a total serialized byte budget under 1.5 MB', () => {
+  const now = 20 * 86_400_000
+  const bigOutput = 'a'.repeat(6000)
+  const stored: Record<string, { savedAt: number; cards: AgentCard[] }> = {}
+  // 18 sessions x 40 cards x 6KB output ≈ 4.4 MB without a byte budget.
+  for (let s = 0; s < 17; s++) {
+    stored[`sid-${String(s).padStart(2, '0')}`] = {
+      savedAt: now - (18 - s) * 60_000,
+      cards: Array.from({ length: 40 }, (_, i) => sampleCard({ id: `s${s}-c${i}`, output: bigOutput })),
+    }
+  }
+  const currentCards = Array.from({ length: 40 }, (_, i) => sampleCard({ id: `cur-c${i}`, output: bigOutput }))
+  const merged = mergeSavedCards(stored, 'sid-current', currentCards, now, { maxCards: 40, maxOutput: 6000 })
+  const bytes = new TextEncoder().encode(JSON.stringify(merged)).length
+  expect(bytes).toBeLessThanOrEqual(1_500_000)
+  // Current session survives, oldest sessions were dropped first.
+  expect(merged['sid-current']).toBeDefined()
+  expect(merged['sid-00']).toBeUndefined()
+  expect(merged['sid-16']).toBeDefined()
+})
+
+test('5b: card save failure logs a short warning once instead of swallowing silently', async ($, on) => {
+  const clock = mock.clock(on, { now: 100_000 })
+  on('store.get', (_$, e) => ({ value: e.key === 'harnesses' ? [] : e.key === 'codex-enabled' ? false : undefined }))
+  on('store.set', (_$, e) => {
+    if (e.key === 'cards' || e.key.startsWith('cards:') || e.key === 'cards-index') {
+      return { deny: 'store quota exceeded (4 MiB)' }
+    }
+    return { value: undefined }
+  })
+  on('store.delete', () => ({ value: undefined }))
+  const logs: string[] = []
+  on('ui.log', (_$, e) => {
+    logs.push(String((e as { text?: string }).text ?? e))
+    return { value: undefined } as never
+  })
+  on('session.id', () => ({ value: 'sid-save-fail' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  let n = 0
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: `a-${++n}` }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({
+    tool_use_id: 'tu-1', prompt: 'p1', description: 'd1', subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await $.agent.spawn({
+    tool_use_id: 'tu-2', prompt: 'p2', description: 'd2', subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await clock.advance(300)
+
+  const warnings = logs.filter(l => /could not save.*cards/i.test(l))
+  expect(warnings.length).toBe(1)
+})
+
+test('6: cards migrate from legacy shared key to per-session keys and concurrent sessions do not overwrite each other', async ($, on) => {
+  const now = 30 * 86_400_000
+  const clock = mock.clock(on, { now })
+  const legacyA = sampleCard({ id: 'legacy-a', title: 'Legacy A' })
+  const legacyB = sampleCard({ id: 'legacy-b', title: 'Legacy B' })
+  const store = memStore(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: {
+      'sid-a': { savedAt: now - 10_000, cards: [legacyA] },
+      'sid-b': { savedAt: now - 5_000, cards: [legacyB] },
+    },
+  })
+  let currentSid = 'sid-a'
+  on('session.id', () => ({ value: currentSid }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  let n = 0
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: `agent-${++n}` }))
+
+  // First load migrates legacy `cards` into `cards:<sid>` + `cards-index`, then deletes `cards`.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  expect(store.has('cards')).toBe(false)
+  expect(store.has('cards:sid-a')).toBe(true)
+  expect(store.has('cards:sid-b')).toBe(true)
+  expect(store.has('cards-index')).toBe(true)
+
+  // Session A saves a new card; meanwhile Session B writes its own key directly (concurrent session).
+  await $.agent.spawn({
+    tool_use_id: 'tu-a', prompt: 'pa', description: 'Session A task', subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  store.set('cards:sid-b', { savedAt: now + 1000, cards: [legacyB, sampleCard({ id: 'b-concurrent', title: 'Concurrent B' })] })
+  await clock.advance(300)
+
+  // Session A's save must not overwrite Session B's concurrent save.
+  const savedA = store.get('cards:sid-a') as { cards: AgentCard[] }
+  const savedB = store.get('cards:sid-b') as { cards: AgentCard[] }
+  expect(savedA.cards.map(c => c.id)).toContain('agent-1')
+  expect(savedB.cards.map(c => c.id)).toEqual(['legacy-b', 'b-concurrent'])
+})
+
+test('7: reopening a session does not duplicate external Codex output when the watcher replays from byte 0', async ($, on) => {
+  const now = 40 * 86_400_000
+  const clock = mock.clock(on, { now })
+  const savedExt = sampleCard({
+    id: 'codex-th-replay',
+    provider: 'codex',
+    isExternal: true,
+    threadId: 'th-replay',
+    title: 'External Codex run',
+    status: 'done',
+    startedAt: now - 10_000,
+    endedAt: now - 5_000,
+    lastEventAt: now - 5_000,
+    output: 'Unique rollout message.\n',
+    activity: [{ id: 'a1', label: '$ git status', status: 'done' }],
+  })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': true,
+    cards: { 'sid-replay': { savedAt: now - 5_000, cards: [savedExt] } },
+  })
+  on('session.id', () => ({ value: 'sid-replay' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.spawn', async function* () {
+    const events = [
+      { t: 'meta', f: 'th-replay', ts: now - 10_000, cwd: 'project' },
+      { t: 'act', f: 'th-replay', ts: now - 8_000, id: 'a1', label: '$ git status', status: 'done' },
+      { t: 'msg', f: 'th-replay', ts: now - 6_000, text: 'Unique rollout message.' },
+      { t: 'task', f: 'th-replay', ts: now - 5_000, state: 'done' },
+    ]
+    yield { stream: 'stdout', text: events.map(e => JSON.stringify(e)).join('\n') + '\n' } as never
+    return { value: { exitCode: 0 } } as never
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.advance(300)
+
+  const ui = await mountPane($, 80)
+  await ui.press({ key: 't-codex-th-replay' } as never)
+  await ui.redraw()
+  const matches = await ui.findAll({ type: 'Text', text: /Unique rollout message\./ })
+  expect(matches.length).toBe(1)
+  await ui.unmount()
+})
+
+test('8: a first Codex limits failure with zero windows still renders the Codex error row and Retry button', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  const clock = mock.clock(on, { now })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-codex-first-fail' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('session.usage', () => ({
+    value: { startedAt: now, context: { tokens: 0 }, rateLimits: [] } as never,
+  }))
+  on('process.spawn', async function* () {
+    return { value: { exitCode: 0 } } as never
+  })
+  let calls = 0
+  let succeed = false
+  on('process.run', async (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) {
+      calls++
+      if (!succeed) {
+        return { value: { exitCode: 0, stdout: JSON.stringify({ error: 'not logged in' }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            ts: now + 1000,
+            source: 'live',
+            limits: { windows: [{ minutes: 300, percent: 15, resetsAt: now + 3_600_000 }], plan: 'plus' },
+          }),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(calls).toBe(1)
+
+  const ui = await mountPane($, 80)
+  expect(await ui.find({ text: 'Live reading failed: not logged in' })).toBeDefined()
+  expect((await ui.find({ key: 'lim-codex-retry' }))?.text).toBe('Retry')
+
+  // Pressing Retry succeeds and replaces the failure row with live windows.
+  succeed = true
+  await ui.press({ key: 'lim-codex-retry' } as never)
+  await clock.settle()
+  await ui.redraw()
+  expect(calls).toBe(2)
+  expect(await ui.find({ text: /Live reading failed/ })).toBeUndefined()
+  expect(await ui.find({ text: '15%' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('5c: planCardsSave trims output of oldest finished cards first to stay within byte budget', () => {
+  const now = 50 * 86_400_000
+  const oldDone = sampleCard({ id: 'done-1', status: 'done', output: 'x'.repeat(2000) })
+  const newDone = sampleCard({ id: 'done-2', status: 'done', output: 'y'.repeat(2000) })
+  const live = sampleCard({ id: 'live-1', status: 'running', output: 'z'.repeat(1200) })
+  const plan = planCardsSave({}, 'sid-trim', [oldDone, newDone, live], now, { maxCards: 40, maxOutput: 6000, maxBytes: 4200 })
+  expect(plan.entry).toBeDefined()
+  // All three cards remain listed, oldest finished card's output was trimmed first, and running card's output is intact.
+  expect(plan.entry!.cards.map(c => c.id)).toEqual(['done-1', 'done-2', 'live-1'])
+  expect(plan.entry!.cards[0]!.output.length).toBeLessThan(oldDone.output.length)
+  expect(plan.entry!.cards[2]!.output.length).toBe(1200)
+})
+
+test('7b: applyToCard ignores replayed events at or below rolloutOffset and applies newer events', () => {
+  const card = sampleCard({
+    id: 'codex-th-off',
+    provider: 'codex',
+    isExternal: true,
+    threadId: 'th-off',
+    status: 'running',
+    output: 'Already seen.\n',
+    rolloutOffset: 250,
+    lastEventAt: 1000,
+  })
+  applyToCard(card, { t: 'msg', f: 'th-off', ts: 900, off: 200, text: 'Already seen.' })
+  applyToCard(card, { t: 'msg', f: 'th-off', ts: 1000, off: 250, text: 'Already seen.' })
+  expect(card.output).toBe('Already seen.\n')
+  applyToCard(card, { t: 'msg', f: 'th-off', ts: 1100, off: 320, text: 'Fresh output.' })
+  expect(card.output).toBe('Already seen.\nFresh output.\n')
+  expect(card.rolloutOffset).toBe(320)
+})
+
+test('8b: Codex enabled with no reading yet and no error still shows Usage limits with Refresh and Retry', async ($, on) => {
+  const now = Date.UTC(2026, 10, 21, 12)
+  mock.clock(on, { now })
+  mock.store(on, { harnesses: [], 'codex-enabled': true })
+  on('session.id', () => ({ value: 'sid-codex-empty' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.root', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ deny: 'not found' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('session.usage', () => ({ value: { startedAt: now, context: { tokens: 0 }, rateLimits: [] } as never }))
+  on('process.spawn', async function* () {
+    return { value: { exitCode: 0 } } as never
+  })
+  // Never resolves on first read so lim.codex is empty and lim.codexError is undefined.
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv.some(a => a.endsWith('/bin/codex-limits.mjs'))) return new Promise(() => {})
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  const ui = await mountPane($, 80)
+  expect((await ui.find({ key: 'lim-refresh' }))?.text).toBe('↻ Refresh')
+  expect((await ui.find({ key: 'lim-codex-retry' }))?.text).toBe('Retry')
+  expect(await ui.find({ text: 'no reading yet' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('9a: parseRunPid and deadRunnerFailure decide dead harness runs purely', () => {
+  expect(parseRunPid('42310\n')).toBe(42310)
+  expect(parseRunPid('  99 ')).toBe(99)
+  expect(parseRunPid('')).toBeUndefined()
+  expect(parseRunPid('0')).toBeUndefined()
+  expect(parseRunPid('-5')).toBeUndefined()
+  expect(parseRunPid('abc')).toBeUndefined()
+  expect(parseRunPid(undefined)).toBeUndefined()
+
+  expect(deadRunnerFailure({ hasExit: false, pid: 42310, isPidAlive: false })).toBe(DEAD_RUNNER_REASON)
+  expect(deadRunnerFailure({ hasExit: true, pid: 42310, isPidAlive: false })).toBeUndefined()
+  expect(deadRunnerFailure({ hasExit: false, pid: 42310, isPidAlive: true })).toBeUndefined()
+  expect(deadRunnerFailure({ hasExit: false, pid: 42310, isPidAlive: undefined })).toBeUndefined()
+  expect(deadRunnerFailure({ hasExit: false, pid: undefined, isPidAlive: false })).toBeUndefined()
+})
+
+test('9b: polling a running harness card whose pid is gone marks it failed with a plain reason and delivers once', async ($, on) => {
+  const start = 700_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-dead-runner' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>([
+    [
+      `${root}/run-dead/meta.json`,
+      JSON.stringify({ id: 'run-dead', harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: 'Orphaned task', cwd: 'project', sessionId: 'sid-dead-runner', startedAt: start - 30_000 }),
+    ],
+    [`${root}/run-dead/pid.txt`, '999999'],
+    [`${root}/run-dead/events.jsonl`, '{"type":"assistant.message","data":{"content":"Partial progress"}}\n'],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root) ? [{ name: 'run-dead', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const pidChecks: string[] = []
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv.some(a => a.endsWith('/bin/pid-alive.mjs'))) {
+      pidChecks.push(argv.at(-1) ?? '')
+      return { value: { exitCode: 0, stdout: JSON.stringify({ alive: false }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+
+  expect(pidChecks).toEqual(['999999'])
+  expect(submits.length).toBe(1)
+  expect(submits[0]).toContain(DEAD_RUNNER_REASON)
+  expect(files.get(`${root}/run-dead/delivered.txt`)).toMatch(/^\d+$/)
+
+  const ui = await mountPane($, 80)
+  expect(await ui.find({ text: /Finished · 1/ })).toBeDefined()
+  await ui.press({ key: 't-h-run-run-dead' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: DEAD_RUNNER_REASON })).toBeDefined()
+  await ui.unmount()
+
+  // Even after a reload with exit.txt still missing, the dead run is not delivered a second time.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+  expect(submits.length).toBe(1)
 })
