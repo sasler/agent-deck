@@ -29,6 +29,18 @@ node --test tests/runner.test.mjs
 
 `tsc -p . --noEmit` works only once the engine has written `.claude-plugin/types/`, which happens when it loads the mod.
 
+## Trying changes live (dev copy)
+
+Run the repo's own code in your session instead of the released plugin, so each edit shows in the pane at the end of the turn, with no PR or release.
+
+1. Turn the released plugin off for this repo only (it writes the gitignored `.claude/settings.local.json`; other projects keep the release): `claude plugin disable agent-deck@agent-deck --scope local`
+2. Load the `plugin-authoring` skill. It names this session's mods folder, `~/.claude/dev-mods/<session id>/`.
+3. Link the repo into it (PowerShell): `New-Item -ItemType Junction -Path "$HOME\.claude\dev-mods\<session id>\agent-deck" -Target "C:\src\agent-deck"`
+4. When the turn ends, Claude Code asks to turn on the session's mods: the user picks **Turn them on**. From then on, each change to the repo reloads the mod when the turn that made it ends, or right before one of its tools runs. A failed load or hook shows as a dim line in the transcript.
+5. The dev copy keeps its own settings (harnesses, task routing, meters) in `~/.claude/plugins/store/agent-deck_inline-*.json`, separate from the release's `agent-deck_agent-deck-*.json`. Copy the `harnesses`, `meters`, `codex-enabled` and `routing` keys across, or set them up again in its ⚙ Settings.
+
+When done: `claude plugin enable agent-deck@agent-deck --scope local`, then remove the junction with `Remove-Item` on the link only (never `-Recurse`, which would follow it into the repo).
+
 ## Rules
 
 - **Never start a CLI through a shell.** Prompts must reach the CLI unexpanded. On Windows, `launch.mjs` resolves npm `.cmd` shims to the script they wrap and refuses any other batch file.
