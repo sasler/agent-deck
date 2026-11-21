@@ -9,6 +9,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { limitsOf, newestLimits } from './codex-limits.mjs'
+
 const [, , sessionsDir, runsDir, projectCwd, sinceArg] = process.argv
 const since = Number(sinceArg) || Date.now() - 30 * 60_000
 const TICK_MS = 1000
@@ -147,16 +149,6 @@ const callLabel = p => {
   return `${ns ? ns + '.' : ''}${p.name ?? 'tool'}${what ? ' ' + clip(String(what).replace(/\s+/g, ' '), 90) : ''}`
 }
 
-const limitsOf = rl => {
-  if (!rl) return undefined
-  const ws = []
-  for (const w of [rl.primary, rl.secondary]) {
-    if (w && typeof w.used_percent === 'number') {
-      ws.push({ minutes: w.window_minutes, percent: w.used_percent, resetsAt: typeof w.resets_at === 'number' ? w.resets_at * 1000 : undefined })
-    }
-  }
-  return { windows: ws, plan: rl.plan_type ?? undefined }
-}
 
 const handleLine = (state, line) => {
   if (!line.includes('"type"')) return
@@ -302,36 +294,10 @@ const tick = () => {
   scanRuns()
 }
 
-// Seed the limit bars from the newest rollout on the machine, whatever its age.
+// Seed the limit bars from the newest reading on the machine, whatever its age; ts is when Codex wrote it.
 const seedLimits = () => {
-  let newest
-  for (const dir of dayDirs()) {
-    let names = []
-    try {
-      names = fs.readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      if (!name.endsWith('.jsonl')) continue
-      const file = path.join(dir, name)
-      try {
-        const stat = fs.statSync(file)
-        if (!newest || stat.mtimeMs > newest.stat.mtimeMs) newest = { file, stat }
-      } catch {}
-    }
-    if (newest) break
-  }
-  if (!newest) return
-  const start = Math.max(0, newest.stat.size - 262_144)
-  const lines = readRange(newest.file, start, newest.stat.size - start).split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i].includes('"rate_limits"')) continue
-    try {
-      const limits = limitsOf(JSON.parse(lines[i]).payload?.rate_limits)
-      if (limits) return emit({ t: 'limits', ts: newest.stat.mtimeMs, limits })
-    } catch {}
-  }
+  const found = newestLimits(sessionsDir)
+  if (found) emit({ t: 'limits', ts: found.ts, limits: found.limits })
 }
 
 emit({ t: 'hello', pid: process.pid })

@@ -241,6 +241,73 @@ export const withFusion = (h: Pick<Harness, 'parser' | 'provider'>, models: Harn
 
 export const modelLabel = (m: HarnessModel) => [m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id, m.note].filter(Boolean).join(' · ')
 
+/** A model's name as the model pickers show it: the name its list gives, else the id. */
+export const modelName = (id: string, models: readonly HarnessModel[] = []): string => models.find(m => m.id === id)?.name ?? id
+
+/**
+ * The model a card shows, by name: a harness card looks in its harness's model list, a Claude
+ * card (a subagent, or a Claude Code harness) in Claude's. Codex's list has ids only.
+ */
+export const cardModelName = (c: Pick<AgentCard, 'provider' | 'harness' | 'model'>, harnesses: readonly Harness[]): string => {
+  const h = c.provider === 'harness' ? harnesses.find(x => x.id === c.harness) : undefined
+  const list = [...(h?.models ?? []), ...(c.provider === 'claude' || h?.parser === 'claude' ? CLAUDE_MODELS : [])]
+  return modelName(c.model, list)
+}
+
+// ---------- reasoning effort ----------
+
+/**
+ * How each CLI takes a reasoning effort, as its --help gives it. Copilot: --reasoning-effort;
+ * Claude Code and Antigravity: --effort; OpenCode: --variant (provider-specific); Codex exec:
+ * -c model_reasoning_effort=. Gemini and Cursor have no such flag, so they are not listed.
+ */
+const EFFORT_FLAGS: Partial<Record<HarnessParser, { flag: string; config?: string; levels: readonly string[] }>> = {
+  copilot: { flag: '--reasoning-effort', levels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+  claude: { flag: '--effort', levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  antigravity: { flag: '--effort', levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  opencode: { flag: '--variant', levels: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+  codex: { flag: '-c', config: 'model_reasoning_effort', levels: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
+}
+
+/** The codex tool's efforts (its model_reasoning_effort). */
+export const CODEX_EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh']
+/** The Agent tool's efforts for a Claude subagent. */
+export const SUBAGENT_EFFORTS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const TEMPLATE_EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** The efforts a harness takes: its CLI's, or the usual ones when its arguments place {effort}; none for a CLI without one. */
+export const harnessEfforts = (h: Pick<Harness, 'parser' | 'args'>): readonly string[] =>
+  EFFORT_FLAGS[h.parser]?.levels ?? (/\{effort\}/.test(h.args) ? TEMPLATE_EFFORTS : [])
+
+/** The efforts a task's route offers, or why it offers none; undefined while it has no agent. */
+export const routeEffortChoices = (target: string, h: Harness | undefined): { levels: readonly string[] } | { reason: string } | undefined => {
+  if (!target) return undefined
+  if (target === 'codex') return { levels: CODEX_EFFORTS }
+  if (target === 'claude') return { levels: SUBAGENT_EFFORTS }
+  if (!h) return undefined
+  const levels = harnessEfforts(h)
+  if (levels.length) return { levels }
+  return { reason: h.parser === 'text' ? `No effort setting: put {effort} in ${h.name}'s arguments where its CLI takes one.` : `No effort setting: ${h.name}'s CLI has none.` }
+}
+
+/** Puts the effort flag in front of the prompt (and the flag before it), replacing one already there. */
+const placeEffort = (args: string[], parser: HarnessParser, effort: string, prompt: string) => {
+  const how = EFFORT_FLAGS[parser]
+  if (!how) return
+  if (how.config) {
+    const key = `${how.config}=`
+    for (let i = args.length - 1; i >= 0; i--) {
+      if ((args[i] === '-c' || args[i] === '--config') && args[i + 1]?.startsWith(key)) args.splice(i, 2)
+      else if (args[i]?.startsWith(`--config=${key}`)) args.splice(i, 1)
+    }
+  } else removeArg(args, how.flag)
+  let at = args.findIndex(a => a.includes(prompt))
+  // Go and other parsers stop at the first word that is not a flag, so the effort goes before the prompt.
+  if (at < 0) at = args.length
+  else if (at > 0 && args[at - 1]!.startsWith('-') && !args[at - 1]!.includes('=')) at--
+  args.splice(at, 0, how.flag, how.config ? `${how.config}=${effort}` : effort)
+}
+
 // ---------- arguments ----------
 
 /** Splits an args template into words: whitespace separates, single or double quotes group. */
@@ -268,9 +335,9 @@ export const tokenizeArgs = (s: string): string[] => {
   return words
 }
 
-export type ArgValues = { prompt: string; model?: string; session?: string; cwd?: string }
+export type ArgValues = { prompt: string; model?: string; session?: string; cwd?: string; effort?: string }
 
-const PLACEHOLDER = /\{(prompt|model|session|cwd)\}/g
+const PLACEHOLDER = /\{(prompt|model|session|cwd|effort)\}/g
 
 /**
  * Fills the template's placeholders. A word whose placeholders are all empty is
@@ -282,7 +349,7 @@ export const expandArgs = (template: string, v: ArgValues): string[] => {
   for (const word of tokenizeArgs(template)) {
     const names = [...word.matchAll(PLACEHOLDER)].map(m => m[1] as keyof ArgValues)
     if (names.length && names.every(n => !v[n])) {
-      const isBare = /^\{(prompt|model|session|cwd)\}$/.test(word)
+      const isBare = /^\{(prompt|model|session|cwd|effort)\}$/.test(word)
       const prev = out[out.length - 1]
       if (isBare && prev !== undefined && prev.startsWith('-') && !prev.includes('=')) out.pop()
       continue
@@ -359,9 +426,17 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
   const error = copilotOptionsError(h, v)
   if (error) throw new Error(error)
   const { model, tier } = copilotRouting(h, v)
-  if (h.parser !== 'copilot') return { args: expandArgs(h.args, { ...v, model }) }
-  const values = { prompt: v.prompt, model: tier ? 'auto' : model, session: v.session, cwd: v.cwd }
-  const markers = { prompt: '\0agent-deck-prompt\0', model: '\0agent-deck-model\0', session: '\0agent-deck-session\0', cwd: '\0agent-deck-cwd\0' }
+  // An effort the CLI doesn't take is left out; one the arguments place themselves goes through {effort}.
+  const effort = v.effort && harnessEfforts(h).includes(v.effort) ? v.effort : undefined
+  const hasEffortSlot = /\{effort\}/.test(h.args)
+  const promptMark = '\0agent-deck-prompt\0'
+  if (h.parser !== 'copilot') {
+    const args = expandArgs(h.args, { ...v, model, effort, prompt: v.prompt ? promptMark : v.prompt })
+    if (effort && !hasEffortSlot) placeEffort(args, h.parser, effort, promptMark)
+    return { args: args.map(a => a.split(promptMark).join(v.prompt)) }
+  }
+  const values = { prompt: v.prompt, model: tier ? 'auto' : model, session: v.session, cwd: v.cwd, effort }
+  const markers = { prompt: promptMark, model: '\0agent-deck-model\0', session: '\0agent-deck-session\0', cwd: '\0agent-deck-cwd\0', effort: '\0agent-deck-effort\0' }
   const expand = (arg: string) =>
     (Object.keys(markers) as (keyof typeof markers)[]).reduce((word, name) => word.split(markers[name]).join(values[name] ?? ''), arg)
   const args = expandArgs(h.args, {
@@ -369,6 +444,7 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
     model: values.model ? markers.model : undefined,
     session: values.session ? markers.session : undefined,
     cwd: values.cwd ? markers.cwd : undefined,
+    effort: values.effort ? markers.effort : undefined,
   })
   for (let i = 0; i < args.length - 1; i++) {
     const prompt = args[i + 1]
@@ -389,6 +465,7 @@ export const harnessCommand = (h: Harness, v: HarnessArgValues): { args: string[
   }
   const limit = v.maxAiCredits ?? h.maxAiCredits
   if (limit !== undefined) setArg(args, '--max-ai-credits', String(limit))
+  if (effort && !hasEffortSlot) placeEffort(args, h.parser, effort, markers.prompt)
   protectCopilotKey(args)
   if (v.usageFile && !args.some(a => a === '--usage-output-file' || a.startsWith('--usage-output-file='))) args.push('--usage-output-file', v.usageFile)
   let usageIndex = -1
@@ -1080,10 +1157,10 @@ export const agentRunSpec = (enabled: readonly Harness[], routes: readonly Route
       'The run is its own process and survives session drops; its live output, model and tokens show in the Agents pane. ' +
       "When it finishes, its final report arrives as a new message: don't poll, sleep or wait for it. agent_result reads a run on demand. " +
       (enabled.length
-        ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${modelsHint(h)})`).join('; ')}. `
+        ? `Harnesses: ${enabled.map(h => `${h.id} (${h.name}${h.model ? `, default model ${h.model}` : ''}${h.autoTier ? `, Auto profile ${h.autoTier}` : ''}${h.maxAiCredits !== undefined ? `, limit ${h.maxAiCredits} AI credits` : ''}${harnessEfforts(h).length ? `, effort ${harnessEfforts(h).join('|')}` : ''}${modelsHint(h)})`).join('; ')}. `
         : 'No harness is enabled yet: the person adds them under ⚙ Settings in the Agents pane. ') +
       (tasks.length
-        ? `Task routing is on: pass \`task\` instead of harness and model to use the person's pick (${tasks.map(r => `${r.task} → ${r.harness}${r.model ? ` ${r.model}` : ''}`).join('; ')}). `
+        ? `Task routing is on: pass \`task\` instead of harness and model to use the person's pick (${tasks.map(r => `${r.task} → ${r.harness}${r.model ? ` ${r.model}` : ''}${r.effort ? ` effort ${r.effort}` : ''}`).join('; ')}). `
         : '') +
       'For OpenAI Codex use the codex tool instead. Pass `resume` with a session id from an earlier report to continue that conversation.',
     inputSchema: {
@@ -1098,6 +1175,7 @@ export const agentRunSpec = (enabled: readonly Harness[], routes: readonly Route
         prompt: { type: 'string', description: 'The task.' },
         title: { type: 'string', description: 'A few words shown on the card.' },
         model: { type: 'string', description: "Model override; the harness's default when unset." },
+        effort: { type: 'string', description: "Reasoning effort, for a harness whose CLI takes one (the levels are listed with each harness). With `task`, the route's effort applies unless this is set." },
         autoTier: { type: 'string', description: 'Copilot Auto routing profile, such as efficiency, balance, intelligence, hydrafusion or hydrafusion-max. Requires Auto and account support; not BYOK.' },
         maxAiCredits: { type: 'number', minimum: 30, description: 'Copilot session-wide soft AI credit limit, including subagents. Overrides the harness limit; at least 30.' },
         cwd: { type: 'string', description: 'Working directory; defaults to the session cwd.' },
@@ -1138,16 +1216,24 @@ export const loadRouting = (stored: unknown): Routing => {
     const task = typeof r.task === 'string' ? taskSlug(r.task) : ''
     if (!task || seen.has(task)) continue
     seen.add(task)
-    routes.push({ task, target: typeof r.target === 'string' ? r.target : '', ...(str(r.model) ? { model: r.model as string } : {}) })
+    routes.push({ task, target: typeof r.target === 'string' ? r.target : '', ...(str(r.model) ? { model: r.model as string } : {}), ...(str(r.effort) ? { effort: r.effort as string } : {}) })
   }
   return { isOn: o.isOn === true, routes }
 }
 
 /** A route that can run now, as Claude is told about it. */
 export type RoutedTask =
-  | { kind: 'harness'; task: string; harness: string; name: string; model?: string }
-  | { kind: 'codex'; task: string; model?: string }
-  | { kind: 'claude'; task: string; model?: string }
+  | { kind: 'harness'; task: string; harness: string; name: string; model?: string; effort?: string }
+  | { kind: 'codex'; task: string; model?: string; effort?: string }
+  | { kind: 'claude'; task: string; model?: string; effort?: string }
+
+/** A route's effort, when its agent takes that effort; a stale pick (another harness, another CLI) is left out. */
+export const routeEffort = (r: TaskRoute, harnesses: readonly Harness[]): string | undefined => {
+  const effort = r.effort?.trim()
+  if (!effort) return undefined
+  const choices = routeEffortChoices(r.target, harnesses.find(h => h.id === r.target))
+  return choices && 'levels' in choices && choices.levels.includes(effort) ? effort : undefined
+}
 
 /** Why a route can't run now; undefined when it can, or has no target. */
 export const routeProblem = (r: TaskRoute, harnesses: readonly Harness[], isCodexOn: boolean): string | undefined => {
@@ -1165,8 +1251,9 @@ export const routedTasks = (routing: Routing, harnesses: readonly Harness[], isC
   for (const r of routing.routes) {
     if (!r.target || routeProblem(r, harnesses, isCodexOn)) continue
     const model = r.model?.trim() || undefined
-    if (r.target === 'codex' || r.target === 'claude') out.push({ kind: r.target, task: r.task, model })
-    else out.push({ kind: 'harness', task: r.task, harness: r.target, name: harnesses.find(h => h.id === r.target)?.name ?? r.target, model })
+    const effort = routeEffort(r, harnesses)
+    if (r.target === 'codex' || r.target === 'claude') out.push({ kind: r.target, task: r.task, model, effort })
+    else out.push({ kind: 'harness', task: r.task, harness: r.target, name: harnesses.find(h => h.id === r.target)?.name ?? r.target, model, effort })
   }
   return out
 }
@@ -1174,10 +1261,10 @@ export const routedTasks = (routing: Routing, harnesses: readonly Harness[], isC
 const routeLine = (r: RoutedTask): string => {
   const hint = taskHint(r.task)
   const what = `${r.task}${hint ? ` (${hint})` : ''}`
-  const model = r.model ? `, model ${r.model}` : ''
-  if (r.kind === 'codex') return `- ${what}: the codex tool${model}.`
-  if (r.kind === 'claude') return `- ${what}: a Claude subagent (the Agent tool${model}).`
-  return `- ${what}: agent_run with task "${r.task}" (${r.name}${model}).`
+  const picks = `${r.model ? `, model ${r.model}` : ''}${r.effort ? `, effort ${r.effort}` : ''}`
+  if (r.kind === 'codex') return `- ${what}: the codex tool${picks}.`
+  if (r.kind === 'claude') return `- ${what}: a Claude subagent (the Agent tool${picks}).`
+  return `- ${what}: agent_run with task "${r.task}" (${r.name}${picks}).`
 }
 
 /** The note that tells the main thread who does what; undefined when routing is off or nothing is routed. */
@@ -1203,26 +1290,67 @@ export const routingContext = (want: string | undefined, last: string | undefine
  * then the task's route. An error tells Claude what to do instead.
  */
 export const resolveRun = (
-  input: { harness?: string; task?: string; model?: string },
+  input: { harness?: string; task?: string; model?: string; effort?: string },
   routing: Routing,
   harnesses: readonly Harness[],
   isCodexOn: boolean,
-): { harness: string; model?: string } | { error: string } => {
-  if (!input.task) return input.harness ? { harness: input.harness, model: input.model } : { error: 'Name a harness, or a routed task.' }
+): { harness: string; model?: string; effort?: string } | { error: string } => {
+  const asked = { harness: input.harness!, model: input.model, effort: input.effort }
+  if (!input.task) return input.harness ? asked : { error: 'Name a harness, or a routed task.' }
   const task = taskSlug(input.task)
   const r = routing.routes.find(x => x.task === task)
   if (!routing.isOn || !r?.target) {
-    if (input.harness) return { harness: input.harness, model: input.model }
+    if (input.harness) return asked
     return { error: `No route for the task "${input.task}"${routing.isOn ? '' : ': task routing is off'}. Name a harness instead.` }
   }
-  if (input.harness) return { harness: input.harness, model: input.model ?? (input.harness === r.target ? r.model?.trim() || undefined : undefined) }
+  const isSame = !input.harness || input.harness === r.target
+  const model = input.model ?? (isSame ? r.model?.trim() || undefined : undefined)
+  const effort = input.effort ?? (isSame ? routeEffort(r, harnesses) : undefined)
+  if (input.harness) return { harness: input.harness, model, effort }
   const problem = routeProblem(r, harnesses, isCodexOn)
   if (problem) return { error: `The "${task}" route can't run: ${problem}. Tell the person, and ask before using another agent.` }
-  const model = input.model ?? (r.model?.trim() || undefined)
-  if (r.target === 'codex') return { error: `The "${task}" task goes to the built-in Codex: use the codex tool${model ? ` with model ${model}` : ''}.` }
-  if (r.target === 'claude') return { error: `The "${task}" task goes to a Claude subagent: use the Agent tool${model ? ` with model ${model}` : ''}.` }
-  return { harness: r.target, model }
+  const picks = [model ? `model ${model}` : '', effort ? `effort ${effort}` : ''].filter(Boolean).join(' and ')
+  if (r.target === 'codex') return { error: `The "${task}" task goes to the built-in Codex: use the codex tool${picks ? ` with ${picks}` : ''}.` }
+  if (r.target === 'claude') return { error: `The "${task}" task goes to a Claude subagent: use the Agent tool${picks ? ` with ${picks}` : ''}.` }
+  return { harness: r.target, model, effort }
 }
+
+/** Why an effort can't go to a harness; undefined when it can, or none was asked. */
+export const effortProblem = (h: Pick<Harness, 'name' | 'parser' | 'args'>, effort: string | undefined): string | undefined => {
+  if (!effort) return undefined
+  const levels = harnessEfforts(h)
+  if (!levels.length) return `${h.name}'s CLI takes no effort setting; leave effort out.`
+  return levels.includes(effort) ? undefined : `${h.name} takes effort ${levels.join(', ')}, not "${effort}".`
+}
+
+// ---------- usage limits: how old a reading is ----------
+
+/** A reading older than this says how old it is. */
+export const STALE_READING_MS = 15 * 60_000
+
+/** 42m, 3h, 2d: a span in its largest whole unit, rounded. */
+export const fmtSpan = (ms: number): string => {
+  const mins = Math.max(0, Math.round(ms / 60000))
+  return mins < 60 ? `${mins}m` : mins < 2880 ? `${Math.round(mins / 60)}h` : `${Math.round(mins / 1440)}d`
+}
+
+/** "updated 3h ago" for a reading older than a quarter hour (or always, with `isAlways`); undefined while fresh or never read. */
+export const readingAge = (at: number | undefined, now: number, isAlways = false): string | undefined =>
+  at === undefined || (!isAlways && now - at < STALE_READING_MS) ? undefined : `updated ${fmtSpan(now - at)} ago`
+
+/** Whether a window's reset time has passed: the reading predates the reset, so it no longer says how much is used. */
+export const isResetPast = (w: LimitWindow, now: number): boolean => w.resetsAt !== undefined && w.resetsAt <= now
+
+/** What a window says about its reset: when it comes, or, once that time has passed, that the reading is out of date. */
+export const resetNote = (w: LimitWindow, now: number): string | undefined =>
+  w.resetsAt === undefined ? undefined : isResetPast(w, now) ? 'out of date' : `resets in ${fmtSpan(w.resetsAt - now)}`
+
+/** Each provider's highest percent, for the one-line view of collapsed usage limits; a window past its reset doesn't count. */
+export const limitSummary = (rows: readonly { name: string; windows: readonly LimitWindow[] }[], now: number): { name: string; percent?: number }[] =>
+  rows.map(r => {
+    const live = r.windows.filter(w => !isResetPast(w, now))
+    return { name: r.name, percent: live.length ? Math.max(...live.map(w => w.percent)) : undefined }
+  })
 
 // ---------- handing a finished run's report over, once ----------
 

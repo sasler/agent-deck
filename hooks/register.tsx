@@ -5,6 +5,14 @@ import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, 
 import {
   AGENT_RESULT_SPEC,
   CARD_STALE_MS,
+  cardModelName,
+  effortProblem,
+  fmtSpan,
+  isResetPast,
+  limitSummary,
+  readingAge,
+  resetNote,
+  routeEffortChoices,
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
@@ -81,6 +89,7 @@ const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 const agents = atom({ plugin: 'agent-deck', key: 'agents' } as const, [] as AgentCard[])
 const limits = atom({ plugin: 'agent-deck', key: 'limits' } as const, { codex: [], claude: [] } as Limits)
 const expanded = atom({ plugin: 'agent-deck', key: 'expanded' } as const, [] as string[])
+const fullOutputAtom = atom({ plugin: 'agent-deck', key: 'fullOutput' } as const, [] as string[])
 const tick = atom({ plugin: 'agent-deck', key: 'tick' } as const, 0)
 const cacheAtom = atom({ plugin: 'agent-deck', key: 'cache' } as const, freshCache())
 const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, [] as Harness[])
@@ -93,6 +102,14 @@ const AGY_ACCENT = '#3186FF'
 const metersAtom = atom({ plugin: 'agent-deck', key: 'meters' } as const, DEFAULT_METERS)
 const routingAtom = atom({ plugin: 'agent-deck', key: 'routing' } as const, DEFAULT_ROUTING)
 const COPILOT_ACCENT = '#8957E5'
+/** The streamed output an open card shows before Show all: its last lines, newest at the bottom. */
+const OUTPUT_LINES = 12
+
+/**
+ * The top row's glyphs, one per control. Buttons take only text, so these are characters, with
+ * U+FE0E asking for the plain text form rather than a color emoji where a font has both.
+ */
+const ICON = { keepWarm: '\u2668\uFE0E', routing: '\u21C4', settings: '\u2699\uFE0E' } as const
 
 type $T = EngineInterface
 
@@ -128,9 +145,9 @@ export const filledCells = (percent: number, width: number): number =>
 /** The pane's keep-warm picker: off, or a window in hours. */
 export const KEEPWARM_OPTIONS = [
   { value: 'off', label: 'Off' },
-  { value: '2', label: '2 hours' },
-  { value: '4', label: '4 hours' },
-  { value: '6', label: '6 hours' },
+  { value: '2', label: '2h' },
+  { value: '4', label: '4h' },
+  { value: '6', label: '6h' },
 ]
 
 /** The option a running window shows: the smallest that holds what is left. */
@@ -237,12 +254,6 @@ export const isMeterShown = (choice: MeterChoice, p: MeterProvider, used: Readon
   choice.mode === 'all' || (choice.mode === 'session' ? used.has(p) : choice.selected.includes(p))
 
 const toneColor = (tone: 'warm' | 'cold' | 'unknown') => (tone === 'warm' ? 'success' : tone === 'cold' ? 'error' : undefined)
-
-const fmtReset = (at: number | undefined, now: number): string => {
-  if (!at) return ''
-  const mins = Math.max(0, Math.round((at - now) / 60000))
-  return mins < 60 ? `${mins}m` : mins < 2880 ? `${Math.round(mins / 60)}h` : `${Math.round(mins / 1440)}d`
-}
 
 const windowLabel = (minutes: number | undefined): string =>
   minutes === undefined ? '?' : minutes <= 300 ? `${Math.round(minutes / 60)}h` : minutes >= 10080 ? '7d' : `${Math.round(minutes / 1440)}d`
@@ -449,7 +460,15 @@ const refreshClaudeLimits = async ($: $T) => {
   const usage = await $.session.usage().catch(() => undefined)
   if (!usage) return
   const claude = claudeLimits(usage.rateLimits)
-  await setLimits($, l => ({ ...l, claude }))
+  const at = await $.clock.now()
+  await setLimits($, l => ({ ...l, claude, readAt: { ...l.readAt, claude: at } }))
+}
+
+/** Codex's reading, unless one written later is already shown: `ts` is when Codex wrote it. */
+const setCodexLimits = async ($: $T, ts: number, reading: WatchLimits) => {
+  const codex = toLimitWindows(reading)
+  if (!codex.length) return
+  await setLimits($, l => (ts < (l.readAt?.codex ?? 0) ? l : { ...l, codex, codexPlan: reading.plan, readAt: { ...l.readAt, codex: ts } }))
 }
 
 let version: string | undefined
@@ -619,8 +638,7 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
 export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
   if (ev.t === 'hello') return
   if (ev.t === 'limits') {
-    const codex = toLimitWindows(ev.limits)
-    if (codex.length) await setLimits($, l => ({ ...l, codex, codexPlan: ev.limits.plan }))
+    await setCodexLimits($, ev.ts, ev.limits)
     return
   }
   if (ev.t === 'run') {
@@ -629,10 +647,7 @@ export const applyWatchEvent = async ($: $T, ev: WatchEvent) => {
   }
   const card = await cardForThread($, ev.f, ev.ts)
   applyToCard(card, ev)
-  if (ev.t === 'tok' && ev.limits) {
-    const codex = toLimitWindows(ev.limits)
-    if (codex.length) await setLimits($, l => ({ ...l, codex, codexPlan: ev.limits!.plan }))
-  }
+  if (ev.t === 'tok' && ev.limits) await setCodexLimits($, ev.ts, ev.limits)
   if (ev.t === 'task' && ev.state === 'running') startTicking($)
   schedule($)
 }
@@ -956,6 +971,7 @@ type HarnessRunMeta = {
   sessionId: string
   startedAt: number
   model?: string
+  effort?: string
 }
 
 type HarnessRun = HarnessRunMeta & {
@@ -987,6 +1003,7 @@ const newHarnessCard = (meta: HarnessRunMeta): AgentCard => ({
   accent: meta.color,
   title: meta.title,
   model: meta.model ?? meta.name,
+  effort: meta.effort,
   status: 'running',
   startedAt: meta.startedAt,
   output: '',
@@ -1069,6 +1086,7 @@ const harnessFooter = (run: HarnessRun, card: AgentCard | undefined) => {
   const t = card?.tokens
   return (
     `[${run.name} run ${run.id} · harness ${run.harness} · model ${card?.model ?? run.model ?? 'default'}` +
+    (run.effort ? ` · effort ${run.effort}` : '') +
     (card?.sessionRef ? ` · session ${card.sessionRef}` : '') +
     (t && t.input + t.output > 0 ? ` · in ${fmtTokens(t.input + t.cacheRead + t.cacheWrite)} out ${fmtTokens(t.output)}` : '') +
     (card?.aiCredits !== undefined ? ` · ${fmtCredits(card.aiCredits)} AI credits${card.aiCreditsStatus === 'partial' ? ' (reported subtotal)' : ''}` : '') +
@@ -1201,6 +1219,7 @@ const launchHarnessRun = async ($: $T, h: Harness, input: AgentRunInput): Promis
     sessionId,
     startedAt: await $.clock.now(),
     model,
+    effort: input.effort,
   }
   const dir = `${root}/${id}`
   const command = harnessCommand(h, { ...input, session: input.resume, cwd, usageFile: `${dir}/usage.json` })
@@ -1251,7 +1270,7 @@ const queryModels = async ($: $T, q: ModelQuery, h: Harness): Promise<{ models: 
   }
 }
 
-type AgentRunInput = CopilotRunOptions & { harness: string; task?: string; prompt: string; title?: string; cwd?: string; resume?: string }
+type AgentRunInput = CopilotRunOptions & { harness: string; task?: string; prompt: string; title?: string; cwd?: string; resume?: string; effort?: string }
 
 // ---------- task routing: who does which kind of task ----------
 
@@ -1351,7 +1370,8 @@ const refreshCopilotLimits = async ($: $T): Promise<boolean> => {
   }
   if (!reading) return false
   const { windows, plan } = reading
-  await setLimits($, l => ({ ...l, copilot: windows, copilotPlan: plan }))
+  const at = await $.clock.now()
+  await setLimits($, l => ({ ...l, copilot: windows, copilotPlan: plan, readAt: { ...l.readAt, copilot: at } }))
   return true
 }
 
@@ -1364,30 +1384,72 @@ const startCopilotLimits = async ($: $T) => {
 
 const KEY_AGY_SESSION = 'agy-quota-session'
 let agyPoller: { cancel: () => void } | undefined
-let isAgyChecking = false
+let agyCheck: Promise<boolean> | undefined
 
 /** The Antigravity harness the meters read through: the first one switched on. */
 const agyHarness = () => harnessList.find(h => h.isEnabled && h.parser === 'antigravity')
 
-const refreshAgyLimits = async ($: $T): Promise<boolean> => {
+/** Asks agy for its limits; a check already under way is the answer, not a second agy. */
+const refreshAgyLimits = ($: $T): Promise<boolean> => {
   const h = agyHarness()
-  if (!h || isAgyChecking) return false
-  isAgyChecking = true
+  if (!h) return Promise.resolve(false)
+  agyCheck ??= readAgyLimits($, h).finally(() => {
+    agyCheck = undefined
+  })
+  return agyCheck
+}
+
+const readAgyLimits = async ($: $T, h: Harness): Promise<boolean> => {
+  const saved = await $.store.get(KEY_AGY_SESSION)
+  const args = ['node', `${$.plugin.root}/bin/agy-quota.mjs`, h.command, ...(typeof saved === 'string' && saved ? [saved] : [])]
+  const r = await $.process.run(args, { timeoutMs: 60_000 }).catch(() => undefined)
+  let answer: { sessionId?: string; quota?: unknown; error?: string } = {}
   try {
-    const saved = await $.store.get(KEY_AGY_SESSION)
-    const args = ['node', `${$.plugin.root}/bin/agy-quota.mjs`, h.command, ...(typeof saved === 'string' && saved ? [saved] : [])]
-    const r = await $.process.run(args, { timeoutMs: 60_000 }).catch(() => undefined)
-    let answer: { sessionId?: string; quota?: unknown; error?: string } = {}
-    try {
-      answer = JSON.parse(r?.stdout ?? '')
-    } catch {}
-    if (answer.sessionId && answer.sessionId !== saved) await $.store.set(KEY_AGY_SESSION, answer.sessionId)
-    const windows = answer.quota ? agyLimits(answer.quota) : []
-    if (!windows.length) return false
-    await setLimits($, l => ({ ...l, antigravity: windows }))
-    return true
+    answer = JSON.parse(r?.stdout ?? '')
+  } catch {}
+  if (answer.sessionId && answer.sessionId !== saved) await $.store.set(KEY_AGY_SESSION, answer.sessionId)
+  const windows = answer.quota ? agyLimits(answer.quota) : []
+  if (!windows.length) return false
+  const at = await $.clock.now()
+  await setLimits($, l => ({ ...l, antigravity: windows, readAt: { ...l.readAt, antigravity: at } }))
+  return true
+}
+
+/** Reads Codex's newest reading now (bin/codex-limits.mjs), the way the watcher seeds its meters. */
+const refreshCodexLimits = async ($: $T): Promise<boolean> => {
+  const home = await codexHome($)
+  if (!home || !codexOn) return false
+  const r = await $.process.run(['node', `${$.plugin.root}/bin/codex-limits.mjs`, `${home}/sessions`], { timeoutMs: 30_000 }).catch(() => undefined)
+  let found: { ts?: unknown; limits?: WatchLimits } = {}
+  try {
+    found = JSON.parse(r?.stdout ?? '')
+  } catch {}
+  if (typeof found.ts !== 'number' || !Array.isArray(found.limits?.windows)) return false
+  await setCodexLimits($, found.ts, found.limits!)
+  return true
+}
+
+let isRefreshingLimits = false
+
+/** The Refresh button: reads every provider's limits again now, and says so while it does. */
+const refreshAllLimits = async ($: $T) => {
+  if (isRefreshingLimits) return
+  isRefreshingLimits = true
+  await update($, limits, l => ({ ...l, isRefreshing: true }))
+  try {
+    await Promise.all(
+      [
+        refreshClaudeLimits($),
+        refreshCopilotLimits($).then(isRead => {
+          if (isRead && !copilotPoller) copilotPoller = $.clock.every(5 * 60_000, () => void refreshCopilotLimits($))
+        }),
+        refreshAgyLimits($),
+        refreshCodexLimits($),
+      ].map(p => p.catch(() => undefined)),
+    )
   } finally {
-    isAgyChecking = false
+    isRefreshingLimits = false
+    await update($, limits, l => ({ ...l, isRefreshing: false }))
   }
 }
 
@@ -1407,7 +1469,7 @@ async function loadMeters($: $T) {
   const o = (stored && typeof stored === 'object' ? stored : {}) as Partial<MeterChoice>
   const mode = o.mode === 'session' || o.mode === 'selected' ? o.mode : 'all'
   const selected = Array.isArray(o.selected) ? o.selected.filter(x => ['claude', 'codex', 'copilot', 'antigravity'].includes(x)) : DEFAULT_METERS.selected
-  await update($, metersAtom, () => ({ mode, selected }))
+  await update($, metersAtom, () => ({ mode, selected, ...(o.isCollapsed === true ? { isCollapsed: true } : {}) }))
 }
 
 async function saveMeters($: $T, choice: MeterChoice) {
@@ -1457,7 +1519,7 @@ async function setCodexEnabled($: $T, on: boolean) {
     await startCodexWatcher($)
   } else {
     stopWatcher()
-    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined }))
+    await setLimits($, l => ({ ...l, codex: [], codexPlan: undefined, readAt: { ...l.readAt, codex: undefined } }))
   }
 }
 
@@ -2076,7 +2138,7 @@ async function routingCommand($: $T, word: string | undefined): Promise<string> 
   const lines = routing.routes.map(r => {
     const problem = routeProblem(r, harnessList, codexOn)
     const to = !r.target ? 'not set' : r.target === 'codex' ? 'Codex (built in)' : r.target === 'claude' ? 'Claude subagent' : (harnessList.find(h => h.id === r.target)?.name ?? r.target)
-    return `  ${r.task}: ${to}${r.model ? ` · ${r.model}` : ''}${problem ? ` (can't run: ${problem})` : ''}`
+    return `  ${r.task}: ${to}${r.model ? ` · ${r.model}` : ''}${r.effort ? ` · effort ${r.effort}` : ''}${problem ? ` (can't run: ${problem})` : ''}`
   })
   const head = routing.isOn
     ? routes.length
@@ -2146,6 +2208,8 @@ export const register: Register = on => {
     if (anyRunning()) startTicking($)
     await persist($)
     if (codexOn) await startCodexWatcher($)
+    // A reload can cut a refresh short: the limits outlive it, the refresh doesn't.
+    await update($, limits, l => (l.isRefreshing ? { ...l, isRefreshing: false } : l))
     void refreshClaudeLimits($)
     poller = $.clock.every(60_000, () => void refreshClaudeLimits($))
     await loadMeters($).catch(() => undefined)
@@ -2392,17 +2456,21 @@ export const register: Register = on => {
     const asked = e as unknown as AgentRunInput
     const resolved = resolveRun(asked, routing, harnessList, codexOn)
     if ('error' in resolved) return { deny: `agent-deck: ${resolved.error}` }
-    const input: AgentRunInput = { ...asked, harness: resolved.harness, model: resolved.model, title: asked.title ?? (asked.task && !asked.harness ? `${taskSlug(asked.task)}: ${asked.prompt.replace(/\s+/g, ' ').slice(0, 50)}` : undefined) }
+    const input: AgentRunInput = { ...asked, harness: resolved.harness, model: resolved.model, effort: resolved.effort, title: asked.title ?? (asked.task && !asked.harness ? `${taskSlug(asked.task)}: ${asked.prompt.replace(/\s+/g, ' ').slice(0, 50)}` : undefined) }
     const h = harnessList.find(x => x.id === input.harness)
     if (!h) {
       const ids = harnessList.filter(x => x.isEnabled).map(x => x.id)
       return { deny: `agent-deck: no harness "${input.harness}". ${ids.length ? `Enabled: ${ids.join(', ')}.` : 'None is enabled: add one under ⚙ Settings in the Agents pane.'}` }
     }
     if (!h.isEnabled) return { deny: `agent-deck: the ${h.name} harness is switched off in the Agents pane.` }
+    const effortError = effortProblem(h, asked.effort)
+    if (effortError) return { deny: `agent-deck: not started. ${effortError}` }
+    // A route's effort that this harness doesn't take (its CLI changed since) is left out.
+    if (input.effort && effortProblem(h, input.effort)) input.effort = undefined
     const run = await launchHarnessRun($, h, input)
     return {
       result:
-        `${h.name} run ${run.id} started in the background (model ${run.model ?? 'default'}). ` +
+        `${h.name} run ${run.id} started in the background (model ${run.model ?? 'default'}${run.effort ? `, effort ${run.effort}` : ''}). ` +
         `Its report will arrive as a new message when it finishes; don't wait or poll for it. ` +
         `Continue with other work, or end your turn if there is nothing else to do. agent_result with id "${run.id}" shows its progress.`,
     }
@@ -2513,6 +2581,7 @@ export const register: Register = on => {
     const lim = await read($, limits)
     const cache = await read($, cacheAtom)
     const open = new Set(await read($, expanded))
+    const fullOut = new Set(await read($, fullOutputAtom))
     const n = await read($, tick)
     const now = await $.clock.now()
     const view = await read($, viewAtom)
@@ -2559,7 +2628,7 @@ export const register: Register = on => {
             {`${Math.round(w.percent)}%`}
           </Text>
         </Box>
-        {w.resetsAt !== undefined && <Text dimColor>{`↻${fmtReset(w.resetsAt, now)}`}</Text>}
+        {w.resetsAt !== undefined && (isResetPast(w, now) ? <Text color="warning">out of date</Text> : <Text dimColor>{`↻${fmtSpan(w.resetsAt - now)}`}</Text>)}
       </Box>
     )
 
@@ -2579,32 +2648,48 @@ export const register: Register = on => {
 
     const limitBars = (name: string, color: string, ws: LimitWindow[], extra?: string) => (
       <Box key={`lim-${name}`} flexDirection="column" marginBottom={1}>
-        <Text>
+        <Text wrap="wrap">
           <Text bold color={color}>
             {name}
           </Text>
           {extra && <Text dimColor> · {extra}</Text>}
         </Text>
         {ws.length === 0 && <Text dimColor>no reading yet</Text>}
-        {ws.map(w => (
-          <Box key={`${name}-${w.label}`} flexDirection="column">
-            <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
-              <Text>{windowName(w)}</Text>
-              <Box flexDirection="row" columnGap={1} flexShrink={0}>
-                {w.resetsAt !== undefined && <Text dimColor>resets in {fmtReset(w.resetsAt, now)}</Text>}
-                <Text bold color={limitColor(w.percent)}>
-                  {`${Math.round(w.percent)}%`}
-                </Text>
+        {ws.map(w => {
+          const isPast = isResetPast(w, now)
+          return (
+            <Box key={`${name}-${w.label}`} flexDirection="column">
+              <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
+                <Text wrap="truncate-end">{windowName(w)}</Text>
+                <Box flexDirection="row" columnGap={1} flexShrink={0}>
+                  {w.resetsAt !== undefined && <Text dimColor={!isPast} color={isPast ? 'warning' : undefined}>{resetNote(w, now)}</Text>}
+                  <Text bold color={isPast ? undefined : limitColor(w.percent)} dimColor={isPast}>
+                    {`${Math.round(w.percent)}%`}
+                  </Text>
+                </Box>
               </Box>
+              {bar(`${name}-${w.label}-bar`, w.percent, isPast ? '#8B949E' : SVG_COLORS[limitColor(w.percent)])}
             </Box>
-            {bar(`${name}-${w.label}-bar`, w.percent, SVG_COLORS[limitColor(w.percent)])}
-          </Box>
-        ))}
+          )
+        })}
       </Box>
     )
 
-    const limitRow = (name: string, color: string, ws: LimitWindow[], extra?: string) =>
-      Svg ? limitBars(name, color, ws, extra) : limitText(name, color, ws, extra)
+    /** A provider's meters, with how old the reading is once that matters. */
+    const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string) => {
+      const hasPast = ws.some(w => isResetPast(w, now))
+      const extra = [plan, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
+      return (
+        <Box key={`lim-row-${p}`} flexDirection="column">
+          {Svg ? limitBars(name, color, ws, extra) : limitText(name, color, ws, extra)}
+          {hasPast && p === 'codex' && (
+            <Text dimColor wrap="wrap">
+              Codex writes its limits only while it works, so this reading updates with its next run.
+            </Text>
+          )}
+        </Box>
+      )
+    }
 
     const limitText = (name: string, color: string, ws: LimitWindow[], extra?: string) =>
       (isSideBySide && ws.length <= maxWindows) || ws.length === 0 ? (
@@ -2676,38 +2761,18 @@ export const register: Register = on => {
             </Text>
           </Box>
         )}
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} flexWrap="wrap">
-          <Box flexShrink={1} minWidth={0}>
-            {kw ? (
-              <Text wrap="wrap">
-                <Text bold color="success">
-                  ♨ keep-warm {fmtDuration(kw.leftMs)}
-                </Text>
-                <Text dimColor> · {kw.next}</Text>
-              </Text>
-            ) : (
-              <Text dimColor wrap="wrap">
-                keep-warm off
-              </Text>
-            )}
-          </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            {Select ? (
-              <Select
-                key="kw-window"
-                label="Keep warm"
-                options={KEEPWARM_OPTIONS}
-                value={keepWarmValue(kw?.leftMs)}
-                onSelect={v => void pickKeepWarm($, v)}
-              />
-            ) : kw ? (
-              <Button key="kw-stop" label="Stop" onPress={() => void stopKeepWarm($)} />
-            ) : (
-              <Button key="kw-2h" label="Keep warm 2h" variant="primary" onPress={() => void startKeepWarm($, DEFAULT_WINDOW_MS)} />
-            )}
-            {!Select && !kw && <Button key="kw-6h" label="6h" onPress={() => void startKeepWarm($, 6 * 3_600_000)} />}
-          </Box>
-        </Box>
+        {kw ? (
+          <Text wrap="wrap">
+            <Text bold color="success">
+              {ICON.keepWarm} keep-warm {fmtDuration(kw.leftMs)}
+            </Text>
+            <Text dimColor> · {kw.next}</Text>
+          </Text>
+        ) : (
+          <Text dimColor wrap="wrap">
+            keep-warm off · {Select ? 'pick a window with Keep warm above' : 'Keep warm above starts it'}
+          </Text>
+        )}
         {cache.stopped && (
           <Text color="warning" wrap="wrap">
             keep-warm stopped: {cache.stopped}
@@ -2727,10 +2792,31 @@ export const register: Register = on => {
       </Box>
     )
 
+    // ---- the top row: keep-warm, routing, settings ----
+
+    const keepWarmControls = Select
+      ? [
+          <Select
+            key="kw-window"
+            label={`${ICON.keepWarm} Keep warm`}
+            options={KEEPWARM_OPTIONS}
+            value={keepWarmValue(kw?.leftMs)}
+            onSelect={v => void pickKeepWarm($, v)}
+          />,
+        ]
+      : kw
+        ? [<Button key="kw-stop" label={`${ICON.keepWarm} Stop keep-warm`} onPress={() => void stopKeepWarm($)} />]
+        : [
+            <Button key="kw-2h" label={`${ICON.keepWarm} Keep warm 2h`} onPress={() => void startKeepWarm($, DEFAULT_WINDOW_MS)} />,
+            <Button key="kw-6h" label="6h" onPress={() => void startKeepWarm($, 6 * 3_600_000)} />,
+          ]
+
     // ---- agent cards ----
 
     const toggle = (id: string) =>
       update($, expanded, ids => (ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]))
+    const toggleFull = (id: string) =>
+      update($, fullOutputAtom, ids => (ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]))
 
     const stat = (key: string, label: string, value: string, color?: string) => (
       <Text key={key}>
@@ -2750,56 +2836,72 @@ export const register: Register = on => {
       const glyphColor = isRunning ? accent : c.status === 'done' ? 'success' : c.status === 'aborted' ? 'warning' : 'error'
       const provider = (c.providerName ?? c.provider).toUpperCase()
       const fullTitle = `${c.title}${c.isExternal ? ' (outside tool)' : ''}`
-      // A collapsed row cuts its title to fit before the surface lays it out, so it never pushes past the frame;
-      // an open card gives the title a wrapping line of its own.
+      const model = cardModelName(c, hs)
+      const statusWord = isRunning ? 'running' : c.status === 'done' ? 'done' : c.status === 'aborted' ? 'stopped' : 'failed'
+      // A collapsed row cuts its title to fit before the surface lays it out, so it never pushes past the frame.
       const room = cols - provider.length - elapsed.length - 12
-      const title = isOpen ? '' : clip(fullTitle, Math.max(8, room))
+      const title = clip(fullTitle, Math.max(8, room))
 
-      const header = (
-        <Box flexDirection="row" justifyContent="space-between" gap={1}>
-          <Box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
-            <Text color={glyphColor}>{glyph}</Text>
-            <Text bold color={accent}>
-              {provider}
-            </Text>
-            {title && (
-              <Text bold wrap="truncate-end">
-                {title}
-              </Text>
-            )}
-          </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor>
-              {elapsed}
-            </Text>
-            {!isRunning && <Button key={`t-${c.id}`} label={isOpen ? '▾' : '▸'} plain onPress={() => toggle(c.id)} />}
-          </Box>
-        </Box>
-      )
+      const toggleButton = !isRunning && <Button key={`t-${c.id}`} label={isOpen ? '▾' : '▸'} plain onPress={() => toggle(c.id)} />
 
       if (!isOpen) {
         return (
           <Box key={c.id} flexDirection="column" paddingX={1}>
-            {header}
+            <Box flexDirection="row" justifyContent="space-between" gap={1}>
+              <Box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+                <Text color={glyphColor}>{glyph}</Text>
+                <Text bold color={accent}>
+                  {provider}
+                </Text>
+                <Text bold wrap="truncate-end">
+                  {title}
+                </Text>
+              </Box>
+              <Box flexDirection="row" gap={1} flexShrink={0}>
+                <Text dimColor>{elapsed}</Text>
+                {toggleButton}
+              </Box>
+            </Box>
           </Box>
         )
       }
 
+      // An open card's header: who, which model, how it stands and for how long on one line, the title under it.
+      // It stays put at the card's top while the output below is capped to its last lines.
+      const header = (
+        <Box flexDirection="column">
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Box flexDirection="row" columnGap={1} flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+              <Text color={glyphColor}>{glyph}</Text>
+              <Text bold color={accent}>
+                {provider}
+              </Text>
+              <Text bold color={accent} wrap="truncate-end">
+                ◆ {model}
+              </Text>
+              {c.effort && (
+                <Text bold inverse color={accent}>
+                  {` ${c.effort} `}
+                </Text>
+              )}
+            </Box>
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              <Text dimColor={c.status !== 'error'} color={c.status === 'error' ? 'error' : undefined}>
+                {statusWord}
+              </Text>
+              <Text dimColor>{elapsed}</Text>
+              {toggleButton}
+            </Box>
+          </Box>
+          <Text bold wrap="wrap">
+            {fullTitle}
+          </Text>
+        </Box>
+      )
+
       const stale = staleFor(c, now)
       const t = c.tokens
       const hit = cacheHitPercent(t)
-      const modelRow = (
-        <Box flexDirection="row" columnGap={1} flexWrap="wrap">
-          <Text bold color={accent}>
-            ◆ {c.model}
-          </Text>
-          {c.effort && (
-            <Text bold inverse color={accent}>
-              {` ${c.effort} `}
-            </Text>
-          )}
-        </Box>
-      )
       const statsRow = (
         <Box flexDirection="row" columnGap={2} flexWrap="wrap">
           {stat('in', 'in', fmtTokens(t.input + t.cacheRead + t.cacheWrite))}
@@ -2813,15 +2915,14 @@ export const register: Register = on => {
       )
 
       const lines = c.output.split('\n').filter(l => l.trim() !== '')
-      const tail = lines.slice(isRunning ? -8 : -14)
+      // The engine scrolls only the whole pane, so an open card shows its last lines and Show all lifts the cap.
+      const isFull = fullOut.has(c.id)
+      const tail = isFull ? lines : lines.slice(-OUTPUT_LINES)
+      const hidden = lines.length - tail.length
       const acts = c.activity.slice(-5)
       return (
         <Box key={c.id} flexDirection="column" borderStyle="round" borderColor={accent} paddingX={1}>
           {header}
-          <Text bold wrap="wrap">
-            {fullTitle}
-          </Text>
-          {modelRow}
           {c.binary && (
             <Text dimColor wrap="truncate-end">
               {c.binary}
@@ -2849,9 +2950,15 @@ export const register: Register = on => {
           )}
           {tail.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
+              {(hidden > 0 || isFull) && lines.length > OUTPUT_LINES && (
+                <Box flexDirection="row" columnGap={1} alignItems="center">
+                  <Text dimColor>{isFull ? `all ${lines.length} lines` : `${hidden} earlier line${hidden === 1 ? '' : 's'}`}</Text>
+                  <Button key={`out-${c.id}`} label={isFull ? 'Show less' : 'Show all'} plain dimColor onPress={() => void toggleFull(c.id)} />
+                </Box>
+              )}
               {tail.map((l, i) => (
                 <Text key={`${c.id}-o${i}`} dimColor={l.startsWith('∴')} italic={l.startsWith('∴')} wrap="wrap">
-                  {l}
+                  {isFull ? l : clip(l, cols * 3)}
                 </Text>
               ))}
             </Box>
@@ -3295,6 +3402,26 @@ export const register: Register = on => {
     const setRoute = (task: string, patch: Partial<TaskRoute>) =>
       saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
 
+    /** The route's effort: the levels its agent takes, or why it takes none. */
+    const routeEffortPicker = (r: TaskRoute) => {
+      const choices = routeEffortChoices(r.target, hs.find(x => x.id === r.target))
+      if (!choices) return undefined
+      if ('reason' in choices) {
+        return (
+          <Text key={`r-effort-none-${r.task}`} dimColor wrap="wrap">
+            {choices.reason}
+          </Text>
+        )
+      }
+      if (!Select) return undefined
+      const options = [
+        { value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' },
+        ...choices.levels.map(l => ({ value: l, label: l })),
+        ...(r.effort && !choices.levels.includes(r.effort) ? [{ value: r.effort, label: `${r.effort} · not taken` }] : []),
+      ]
+      return <Select key={`r-effort-${r.task}`} label="Effort" options={options} value={r.effort ?? ''} onSelect={v => void setRoute(r.task, { effort: v || undefined })} />
+    }
+
     const routeModel = (r: TaskRoute) => {
       const target = hs.find(x => x.id === r.target)
       const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
@@ -3352,11 +3479,12 @@ export const register: Register = on => {
           </Box>
           {Select ? (
             <Box flexDirection="column" gap={0}>
-              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))} />
+              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined, effort: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))} />
               {routeModel(r)}
+              {routeEffortPicker(r)}
             </Box>
           ) : (
-            <Text dimColor>{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}`}</Text>
+            <Text dimColor>{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}${r.effort ? ` · effort ${r.effort}` : ''}`}</Text>
           )}
           {problem && <Text color="warning">{`Can't run: ${problem}.`}</Text>}
         </Box>
@@ -3447,6 +3575,10 @@ export const register: Register = on => {
             hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.',
             hasReading.antigravity ? 'Antigravity: read from agy, as /usage shows them.' : 'Antigravity: needs an Antigravity harness switched on, and agy signed in.',
           ].join(' ')}
+        </Text>
+        <Text dimColor wrap="wrap">
+          The Usage limits header in the main view switches between these views too, folds the meters into one line, and
+          refreshes them.
         </Text>
       </Box>
     )
@@ -3594,30 +3726,91 @@ export const register: Register = on => {
     const finished = list.filter(c => c.status !== 'running').reverse()
     const totalCost = list.reduce((s, c) => s + (c.costUsd ?? 0), 0)
 
+    // ---- usage limits: a header that folds them, switches the view and refreshes them ----
+
+    const LIMIT_VIEWS: { value: MeterChoice['mode']; label: string }[] = [
+      { value: 'all', label: 'All' },
+      { value: 'session', label: 'Used here' },
+      { value: 'selected', label: 'Selected' },
+    ]
+    const limitProviders = [
+      { p: 'codex' as const, name: 'Codex', color: CODEX_ACCENT, windows: lim.codex, plan: lim.codexPlan },
+      { p: 'claude' as const, name: 'Claude', color: 'claude', windows: lim.claude, plan: undefined },
+      { p: 'copilot' as const, name: 'Copilot', color: COPILOT_ACCENT, windows: lim.copilot ?? [], plan: lim.copilotPlan },
+      { p: 'antigravity' as const, name: 'Antigravity', color: AGY_ACCENT, windows: lim.antigravity ?? [], plan: undefined },
+    ].filter(x => shown.has(x.p))
+    const isCollapsed = meters.isCollapsed === true
+    const viewIndex = Math.max(0, LIMIT_VIEWS.findIndex(v => v.value === meters.mode))
+    const summary = limitSummary(limitProviders, now)
+    const limitsBlock = Object.values(hasReading).some(Boolean) && (
+      <Box key="limits" flexDirection="column" marginTop={1} marginBottom={Svg ? 0 : 1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} flexWrap="wrap">
+          <Button
+            key="lim-toggle"
+            label={`${isCollapsed ? '▸' : '▾'} Usage limits`}
+            plain
+            onPress={() => void saveMeters($, { ...meters, isCollapsed: !isCollapsed })}
+          />
+          <Box flexDirection="row" alignItems="center" columnGap={1} flexShrink={0}>
+            {Select ? (
+              <Select key="lim-view" options={LIMIT_VIEWS} value={meters.mode} onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })} />
+            ) : (
+              <Button
+                key="lim-view"
+                label={LIMIT_VIEWS[viewIndex]!.label}
+                plain
+                dimColor
+                onPress={() => void saveMeters($, { ...meters, mode: LIMIT_VIEWS[(viewIndex + 1) % LIMIT_VIEWS.length]!.value })}
+              />
+            )}
+            <Button key="lim-refresh" label={lim.isRefreshing ? '↻ Refreshing…' : '↻ Refresh'} plain dimColor onPress={() => void refreshAllLimits($)} />
+          </Box>
+        </Box>
+        {limitProviders.length === 0 && (
+          <Text dimColor wrap="wrap">
+            {meters.mode === 'selected' ? 'None selected: pick them under Settings → Usage meters.' : 'Nothing used here has a reading yet.'}
+          </Text>
+        )}
+        {isCollapsed ? (
+          limitProviders.length > 0 && (
+            <Text key="lim-summary" wrap="wrap">
+              {summary.map((x, i) => (
+                <Text key={`lim-sum-${x.name}`}>
+                  {i > 0 && <Text dimColor> · </Text>}
+                  <Text dimColor>{x.name} </Text>
+                  {x.percent === undefined ? (
+                    <Text color="warning">out of date</Text>
+                  ) : (
+                    <Text bold color={limitColor(x.percent)}>{`${Math.round(x.percent)}%`}</Text>
+                  )}
+                </Text>
+              ))}
+            </Text>
+          )
+        ) : (
+          limitProviders.map(x => limitRow(x.p, x.name, x.color, x.windows, x.plan))
+        )}
+      </Box>
+    )
+
     return (
       <Box flexDirection="column" gap={0}>
-        <Box flexDirection="row" justifyContent="flex-end" alignItems="center" columnGap={1}>
+        <Box flexDirection="row" justifyContent="flex-end" alignItems="center" columnGap={1} rowGap={0} flexWrap="wrap" marginBottom={1}>
+          {keepWarmControls}
           <Button
             key="r-toggle-main"
-            label={`Routing ${routingState.isOn ? 'on' : 'off'}`}
+            label={`${ICON.routing} Routing ${routingState.isOn ? 'on' : 'off'}`}
             variant={routingState.isOn ? 'primary' : undefined}
             onPress={() => void saveRouting($, { ...routingState, isOn: !routingState.isOn })}
           />
           <Button
             key="h-open"
-            label="⚙ Settings"
-            plain
-            dimColor
+            label={`${ICON.settings} Settings`}
             onPress={() => void setView({ mode: 'list' }).then(() => refreshRoutedModels($))}
           />
         </Box>
-        <Box flexDirection="column" marginBottom={Svg ? 0 : 1}>
-          {shown.has('codex') && limitRow('Codex', CODEX_ACCENT, lim.codex, lim.codexPlan)}
-          {shown.has('claude') && limitRow('Claude', 'claude', lim.claude)}
-          {shown.has('copilot') && limitRow('Copilot', COPILOT_ACCENT, lim.copilot ?? [], lim.copilotPlan)}
-          {shown.has('antigravity') && limitRow('Antigravity', AGY_ACCENT, lim.antigravity ?? [])}
-        </Box>
         {cacheBox}
+        {limitsBlock}
         {list.length === 0 && <Text dimColor>No subagents yet. Codex, Claude and harness runs appear here.</Text>}
         {running.map(card)}
         {finished.length > 0 && (

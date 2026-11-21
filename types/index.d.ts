@@ -32,8 +32,8 @@ export type Harness = {
   color: string
   command: string
   /**
-   * The arguments, shell-like: quotes group words. {prompt}, {model}, {session} and {cwd}
-   * are filled in; a word whose placeholder is empty is left out with the flag before it.
+   * The arguments, shell-like: quotes group words. {prompt}, {model}, {session}, {cwd} and
+   * {effort} are filled in; a word whose placeholder is empty is left out with the flag before it.
    */
   args: string
   model?: string
@@ -53,9 +53,10 @@ export type Harness = {
 
 /**
  * Who does one kind of task: a harness id, `codex` (the built-in codex tool) or `claude`
- * (a Claude subagent). An empty target means no preference.
+ * (a Claude subagent). An empty target means no preference. `effort` is a reasoning effort
+ * the target takes: a harness CLI's flag, the codex tool's effort, or the Agent tool's.
  */
-export type TaskRoute = { task: string; target: string; model?: string }
+export type TaskRoute = { task: string; target: string; model?: string; effort?: string }
 
 /** Task routing: the table, and whether Claude is told to follow it. */
 export type Routing = { isOn: boolean; routes: TaskRoute[] }
@@ -171,6 +172,10 @@ export type Limits = {
   copilotPlan?: string
   /** Antigravity's weekly and 5-hour limits, per model group, from agy's own language server. */
   antigravity?: LimitWindow[]
+  /** When each provider's reading was taken, epoch ms; Codex's is the time of the rollout line it came from. */
+  readAt?: Partial<Record<MeterProvider, number>>
+  /** Refresh was pressed and the readings are being taken again. */
+  isRefreshing?: boolean
 }
 
 export type MeterProvider = 'claude' | 'codex' | 'copilot' | 'antigravity'
@@ -180,6 +185,8 @@ export type MeterChoice = {
   /** all: every provider with a reading; session: those used in this session; selected: the list below. */
   mode: 'all' | 'session' | 'selected'
   selected: MeterProvider[]
+  /** The usage limits are folded into one line. */
+  isCollapsed?: boolean
 }
 
 export type CachePing = {
@@ -232,6 +239,8 @@ declare module 'claude-code' {
       agents: AgentCard[]
       limits: Limits
       expanded: string[]
+      /** Cards whose output shows in full, not just its last lines. */
+      fullOutput: string[]
       tick: number
       cache: CacheState
       harnesses: Harness[]

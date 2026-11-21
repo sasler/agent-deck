@@ -4,20 +4,27 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
 ## What it shows
 
+At the top of the pane sit three controls: **♨ Keep warm**, **⇄ Routing** and **⚙ Settings**. Under them come the prompt cache, the usage limits, then the agent cards.
+
 - **Usage limits.** Each provider's limits as a meter with a percentage and a reset countdown:
   - Claude's 5-hour and weekly windows, and every other limit your plan reports, such as a Team or Enterprise plan's spend limit or a weekly Opus limit;
   - Codex's limits, read from its session files;
   - Copilot's monthly AI credits, read through the GitHub CLI (`gh api copilot_internal/user`);
   - Antigravity's weekly and 5-hour limits for each model group (Gemini, Claude & GPT, Gemini 4 Argon), the same numbers agy's `/usage` shows. agent-deck asks agy itself every ten minutes and after each Antigravity run, while an Antigravity harness is switched on. It never reads your Google sign-in. To ask, agy opens a session, so agent-deck keeps reopening one session rather than adding a new empty conversation to agy's history each time.
 
-  Under ⚙ (settings) → **Usage meters** you choose which ones show: all connected, only those used in this session, or a selection.
-- **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn.
-- **Keep-warm.** Pick 2, 4 or 6 hours in the cache box, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
+  The **Usage limits** header has three controls:
+  - **▾ / ▸** folds the meters into one line with each provider's highest percent, and opens them again;
+  - the view switch picks **All**, **Used here** (the providers this session used) or **Selected**. It is the same setting as ⚙ Settings → **Usage meters**, where you also pick which providers **Selected** shows;
+  - **↻ Refresh** reads every provider's limits again now and says **Refreshing…** while it does. For Codex that means its newest session file, since Codex writes its limits only while it works.
+
+  A reading older than 15 minutes says how old it is, for example `updated 3h ago`. When a window's reset time has passed since the reading, the meter says **out of date** instead of a countdown: the window has started over, so the old percentage no longer holds. A Codex reading updates with Codex's next run.
+- **Prompt cache.** Whether the cache is warm or cold and how long it has left. It also estimates what a cold re-write of the current context would cost compared with a warm turn, and shows whether keep-warm is on.
+- **Keep-warm.** Pick 2, 4 or 6 hours with **♨ Keep warm** at the top of the pane, or type `/keepwarm 90m`. agent-deck then sends a tiny tool-less request just before the cache would expire, so a coffee break doesn't cost you a full re-write.
 - **Cold-send guard.** When the context is 50k tokens or more and the cache has gone cold, agent-deck holds your first message back once and shows the price. Press **Send anyway** in the band above the prompt (or send it again) to go ahead, or **Discard** it. After **Send anyway** the band says at once that it was sent and that the cache is being re-written, since that can take a while before the reply starts. Change this with `/cache guard refuse|warn|off`.
 - **Live agent cards.** Each running agent gets a card with:
-  - its model and reasoning effort
+  - a header line with the agent, its model by name (as the model pickers show it, for example `Gemini 4 Neon (High)` or `Opus 5.5`), its reasoning effort, how it stands and how long it has run, and the task's title under it
   - the tools it is running
-  - the latest output
+  - the latest output: its last 12 lines, newest at the bottom, so an open card stays a fixed size. **Show all** shows every line the card kept, **Show less** goes back
   - tokens in and out, cache-hit rate and an API-equivalent cost
   - the AI credits a Copilot run used, with a breakdown by concrete model, including Fusion and subagent work; missing billing is shown as not reported, and incomplete billing as a subtotal
 
@@ -25,7 +32,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
 
 ## Harnesses: Copilot, OpenCode, Antigravity, Gemini, Cursor and more
 
-Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the prompt), then click the **⚙** gear at the top right to open its settings. The pane's title shows the version that is running.
+Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the prompt), then click **⚙ Settings** at the top right to open its settings. The pane's title shows the version that is running.
 
 - **Add** a harness from a preset (Copilot, OpenCode, Antigravity, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
 - **Edit** a harness's command, arguments, default model, color and output format.
@@ -97,7 +104,19 @@ When a Copilot harness has its own Model API settings, its runs ignore inherited
 
 Runs start without a shell, so nothing in a prompt is expanded or re-quoted. On Windows, an npm `.cmd` shim starts as the Node script it wraps; any other `.cmd`/`.bat` is refused, so point the command at the program itself.
 
-The arguments are a template. `{prompt}`, `{model}`, `{session}` and `{cwd}` are filled in, and a flag whose value is empty is dropped along with its placeholder. For example, `--model {model}` disappears when no model is set. The edit form shows the exact command it will run.
+The arguments are a template. `{prompt}`, `{model}`, `{session}`, `{cwd}` and `{effort}` are filled in, and a flag whose value is empty is dropped along with its placeholder. For example, `--model {model}` disappears when no model is set. The edit form shows the exact command it will run.
+
+**Reasoning effort.** `agent_run` takes an `effort` for a harness whose CLI has a setting for it, and a route can set one (see Task routing). agent-deck puts the CLI's own flag in front of the prompt:
+
+| CLI | Flag | Levels |
+| --- | --- | --- |
+| Copilot | `--reasoning-effort` | none, minimal, low, medium, high, xhigh, max (what works depends on the model) |
+| Claude Code | `--effort` | low, medium, high, xhigh, max |
+| Antigravity | `--effort` | low, medium, high, xhigh, max |
+| OpenCode | `--variant` | minimal, low, medium, high, xhigh, max (each provider takes its own) |
+| Codex (custom harness) | `-c model_reasoning_effort=` | minimal, low, medium, high, xhigh |
+
+Gemini and Cursor have no effort setting, so they get no effort. A custom CLI gets one where you put `{effort}` in its arguments. Antigravity's model ids also name an effort (`gemini-4-neon-high`); `--effort` sets it for the run.
 
 | Preset | Command | Output read |
 | --- | --- | --- |
@@ -126,9 +145,10 @@ Set it up under ⚙ Settings → **Task routing**:
   - a Claude subagent offers Fable, Opus, Sonnet and Haiku, named with the version each runs.
 
   Where there is no list, type the model id.
-- The **On/Off** button next to **Task routing**, or **Routing on/off** next to ⚙ Settings in the main view, switches routing on or off. `/agent-deck routing on`, `off` and `status` do the same from the prompt.
+- Pick its **Effort**, or leave it at the default, where the agent takes one: a harness whose CLI has an effort flag (the table above), the built-in Codex (minimal to xhigh) or a Claude subagent (low to max, the Agent tool's effort). For a harness without one, the table says so. Picking another agent clears the model and effort.
+- The **On/Off** button next to **Task routing**, or **⇄ Routing on/off** next to ⚙ Settings in the main view, switches routing on or off. `/agent-deck routing on`, `off` and `status` do the same from the prompt.
 
-When routing is on, Claude gets a short note with your picks along with your next message. The note says which agent gets each kind of task, and that Claude keeps quick questions and small edits itself. The note goes out again after a compaction or `/clear`, and again whenever you change a pick. When you switch routing off, Claude is told so with your next message. Claude starts a routed harness with `agent_run` and the task's name (`task: "review"`), and agent-deck fills in the harness and model. An explicit harness or model that Claude passes still wins. `agent_run` reads your current picks each time it is called, so it follows them right after agent-deck reloads too.
+When routing is on, Claude gets a short note with your picks along with your next message. The note says which agent, model and effort gets each kind of task (for example `agent_run with task "ui" (Antigravity, model claude-opus-5-5-high, effort high)`), and that Claude keeps quick questions and small edits itself. The note goes out again after a compaction or `/clear`, and again whenever you change a pick. When you switch routing off, Claude is told so with your next message. Claude starts a routed harness with `agent_run` and the task's name (`task: "review"`), and agent-deck fills in the harness, model and effort. An explicit harness, model or effort that Claude passes still wins. `agent_run` reads your current picks each time it is called, so it follows them right after agent-deck reloads too.
 
 A task routed to an agent that is switched off or missing shows a warning in the table. If Claude tries it, the run doesn't start, and Claude is told to ask you before using another agent.
 

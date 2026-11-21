@@ -8,6 +8,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
+import { newestLimits } from '../bin/codex-limits.mjs'
 import { launchEnv } from '../bin/launch.mjs'
 
 const runner = fileURLToPath(new URL('../bin/run.mjs', import.meta.url))
@@ -307,6 +308,47 @@ const runWatch = async (t, rollouts, projectCwd) => {
   })
   return events.filter(e => e.t === 'meta').map(e => e.f).sort()
 }
+
+test('Codex limits are read on demand from the newest rollout that has a reading, with the time it was written', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-deck-limits-test-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.parse('2026-11-21T12:00:00Z')
+  const day = d => path.join(root, String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'))
+  const today = day(new Date(now))
+  const threeDaysAgo = day(new Date(now - 3 * 86_400_000))
+  fs.mkdirSync(today, { recursive: true })
+  fs.mkdirSync(threeDaysAgo, { recursive: true })
+  const reading = (timestamp, primary, secondary) =>
+    JSON.stringify({
+      timestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        rate_limits: {
+          plan_type: 'plus',
+          primary: { used_percent: primary, window_minutes: 300, resets_at: 1_800_000_000 },
+          secondary: { used_percent: secondary, window_minutes: 10080 },
+        },
+      },
+    })
+  const write = (file, lines, mtime) => {
+    fs.writeFileSync(file, lines.join('\n') + '\n')
+    fs.utimesSync(file, mtime / 1000, mtime / 1000)
+  }
+  write(path.join(threeDaysAgo, 'old.jsonl'), [reading('2026-11-18T08:00:00Z', 90, 95)], now - 3 * 86_400_000)
+  write(path.join(today, 'older.jsonl'), [reading('2026-11-21T09:00:00Z', 10, 20), reading('2026-11-21T09:30:00Z', 12, 21)], now - 2 * 3_600_000)
+  // The newest file has no reading yet: the one before it answers.
+  write(path.join(today, 'newest.jsonl'), ['{"type":"session_meta","payload":{"id":"x"}}'], now - 60_000)
+
+  const found = newestLimits(root, { now })
+  assert.equal(found.ts, Date.parse('2026-11-21T09:30:00Z'))
+  assert.deepEqual(found.limits, {
+    windows: [{ minutes: 300, percent: 12, resetsAt: 1_800_000_000_000 }, { minutes: 10080, percent: 21, resetsAt: undefined }],
+    plan: 'plus',
+  })
+  assert.equal(path.basename(found.file), 'older.jsonl')
+  assert.equal(newestLimits(path.join(root, 'missing'), { now }), undefined)
+})
 
 test('watcher matches MSYS paths, trailing slashes, subfolders and scratchpads, and ignores sibling folders', async t => {
   const rollouts = [
