@@ -27,6 +27,7 @@ import {
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
+  DELIVERY_CLAIM_TTL_MS,
   deliveryClaim,
   isDeliveryTaken,
   readDeliveryMark,
@@ -56,11 +57,14 @@ import {
   harnessCommand,
   fromPreset,
   harnessError,
+  harnessFailure,
   modelQuery,
   parseLine,
   parseModels,
   providerEnv,
   providerTypesFor,
+  redactSecrets,
+  stripAnsi,
   type ModelQuery,
   type CopilotRunOptions,
   pickCodex,
@@ -676,7 +680,7 @@ export const applyToCard = (card: AgentCard, ev: Extract<WatchEvent, { f: string
       }
       break
     case 'err':
-      card.error = ev.text
+      card.error = redactSecrets(stripAnsi(ev.text)).trim() || ev.text
       break
   }
 }
@@ -857,7 +861,65 @@ const footerOf = (run: Run, card: AgentCard | undefined) => {
 const MAX_DELIVERY_TRIES = 5
 /** How old this copy's claim must be before it hands the report over: a copy that claimed in the same moment has written by then. */
 const CLAIM_SETTLE_MS = 500
-const deliveries = new Map<string, { tries: number; nextAt: number; isSending: boolean; claim?: string }>()
+type DeliveryState = {
+  tries: number
+  nextAt: number
+  isSending: boolean
+  claim?: string
+  claimAt?: number
+  /** Set once the report has been accepted so it is never submitted twice, even if writing delivered.txt has to be retried. */
+  deliveredAt?: number
+  /** True once delivered.txt holds the delivered timestamp. */
+  isWritten?: boolean
+  /** Exact report text currently in flight with $.prompt.submit so prompt.submit's hook can stamp delivered.txt as soon as next(e) accepts it. */
+  sendingText?: string
+  onDelivered?: () => void
+}
+const deliveries = new Map<string, DeliveryState>()
+
+const writeDeliveredMark = async ($: $T, dir: string, d: DeliveryState): Promise<boolean> => {
+  const at = d.deliveredAt ?? (await $.clock.now())
+  d.deliveredAt = at
+  d.claim = undefined
+  d.claimAt = undefined
+  if (d.isWritten) return true
+  try {
+    await $.fs.write(`${dir}/delivered.txt`, String(at))
+    d.isWritten = true
+    d.onDelivered?.()
+    return true
+  } catch {
+    return false
+  }
+}
+
+const sendReport = async ($: $T, dir: string, what: string, text: string, d: DeliveryState) => {
+  const file = `${dir}/delivered.txt`
+  try {
+    const entered = await $.prompt.submit({ text })
+    if (entered?.drop !== undefined) throw new Error(`refused: ${entered.drop}`)
+    await writeDeliveredMark($, dir, d)
+  } catch (err) {
+    // If prompt.submit already saw the prompt accepted, never release the claim or submit it a second time.
+    if (d.deliveredAt !== undefined) {
+      await writeDeliveredMark($, dir, d)
+      return
+    }
+    const at = await $.clock.now()
+    d.claim = undefined
+    d.claimAt = undefined
+    await $.fs.write(file, '').catch(() => undefined)
+    d.tries++
+    d.nextAt = at + 30_000 * d.tries
+    if (d.tries >= MAX_DELIVERY_TRIES) {
+      $.ui.toast(`agent-deck: gave up delivering ${what} after ${d.tries} tries (${String((err as Error)?.message ?? err).slice(0, 120)}); its result tool still reads it.`)
+      d.onDelivered?.()
+    }
+  } finally {
+    d.isSending = false
+    d.sendingText = undefined
+  }
+}
 
 /**
  * Hands a finished run's report to the model as a new turn, once. Another copy of agent-deck
@@ -867,46 +929,61 @@ const deliveries = new Map<string, { tries: number; nextAt: number; isSending: b
  * another's claim leaves the report alone. A refused or failed submit lets the claim go and is
  * tried again later (30 s, 60 s, ...), five times at most. True once nothing is left to do here.
  */
-const deliverReport = async ($: $T, dir: string, what: string, text: string): Promise<boolean> => {
+const deliverReport = async ($: $T, dir: string, what: string, text: string, onDelivered?: () => void): Promise<boolean> => {
   const d = deliveries.get(dir) ?? { tries: 0, nextAt: 0, isSending: false }
+  if (onDelivered) d.onDelivered = onDelivered
   deliveries.set(dir, d)
-  if (d.isSending) return false
-  if (d.tries >= MAX_DELIVERY_TRIES) return true
   const file = `${dir}/delivered.txt`
   const now = await $.clock.now()
+  if (d.deliveredAt !== undefined) {
+    const mark = readDeliveryMark(await readText($, file))
+    if (mark.state === 'delivered') {
+      d.isWritten = true
+      return true
+    }
+    d.isWritten = false
+    return writeDeliveredMark($, dir, d)
+  }
+  if (d.isSending) {
+    // Keep our claim fresh while $.prompt.submit waits on a long turn, so another copy doesn't take it over.
+    if (d.claim && d.claimAt !== undefined && now - d.claimAt >= DELIVERY_CLAIM_TTL_MS / 2) {
+      const mark = readDeliveryMark(await readText($, file))
+      if (mark.state === 'claimed' && mark.token === d.claim) {
+        d.claimAt = now
+        await $.fs.write(file, deliveryClaim(d.claim, now)).catch(() => undefined)
+      }
+    }
+    return false
+  }
+  if (d.tries >= MAX_DELIVERY_TRIES) return true
   const mark = readDeliveryMark(await readText($, file))
-  if (mark.state === 'delivered') return true
+  if (mark.state === 'delivered') {
+    d.deliveredAt = now
+    d.isWritten = true
+    d.claim = undefined
+    d.claimAt = undefined
+    return true
+  }
   if (mark.state !== 'claimed' || mark.token !== d.claim) {
     d.claim = undefined
+    d.claimAt = undefined
     // Another copy is handing it over now: look again on the next poll.
     if (isDeliveryTaken(mark, now) || now < d.nextAt) return false
     const token = `${now.toString(36)}-${Math.floor(Math.random() * 36 ** 6).toString(36)}`
     d.claim = token
+    d.claimAt = now
     await $.fs.write(file, deliveryClaim(token, now)).catch(() => {
       d.claim = undefined
+      d.claimAt = undefined
     })
     return false
   }
   if (now - mark.at < CLAIM_SETTLE_MS) return false
   d.isSending = true
-  try {
-    const entered = await $.prompt.submit({ text })
-    if (entered?.drop !== undefined) throw new Error(`refused: ${entered.drop}`)
-    d.claim = undefined
-    await $.fs.write(file, String(now)).catch(() => undefined)
-    return true
-  } catch (err) {
-    // Let the claim go, so the next try, here or in another copy, can hand it over.
-    d.claim = undefined
-    await $.fs.write(file, '').catch(() => undefined)
-    d.tries++
-    d.nextAt = now + 30_000 * d.tries
-    if (d.tries < MAX_DELIVERY_TRIES) return false
-    $.ui.toast(`agent-deck: gave up delivering ${what} after ${d.tries} tries (${String((err as Error)?.message ?? err).slice(0, 120)}); its result tool still reads it.`)
-    return true
-  } finally {
-    d.isSending = false
-  }
+  d.sendingText = text
+  // Submit without stalling other runs in the poll loop while the session is busy.
+  void sendReport($, dir, what, text, d)
+  return false
 }
 
 /** Marks a finished run on its card and hands its report to the model as a new turn. */
@@ -919,6 +996,9 @@ const finishRun = async ($: $T, run: Run, outcome: RunOutcome) => {
     card.isThinking = false
     if (outcome.error) card.error = outcome.error
     schedule($)
+  } else if (card && card.status === 'error' && outcome.error && card.error !== outcome.error) {
+    card.error = outcome.error
+    schedule($)
   }
   if (run.sessionId !== sessionId) {
     run.isDelivered = true
@@ -930,7 +1010,9 @@ const finishRun = async ($: $T, run: Run, outcome: RunOutcome) => {
       ? `Background Codex run ${run.id} ("${run.title}") finished after ${elapsed}. Its report:`
       : `Background Codex run ${run.id} ("${run.title}") failed after ${elapsed}: ${outcome.error ?? 'unknown error'}${outcome.report ? '\n\nIts last message:' : ''}`
   const text = `[agent-deck] ${head}\n\n${outcome.report}\n\n${footerOf(run, card)}`.trim()
-  run.isDelivered = await deliverReport($, run.dir, `Codex run ${run.id}`, text)
+  run.isDelivered = await deliverReport($, run.dir, `Codex run ${run.id}`, text, () => {
+    run.isDelivered = true
+  })
 }
 
 let isPollingRuns = false
@@ -1146,21 +1228,20 @@ const finishHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard, code: n
   run.isFinished = true
   if (run.parser === 'antigravity') void refreshAgyLimits($)
   const stderr = (await readText($, `${run.dir}/stderr.log`)) ?? ''
+  const exitCode = Number.isNaN(code) ? undefined : code
   const isOk = code === 0 && !card.error
   if (card.status === 'running') {
     card.status = isOk ? 'done' : 'error'
     card.endedAt = await $.clock.now()
     card.isThinking = false
-    if (!isOk && !card.error) {
-      card.error =
-        stderr
-          .split('\n')
-          .filter(l => l.trim())
-          .slice(-4)
-          .join(' ')
-          .slice(0, 600) || `${run.name} exited ${Number.isNaN(code) ? '?' : code}`
-    }
+    if (!isOk) card.error = harnessFailure(run.name, exitCode, card.error, stderr)
     schedule($)
+  } else if (card.status === 'error') {
+    const nextError = harnessFailure(run.name, exitCode, card.error, stderr)
+    if (nextError !== card.error) {
+      card.error = nextError
+      schedule($)
+    }
   }
   await deliverHarnessRun($, run, card)
 }
@@ -1177,7 +1258,9 @@ const deliverHarnessRun = async ($: $T, run: HarnessRun, card: AgentCard) => {
     ? `Background ${run.name} run ${run.id} ("${run.title}") finished after ${elapsed}. Its report:`
     : `Background ${run.name} run ${run.id} ("${run.title}") failed after ${elapsed}: ${card.error ?? 'unknown error'}${report ? '\n\nIts last output:' : ''}`
   const text = `[agent-deck] ${head}\n\n${report}\n\n${harnessFooter(run, card)}`.trim()
-  run.isDelivered = await deliverReport($, run.dir, `${run.name} run ${run.id}`, text)
+  run.isDelivered = await deliverReport($, run.dir, `${run.name} run ${run.id}`, text, () => {
+    run.isDelivered = true
+  })
 }
 
 let isPollingHarness = false
@@ -2197,9 +2280,18 @@ const registerCache = (on: On) => {
     const want = currentRoutingNote()
     const extra = routingContext(want, routingSent)
     const pass = async () => {
-      if (!extra) return next(e)
-      const r = await next({ ...e, context: [...(e.context ?? []), extra] })
-      if (!r.drop) routingSent = want
+      const r = extra ? await next({ ...e, context: [...(e.context ?? []), extra] }) : await next(e)
+      if (!r.drop) {
+        if (extra) routingSent = want
+        if (e.origin.kind === 'plugin') {
+          for (const [dir, d] of deliveries) {
+            if (d.isSending && d.sendingText === e.text && d.deliveredAt === undefined) {
+              await writeDeliveredMark($, dir, d)
+              break
+            }
+          }
+        }
+      }
       return r
     }
     if (e.origin.kind === 'plugin' || s.guard === 'off') return pass()

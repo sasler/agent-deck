@@ -68,7 +68,7 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 - runs as its own detached process, so it survives a plugin reload or a dropped session;
 - streams into a card in the pane;
-- delivers its final report back to the conversation as a new message when it finishes, once, even when agent-deck reloads meanwhile or a second copy of it (a dev copy beside the release) watches the same runs.
+- delivers its final report back to the conversation as a new message when it finishes, once, even when agent-deck reloads meanwhile or a second copy of it (a dev copy beside the release) watches the same runs. When a harness exits non-zero without reporting an error event, its card and report include the last lines of its stderr (with keys and tokens redacted) rather than only the exit code.
 
 `agent_result` reads a run on demand.
 

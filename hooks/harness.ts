@@ -1031,7 +1031,7 @@ export type HarnessEvent =
   | { kind: 'session'; id: string }
   | { kind: 'credits'; credits: number }
   | { kind: 'copilot-usage'; models?: Record<string, CopilotModelUsage>; credits?: number; creditsStatus?: CopilotModelUsage['aiCreditsStatus']; isAdded?: boolean }
-  | { kind: 'error'; text: string }
+  | { kind: 'error'; text: string; isExitCode?: boolean }
   | { kind: 'final'; text: string }
 
 type J = Record<string, unknown>
@@ -1160,7 +1160,7 @@ const copilot = (e: J): HarnessEvent[] => {
       const out: HarnessEvent[] = []
       if (str(e.sessionId)) out.push({ kind: 'session', id: e.sessionId as string })
       out.push(...copilotTotals(obj(e.usage)))
-      if (typeof e.exitCode === 'number' && e.exitCode !== 0) out.push({ kind: 'error', text: `Copilot exited ${e.exitCode}` })
+      if (typeof e.exitCode === 'number' && e.exitCode !== 0) out.push({ kind: 'error', text: `Copilot exited ${e.exitCode}`, isExitCode: true })
       return out
     }
   }
@@ -1522,7 +1522,7 @@ export const applyHarnessEvent = (card: AgentCard, ev: HarnessEvent) => {
       break
     }
     case 'error':
-      card.error = ev.text
+      if (!ev.isExitCode || !card.error) card.error = redactSecrets(stripAnsi(ev.text)).trim() || ev.text
       break
     case 'final':
       break
@@ -1917,10 +1917,8 @@ const CODEX_ERROR_MAX = 80
 
 /** Short, safe reason for a failed live Codex limits read: max 80 chars, no raw responses or tokens. */
 export const codexLiveError = (raw: string | undefined): string => {
-  const s = (raw ?? '')
+  const s = redactSecrets(stripAnsi(raw ?? ''))
     .replace(/[\r\n\t]+/g, ' ')
-    .replace(/\bBearer\s+\S+/gi, '[redacted]')
-    .replace(/\b(?:sk|ghp|gho|github_pat|eyJ)[A-Za-z0-9._-]{8,}\b/g, '[redacted]')
     .replace(/\s+/g, ' ')
     .trim()
   if (!s) return 'could not read live'
@@ -2059,7 +2057,85 @@ export const codexModelProblem = (model: string | undefined, f: CodexFind, chose
     .join(' ')
 }
 
-// ---------- why a Codex run failed ----------
+// ---------- why a run failed (ANSI stripping, secret redaction, stderr summary) ----------
+
+const ANSI_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g
+
+/** Strips terminal escape codes (CSI, OSC, and 2-byte ESC sequences). */
+export const stripAnsi = (text: string): string => text.replace(ANSI_RE, '')
+
+const BEARER_SECRET_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
+const PREFIXED_SECRET_RE =
+  /\b(?:sk-[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9._-]{8,}|eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*|AIza[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g
+const LONG_HEX_RE = /\b[0-9a-fA-F]{32,}\b/g
+const LONG_TOKEN_RE = /(?<![:/\\A-Za-z0-9_+-])([A-Za-z0-9+/_-]{32,}={0,2})(?![A-Za-z0-9+/_=-])/g
+
+/**
+ * Redacts API keys, tokens, Bearer credentials and long hex/base64 secrets while leaving
+ * ordinary error messages, file paths, URLs and UUIDs readable.
+ */
+export const redactSecrets = (text: string): string =>
+  text
+    .replace(BEARER_SECRET_RE, '[redacted]')
+    .replace(PREFIXED_SECRET_RE, '[redacted]')
+    .replace(LONG_HEX_RE, '[redacted]')
+    .replace(LONG_TOKEN_RE, match => {
+      if (match.includes('/') && !/[+=]/.test(match) && match.split('/').every(seg => seg.length < 24)) return match
+      const hasUpper = /[A-Z]/.test(match)
+      const hasLower = /[a-z]/.test(match)
+      const hasDigit = /\d/.test(match)
+      const hasB64Punct = /[+/=]/.test(match)
+      if ((hasUpper && hasLower && hasDigit) || (hasB64Punct && (hasUpper || hasLower) && (hasDigit || match.endsWith('=')))) {
+        return '[redacted]'
+      }
+      return match
+    })
+
+const STDERR_SUMMARY_MAX = 500
+const STDERR_NOISE_RE = /^(?:at\s+\S|Node\.js\s+v\d|[\^~]+$)/
+
+/**
+ * Turns a failed run's stderr.log into a short, safe reason: ANSI-stripped, secrets redacted,
+ * last meaningful lines trimmed and capped to `maxChars` (default 500).
+ */
+export const summarizeStderr = (stderr: string, maxChars = STDERR_SUMMARY_MAX): string => {
+  const all = stripAnsi(stderr)
+    .split(/\r?\n/)
+    .map(raw => {
+      const parts = raw.split('\r').map(p => p.trim()).filter(Boolean)
+      return (parts.at(-1) ?? '').replace(/\s+/g, ' ')
+    })
+    .filter(Boolean)
+  if (!all.length) return ''
+  const meaningful = all.filter(l => !STDERR_NOISE_RE.test(l))
+  const lines = (meaningful.length ? meaningful : all).map(l => redactSecrets(l))
+  const picked: string[] = []
+  let len = 0
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    const extra = picked.length ? line.length + 1 : line.length
+    if (picked.length > 0 && len + extra > maxChars) break
+    picked.unshift(line)
+    len += extra
+    if (picked.length >= 6) break
+  }
+  const joined = picked.join(' ')
+  return joined.length <= maxChars ? joined : `${joined.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+}
+
+const BARE_EXIT_RE = /^.+\s+exited\s+(?:-?\d+|\?)$/i
+
+/**
+ * The error line for a failed harness run: its parsed event error when the events carried one,
+ * otherwise "<name> exited <code>" followed by the summarized stderr.log when present.
+ */
+export const harnessFailure = (name: string, code: number | undefined, eventError: string | undefined, stderr: string): string => {
+  const cleaned = eventError ? redactSecrets(stripAnsi(eventError)).trim() : ''
+  if (cleaned && !BARE_EXIT_RE.test(cleaned)) return cleaned
+  const base = cleaned || `${name} exited ${code !== undefined && !Number.isNaN(code) ? code : '?'}`
+  const detail = summarizeStderr(stderr)
+  return detail ? `${base}: ${detail}` : base
+}
 
 /** A Codex error message, unwrapped when it is the API's JSON error body: "message (code)". */
 export const codexErrorText = (message: string): string => {
@@ -2085,17 +2161,18 @@ export const codexFailure = (events: string, stderr: string, code: number | unde
       const e = JSON.parse(line) as J
       const msg = e.type === 'turn.failed' ? str(obj(e.error).message) : e.type === 'error' ? str(e.message) : undefined
       if (msg) {
-        const text = codexErrorText(msg)
-        if (fromEvents.at(-1) !== text) fromEvents.push(text)
+        const text = redactSecrets(stripAnsi(codexErrorText(msg))).trim()
+        if (text && fromEvents.at(-1) !== text) fromEvents.push(text)
       }
     } catch {}
   }
   if (fromEvents.length) return fromEvents.slice(-2).join(' · ').slice(0, 800)
-  const lines = stderr
-    .split('\n')
+  const filtered = stripAnsi(stderr)
+    .split(/\r?\n/)
     .map(l => l.trim())
     .filter(l => l && !l.startsWith('Reading additional input') && !/rmcp::transport/.test(l))
     .filter(l => !/^\d{4}-\d\d-\d\dT\S+\s+(INFO|DEBUG|TRACE|WARN)\b/.test(l))
     .map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s+ERROR\s+/, ''))
-  return lines.slice(-4).join(' ').slice(0, 800) || `codex exited ${code ?? '?'} with no error output`
+    .join('\n')
+  return summarizeStderr(filtered) || `codex exited ${code ?? '?'} with no error output`
 }

@@ -25,7 +25,7 @@ import {
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
 import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, buildModelTree, capSelectOptions, cardModelName, codexLiveError, effortLabel, filterModels, groupModels, orderWindows, parseCodexLimitsOutput, pickerLevels, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
-import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, harnessFailure, modelQuery, parseLine, parseModels, providerEnv, redactSecrets, slugId, stripAnsi, summarizeStderr, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -3068,4 +3068,367 @@ test('every settings tab draws on every surface, a narrow pane too', async ($, o
       await ui.unmount()
     }
   }
+})
+
+// ---------- failed runs: stderr reason, secret redaction, once-only delivery ----------
+
+test('stderr summarising strips ANSI codes, redacts keys and tokens, keeps ordinary paths/messages, and caps around 500 chars', () => {
+  expect(stripAnsi('\x1b[31mError:\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x07 failed')).toBe('Error: link failed')
+
+  // Redacts every secret/token pattern while preserving normal text, URLs, paths and UUIDs.
+  const secrets = [
+    'sk-proj-abc123def456ghi789',
+    'sk-ant-api03-1234567890abcdef',
+    'ghp_1234567890abcdefABCDEF1234567890ab',
+    'gho_abcdef1234567890ABCDEF1234567890',
+    'github_pat_11ABCDEFG0123456789_xyzABCDEF0123456789',
+    'glpat-aBcDeFgHiJkLmNoPqRsT1234',
+    'Bearer eyJhbGciOiJIUzI1NiJ9.payload12345.sig67890',
+    'bearer my-raw-token-value',
+    '0123456789abcdef0123456789abcdef01234567',
+    'YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY=',
+    'aGVsbG8gd29ybGQgdGhpcyBpcyBhIHNlY3JldCBrZXk',
+  ]
+  for (const secret of secrets) {
+    const out = redactSecrets(`auth failed with ${secret} at step 1`)
+    expect(out).toContain('[redacted]')
+    expect(out.includes(secret.replace(/^bearer /i, ''))).toBe(false)
+  }
+
+  const benign =
+    'Error executing prompt: Error: model resolution leaf failed: Auto preference "hydrafusion" is disabled at https://api.github.com/copilot/v1/models (/Users/alice/agent-deck/hooks/harness.ts) session 605c0f8e-5314-4c46-8658-6c3b7078873b'
+  expect(redactSecrets(benign)).toBe(benign)
+
+  // Drops stack frames when meaningful lines exist, strips ANSI, and stays <= 500 chars.
+  const noisy = [
+    '\x1b[33mwarn: priming\x1b[0m',
+    '\x1b[31mError executing prompt: bad token sk-secretkey1234567890\x1b[0m',
+    '    at resolveModel (/app/cli.js:12:3)',
+    '    at main (/app/cli.js:99:1)',
+    'Node.js v22.14.0',
+  ].join('\n')
+  const summary = summarizeStderr(noisy)
+  expect(summary).toContain('Error executing prompt: bad token [redacted]')
+  expect(summary).not.toContain('sk-secretkey')
+  expect(summary).not.toContain('at resolveModel')
+  expect(summary).not.toContain('\x1b[')
+
+  const veryLong = Array.from({ length: 30 }, (_, i) => `line ${i}: ${'detail '.repeat(12)}`).join('\n')
+  expect(summarizeStderr(veryLong).length).toBeLessThanOrEqual(500)
+  expect(summarizeStderr(veryLong)).toContain('line 29:')
+
+  // Real Copilot failure shape: result event has exitCode 1, reason lives only in stderr.log.
+  const copilotStderr =
+    'Error executing prompt: Error: model resolution leaf failed: Auto preference "hydrafusion" is disabled: This tier is not available for the user\'s Copilot plan.; choose an enabled Auto preference or another model'
+  expect(harnessFailure('Copilot', 1, 'Copilot exited 1', copilotStderr)).toBe(`Copilot exited 1: ${copilotStderr}`)
+  expect(harnessFailure('OpenCode', 1, undefined, '\x1b[31mpermission denied\x1b[0m')).toBe('OpenCode exited 1: permission denied')
+  expect(harnessFailure('Copilot', 1, 'Copilot exited 1', '')).toBe('Copilot exited 1')
+  expect(harnessFailure('Copilot', 1, 'Rate limit exceeded', 'ignored stderr')).toBe('Rate limit exceeded')
+
+  // A prior real Copilot error event is not overwritten by a trailing result exitCode 1.
+  const card = { id: 'c', provider: 'harness', title: 't', model: 'auto', status: 'running', startedAt: 0, output: '', isThinking: true, activity: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 } } as AgentCard
+  for (const l of [
+    '{"type":"session.error","data":{"message":"Model quota reached"}}',
+    '{"type":"result","exitCode":1}',
+  ]) {
+    for (const ev of parseLine('copilot', l)) applyHarnessEvent(card, ev)
+  }
+  expect(card.error).toBe('Model quota reached')
+
+  // Codex failure path also strips ANSI and redacts keys/tokens in stderr and events.
+  expect(codexFailure('', '\x1b[2m2026-11-21T10:00:00Z\x1b[0m \x1b[31mERROR\x1b[0m auth failed: Bearer topsecret123456\n', 1)).toBe(
+    'auth failed: [redacted]',
+  )
+  expect(codexFailure(JSON.stringify({ type: 'error', message: 'invalid key sk-codexsecret123456' }), '', 1)).toBe(
+    'invalid key [redacted]',
+  )
+})
+
+test('a failed harness run shows stderr in its card and report, marks delivered.txt with a timestamp, and delivers once even after 11 minutes', async ($, on) => {
+  const start = 100_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-fail-harness' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const stderrReason =
+    'Error executing prompt: Error: model resolution leaf failed: Auto preference "hydrafusion" is disabled: This tier is not available for the user\'s Copilot plan.; choose an enabled Auto preference or another model'
+  const files = new Map<string, string>([
+    [
+      `${root}/run-fail/meta.json`,
+      JSON.stringify({
+        id: 'run-fail',
+        harness: 'copilot',
+        name: 'Copilot',
+        color: '#8957E5',
+        parser: 'copilot',
+        title: 'Smoke test: Copilot',
+        cwd: 'project',
+        sessionId: 'sid-fail-harness',
+        startedAt: start - 4000,
+        model: 'hydrafusion',
+      }),
+    ],
+    [`${root}/run-fail/exit.txt`, '1'],
+    [
+      `${root}/run-fail/events.jsonl`,
+      [
+        '{"type":"session.start","data":{"sessionId":"605c0f8e-5314-4c46-8658-6c3b7078873b"}}',
+        '{"type":"result","sessionId":"605c0f8e-5314-4c46-8658-6c3b7078873b","exitCode":1}',
+      ].join('\n') + '\n',
+    ],
+    [`${root}/run-fail/stderr.log`, `\x1b[31m${stderrReason} (token ghp_1234567890abcdef123456)\x1b[0m\n`],
+    // A second already-delivered failed run whose timestamp is older than DELIVERY_CLAIM_TTL_MS must never re-deliver.
+    [
+      `${root}/run-old/meta.json`,
+      JSON.stringify({
+        id: 'run-old',
+        harness: 'copilot',
+        name: 'Copilot',
+        color: '#8957E5',
+        parser: 'copilot',
+        title: 'Old failed run',
+        cwd: 'project',
+        sessionId: 'sid-fail-harness',
+        startedAt: start - 15 * 60_000,
+        model: 'hydrafusion',
+      }),
+    ],
+    [`${root}/run-old/exit.txt`, '1'],
+    [`${root}/run-old/events.jsonl`, '{"type":"result","exitCode":1}\n'],
+    [`${root}/run-old/stderr.log`, 'old error\n'],
+    [`${root}/run-old/delivered.txt`, String(start - 12 * 60_000)],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root)
+      ? ['run-fail', 'run-old'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))
+      : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  // Fail the first timestamp write to delivered.txt to verify we retry writing the marker without re-submitting.
+  let failTimestampWriteOnce = true
+  on('fs.write', (_$, e) => {
+    const path = key(e.path)
+    if (path === `${root}/run-fail/delivered.txt` && /^\d+$/.test(e.text) && failTimestampWriteOnce) {
+      failTimestampWriteOnce = false
+      return { deny: 'transient write error' }
+    }
+    files.set(path, e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 8; i++) await clock.advance(500)
+
+  // Delivered exactly once with the real stderr reason and redacted token.
+  expect(submits.length).toBe(1)
+  expect(submits[0]).toContain(`Copilot exited 1: ${stderrReason} (token [redacted])`)
+  expect(submits[0]).not.toContain('ghp_1234567890')
+  expect(submits[0]).not.toContain('\x1b[')
+
+  // delivered.txt holds a timestamp (never left as a claim), even after a transient write failure.
+  const deliveredRaw = files.get(`${root}/run-fail/delivered.txt`) ?? ''
+  expect(deliveredRaw).toMatch(/^\d+$/)
+  expect(readDeliveryMark(deliveredRaw)).toEqual({ state: 'delivered' })
+  expect(isDeliveryTaken(readDeliveryMark(deliveredRaw), start + 11 * 60_000)).toBe(true)
+
+  // agent_result and the card's error line show the exact same reason.
+  const res = (await $.tool.call({ tool: 'mcp__agent-deck__agent_result', tool_use_id: 'res-fail', id: 'run-fail' })) as { result?: string }
+  expect(res.result).toContain(`Copilot run run-fail failed: Copilot exited 1: ${stderrReason} (token [redacted])`)
+
+  const ui = await mountPane($, 80)
+  await ui.press({ key: 't-h-run-run-fail' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Copilot exited 1: Error executing prompt:.*choose an enabled Auto preference or another model/ })).toBeDefined()
+  await ui.unmount()
+
+  // Advance 11 minutes (past the 10-minute claim TTL) and poll/reload again: nothing is delivered a second time.
+  await clock.advance(11 * 60_000)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+  expect(submits.length).toBe(1)
+  expect(files.get(`${root}/run-fail/delivered.txt`)).toMatch(/^\d+$/)
+})
+
+test('a failed Codex run shows redacted stderr, marks delivered.txt with a timestamp, and delivers once even after 11 minutes', async ($, on) => {
+  const start = 200_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-fail-codex' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/runs'
+  const files = new Map<string, string>([
+    [
+      `${root}/cx-fail/meta.json`,
+      JSON.stringify({
+        id: 'cx-fail',
+        title: 'Failed Codex task',
+        cwd: 'project',
+        sessionId: 'sid-fail-codex',
+        startedAt: start - 5000,
+        model: 'gpt-6.1-sol',
+      }),
+    ],
+    [`${root}/cx-fail/exit.txt`, '1'],
+    [`${root}/cx-fail/events.jsonl`, '{"type":"thread.started","thread_id":"th-1"}\n'],
+    [`${root}/cx-fail/stderr.log`, '\x1b[31m2026-11-21T10:00:00Z ERROR codex_core: auth rejected sk-secretcodex123456\x1b[0m\n'],
+    // Already-delivered failed Codex run older than 11 minutes must never be delivered again.
+    [
+      `${root}/cx-old/meta.json`,
+      JSON.stringify({
+        id: 'cx-old',
+        title: 'Old Codex failure',
+        cwd: 'project',
+        sessionId: 'sid-fail-codex',
+        startedAt: start - 15 * 60_000,
+      }),
+    ],
+    [`${root}/cx-old/exit.txt`, '1'],
+    [`${root}/cx-old/events.jsonl`, ''],
+    [`${root}/cx-old/stderr.log`, 'old failure\n'],
+    [`${root}/cx-old/delivered.txt`, String(start - 12 * 60_000)],
+  ])
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root)
+      ? ['cx-fail', 'cx-old'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))
+      : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  const submits: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submits.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  // pollRuns ticks every 2000ms: poll 1 claims, poll 2 submits and writes timestamp.
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+
+  expect(submits.length).toBe(1)
+  expect(submits[0]).toContain('Background Codex run cx-fail ("Failed Codex task") failed')
+  expect(submits[0]).toContain('codex_core: auth rejected [redacted]')
+  expect(submits[0]).not.toContain('sk-secretcodex')
+  expect(submits[0]).not.toContain('\x1b[')
+
+  const deliveredRaw = files.get(`${root}/cx-fail/delivered.txt`) ?? ''
+  expect(deliveredRaw).toMatch(/^\d+$/)
+  expect(readDeliveryMark(deliveredRaw)).toEqual({ state: 'delivered' })
+  expect(isDeliveryTaken(readDeliveryMark(deliveredRaw), start + 11 * 60_000)).toBe(true)
+
+  const ui = await mountPane($, 80)
+  await ui.press({ key: 't-codex-run-cx-fail' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /codex_core: auth rejected \[redacted\]/ })).toBeDefined()
+  await ui.unmount()
+
+  // Advance 11 minutes and poll/reload again: nothing is delivered a second time.
+  await clock.advance(11 * 60_000)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(1000)
+  expect(submits.length).toBe(1)
+  expect(files.get(`${root}/cx-fail/delivered.txt`)).toMatch(/^\d+$/)
+})
+
+test('a slow prompt.submit for one run does not leave another claimed run stuck as a claim', async ($, on) => {
+  const start = 300_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-concurrent' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  const root = 'test-home/.claude/agent-deck/harness-runs'
+  const files = new Map<string, string>()
+  for (const id of ['run-slow', 'run-fast']) {
+    files.set(
+      `${root}/${id}/meta.json`,
+      JSON.stringify({ id, harness: 'copilot', name: 'Copilot', color: '#8957E5', parser: 'copilot', title: id, cwd: 'project', sessionId: 'sid-concurrent', startedAt: start - 3000 }),
+    )
+    files.set(`${root}/${id}/exit.txt`, id === 'run-slow' ? '1' : '0')
+    files.set(`${root}/${id}/events.jsonl`, id === 'run-slow' ? '{"type":"result","exitCode":1}\n' : '{"type":"assistant.message","data":{"content":"ok"}}\n')
+    files.set(`${root}/${id}/stderr.log`, id === 'run-slow' ? 'slow error\n' : '')
+  }
+  const key = (p: string) => {
+    const path = p.replace(/\\/g, '/')
+    return path.slice(Math.max(0, path.indexOf(root)))
+  }
+  on('fs.list', (_$, e) => ({
+    value: key(e.path).endsWith(root)
+      ? ['run-slow', 'run-fast'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))
+      : [],
+  }))
+  on('fs.read', (_$, e) => {
+    const text = files.get(key(e.path))
+    return text === undefined ? { deny: 'not found' } : { value: text }
+  })
+  on('fs.exists', (_$, e) => ({ value: files.has(key(e.path)) }))
+  on('fs.write', (_$, e) => {
+    files.set(key(e.path), e.text)
+    return { value: undefined }
+  })
+  let releaseSlow!: () => void
+  const submits: string[] = []
+  on('prompt.submit', async (_$, e) => {
+    submits.push(e.text)
+    if (e.text.includes('run-slow')) await new Promise<void>(r => { releaseSlow = r })
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 6; i++) await clock.advance(500)
+
+  // While run-slow is still waiting in prompt.submit, run-fast has already been submitted and stamped as delivered.
+  expect(submits.length).toBe(2)
+  expect(files.get(`${root}/run-fast/delivered.txt`)).toMatch(/^\d+$/)
+  expect(files.get(`${root}/run-slow/delivered.txt`)).toMatch(/^claim \S+ \d+$/)
+
+  // Once run-slow finishes prompt.submit, its delivered.txt becomes a timestamp too.
+  releaseSlow()
+  for (let i = 0; i < 4; i++) await clock.advance(500)
+  expect(files.get(`${root}/run-slow/delivered.txt`)).toMatch(/^\d+$/)
+  expect(submits.length).toBe(2)
 })
