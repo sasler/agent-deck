@@ -1,9 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, ToolSpec } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderInput, ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CacheState, CodexBin, CodexLimitSource, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, AgyView, CacheState, CodexBin, CodexLimitSource, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, SettingsSection, TaskRoute, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
+  AGY_VIEWS,
+  effortLabel,
+  shownWindows,
   CARD_STALE_MS,
   METER_PROVIDERS,
   cardModelName,
@@ -96,6 +99,9 @@ const tick = atom({ plugin: 'agent-deck', key: 'tick' } as const, 0)
 const cacheAtom = atom({ plugin: 'agent-deck', key: 'cache' } as const, freshCache())
 const harnessesAtom = atom({ plugin: 'agent-deck', key: 'harnesses' } as const, [] as Harness[])
 const viewAtom = atom({ plugin: 'agent-deck', key: 'harnessView' } as const, { mode: 'cards' } as HarnessView)
+const settingsSectionAtom = atom({ plugin: 'agent-deck', key: 'settingsSection' } as const, 'harnesses' as SettingsSection)
+const settingsInlineAtom = atom({ plugin: 'agent-deck', key: 'settingsInline' } as const, false)
+const taskDraftAtom = atom({ plugin: 'agent-deck', key: 'taskDraft' } as const, '')
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
@@ -1526,7 +1532,8 @@ async function loadMeters($: $T) {
   const mode = o.mode === 'session' || o.mode === 'selected' ? o.mode : 'all'
   const valid = METER_PROVIDERS.map(m => m.id)
   const selected = Array.isArray(o.selected) ? o.selected.filter(x => valid.includes(x)) : DEFAULT_METERS.selected
-  await update($, metersAtom, () => ({ mode, selected, ...(o.isCollapsed === true ? { isCollapsed: true } : {}) }))
+  const agyView = AGY_VIEWS.find(v => v.value === o.agyView)?.value
+  await update($, metersAtom, () => ({ mode, selected, ...(o.isCollapsed === true ? { isCollapsed: true } : {}), ...(agyView ? { agyView } : {}) }))
 }
 
 async function saveMeters($: $T, choice: MeterChoice) {
@@ -2209,6 +2216,930 @@ async function routingCommand($: $T, word: string | undefined): Promise<string> 
 
 // ---------- the module ----------
 
+// ---------- settings: their own pane, or the main pane where a second one can't open ----------
+
+const SETTINGS_PANE = 'agent-deck-settings'
+const SETTINGS_TITLE = 'Agent Deck settings'
+
+/** Opens settings in their own pane, beside the deck; where no second pane opens, the main pane draws them instead. */
+const openSettings = async ($: $T) => {
+  await update($, viewAtom, () => ({ mode: 'list' }))
+  const opened = await $.ui.open({ id: SETTINGS_PANE, title: SETTINGS_TITLE, focus: true, closeOnEscape: true }).catch(() => undefined)
+  const isPlaced = opened?.isPlaced === true
+  // An open that waits undrawn would pop up later on its own: settings draw in the main pane now instead.
+  if (!isPlaced) await $.ui.close({ id: SETTINGS_PANE }).catch(() => undefined)
+  await update($, settingsInlineAtom, () => !isPlaced)
+  void refreshRoutedModels($)
+}
+
+/** Done: back to the deck, closing the settings pane when they have one. */
+const closeSettings = async ($: $T) => {
+  const isInline = await read($, settingsInlineAtom)
+  await update($, viewAtom, () => ({ mode: 'cards' }))
+  await update($, settingsInlineAtom, () => false)
+  if (!isInline) await $.ui.close({ id: SETTINGS_PANE }).catch(() => undefined)
+}
+
+/** Which providers this session used, and which have a reading to show: Codex only while its built-in mode is on. */
+const meterReadings = (list: readonly AgentCard[], hs: readonly Harness[], lim: Limits, isCodexOn: boolean) => {
+  const presetOf = (id?: string) => hs.find(x => x.id === id)?.preset
+  const used = new Set<MeterProvider>(['claude'])
+  for (const c of list) {
+    if (c.provider === 'codex' || presetOf(c.harness) === 'codex-cli') used.add('codex')
+    if (presetOf(c.harness) === 'copilot') used.add('copilot')
+    if (hs.find(x => x.id === c.harness)?.parser === 'antigravity') used.add('antigravity')
+  }
+  const hasReading: Record<MeterProvider, boolean> = {
+    claude: lim.claude.length > 0,
+    codex: isCodexOn && lim.codex.length > 0,
+    copilot: (lim.copilot ?? []).length > 0,
+    antigravity: (lim.antigravity ?? []).length > 0,
+  }
+  return { used, hasReading }
+}
+
+const SETTINGS_TABS: readonly { value: SettingsSection; label: string }[] = [
+  { value: 'harnesses', label: 'Harnesses' },
+  { value: 'routing', label: 'Task routing' },
+  { value: 'meters', label: 'Usage meters' },
+  { value: 'codex', label: 'Codex' },
+]
+
+/** What each Antigravity view shows, under its picker in Usage meters. */
+const AGY_VIEW_NOTES: Record<AgyView, string> = {
+  basic: "Gemini's 5-hour and weekly limits.",
+  gemini: "Gemini's limits and Gemini 4 Argon's.",
+  all: 'Every Antigravity limit, Claude & GPT too.',
+}
+
+/** A settings card: a quiet round border around one thing. */
+const CARD = { flexDirection: 'column', borderStyle: 'round', borderColor: 'subtle', paddingX: 1 } as const
+
+/**
+ * Draws settings: a header with Done, a tab per section, and the section; or the form that adds or
+ * edits a harness. `isInline`: drawn in the main pane, because a second pane could not open.
+ */
+const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean): Promise<RenderElement> => {
+  const ui = $.ui.resolve(e)
+  const { Box, Text, Button } = ui
+  // Mobile draws no Select or Input yet: it keeps the buttons.
+  const Select = e.surface !== 'mobile' && 'Select' in ui ? ui.Select : undefined
+  const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
+  const list = await read($, agents)
+  const lim = await read($, limits)
+  const view = await read($, viewAtom)
+  const section = await read($, settingsSectionAtom)
+  const hs = await read($, harnessesAtom)
+  const found = await read($, foundAtom)
+  const codexBin = await read($, codexBinAtom)
+  const isCodexOn = await read($, codexAtom)
+  const meters = await read($, metersAtom)
+  const routingState = await read($, routingAtom)
+  const taskDraft = await read($, taskDraftAtom)
+  const { hasReading } = meterReadings(list, hs, lim, isCodexOn)
+  const cols = Math.max(24, e.props.bodyColumns || e.viewport?.columns || 60)
+  // A field's least width: it wraps to the next line below that, and never asks for more than a card holds.
+  const fieldMin = (n: number) => Math.max(8, Math.min(n, cols - 6))
+
+  const setView = (v: HarnessView) => update($, viewAtom, () => v)
+  const showSection = async (s: SettingsSection) => {
+    await update($, settingsSectionAtom, () => s)
+    await setView({ mode: 'list' })
+  }
+  const backToHarnesses = () => showSection('harnesses')
+
+  /** A section's title, a short line on what it is for, and a control at the right of the title. */
+  const sectionHead = (title: string, help: string, right?: RenderElement | false) => (
+    <Box flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Text bold>{title}</Text>
+        {right}
+      </Box>
+      <Text dimColor wrap="wrap">
+        {help}
+      </Text>
+    </Box>
+  )
+
+  /** A labelled field: the label above its control, a dim note under it. */
+  const fieldBox = (key: string, label: string, minWidth: number, control: RenderElement | false | undefined, note?: string) => (
+    <Box key={key} flexDirection="column" flexGrow={1} flexShrink={1} minWidth={fieldMin(minWidth)}>
+      <Text dimColor>{label}</Text>
+      {control}
+      {note && (
+        <Text dimColor wrap="truncate-end">
+          {note}
+        </Text>
+      )}
+    </Box>
+  )
+
+  const frame = (body: RenderElement, hasTabs: boolean) => (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Text bold>Settings</Text>
+        <Button key="h-done" label="Done" onPress={() => void closeSettings($)} />
+      </Box>
+      {hasTabs && (
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={0}>
+          {SETTINGS_TABS.map(t => (
+            <Button
+              key={`s-tab-${t.value}`}
+              label={t.label}
+              variant={t.value === section ? 'primary' : undefined}
+              dimColor={t.value !== section}
+              onPress={() => void showSection(t.value)}
+            />
+          ))}
+        </Box>
+      )}
+      {body}
+    </Box>
+  )
+
+  // ---- harnesses: the list, and the form that adds or edits one ----
+
+  const patchDraft = (fn: (d: Harness) => Harness) =>
+    update($, viewAtom, cur => (cur.mode === 'edit' ? { ...cur, draft: fn(cur.draft), error: undefined } : cur))
+  const parserLabel = (p: HarnessParser) => PARSERS.find(x => x.value === p)?.label ?? p
+  const showArgs = (words: string[]) => words.map(w => (/\s/.test(w) || !w ? `"${w}"` : w)).join(' ')
+
+  const harnessRow = (hr: Harness) => (
+    <Box key={`h-${hr.id}`} {...CARD}>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Box flexDirection="column" flexShrink={1} minWidth={0}>
+          <Text wrap="truncate-end">
+            <Text bold color={hr.color}>
+              ● {hr.name}
+            </Text>
+            <Text dimColor> {hr.id}</Text>
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            {[hr.command, parserLabel(hr.parser), hr.model ?? '', hr.provider ? `API ${hr.provider.baseUrl}` : ''].filter(Boolean).join(' · ')}
+          </Text>
+          {found[hr.id] === false && <Text color="warning">{hr.command} is not on PATH</Text>}
+        </Box>
+        <Box flexDirection="row" gap={1} flexShrink={0}>
+          <Button
+            key={`h-toggle-${hr.id}`}
+            label={hr.isEnabled ? 'On' : 'Off'}
+            variant={hr.isEnabled ? 'primary' : undefined}
+            onPress={() => void saveHarnesses($, hs.map(x => (x.id === hr.id ? { ...x, isEnabled: !x.isEnabled } : x)))}
+          />
+          {Input && <Button key={`h-edit-${hr.id}`} label="Edit" onPress={() => void openEdit({ ...hr }, hr.id)} />}
+        </Box>
+      </Box>
+    </Box>
+  )
+
+  const codexRow = (
+    <Box key="h-codex" {...CARD}>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Box flexDirection="column" flexShrink={1} minWidth={0}>
+          <Text wrap="truncate-end">
+            <Text bold color={CODEX_ACCENT}>
+              ● Codex
+            </Text>
+            <Text dimColor> built in</Text>
+          </Text>
+          <Text dimColor wrap="truncate-end">
+            {isCodexOn ? 'the codex tool · live view of every Codex run · usage meters' : 'off'}
+          </Text>
+          {found.codex === false && <Text color="warning">codex is not on PATH</Text>}
+        </Box>
+        <Box flexDirection="row" gap={1} flexShrink={0}>
+          <Button
+            key="cx-toggle"
+            label={isCodexOn ? 'On' : 'Off'}
+            variant={isCodexOn ? 'primary' : undefined}
+            onPress={() => void setCodexEnabled($, !isCodexOn)}
+          />
+          <Button key="cx-edit" label="Edit" onPress={() => void showSection('codex')} />
+        </Box>
+      </Box>
+    </Box>
+  )
+
+  const harnessesSection = () => (
+    <Box flexDirection="column" gap={1}>
+      {sectionHead('Harnesses', 'Coding agents Claude can start in the background with agent_run. Each run gets a live card in the deck.')}
+      {codexRow}
+      {hs.map(harnessRow)}
+      {hs.length === 0 && <Text dimColor>No other harness yet.</Text>}
+      {Select && Input ? (
+        <Box flexDirection="column">
+          <Select
+            key="h-add"
+            label="Add a harness"
+            options={[{ value: '', label: 'Choose a preset…' }, ...PRESETS.map(p => ({ value: p.id, label: p.name }))]}
+            value=""
+            onSelect={v => {
+              const p = PRESETS.find(x => x.id === v)
+              if (p) void openEdit(fromPreset(p, hs.map(h => h.id)))
+            }}
+          />
+          <Text dimColor wrap="wrap">
+            Edit a harness to pick its model from the ones it reports. Copilot and Claude Code can also run on your own API
+            key (BYOK): Edit → Model API, or add the Copilot (own API) preset.
+          </Text>
+        </Box>
+      ) : (
+        <Text dimColor wrap="wrap">
+          Adding and editing harnesses needs the desktop app or the terminal.
+        </Text>
+      )}
+    </Box>
+  )
+
+  const field = (key: string, label: string, value: string, set: (d: Harness, v: string) => Harness) =>
+    Input && (
+      <Input
+        key={key}
+        label={label}
+        value={value}
+        submitLabel="keep"
+        onInput={v => void patchDraft(d => set(d, v))}
+        onSubmit={v => void patchDraft(d => set(d, v))}
+      />
+    )
+
+  /** Where the CLI sends its model calls: its own service, or an API set here (BYOK). */
+  const providerSection = (d: Harness) => {
+    const types = providerTypesFor(d.parser)
+    if (!types.length || !Select) return undefined
+    const p = d.provider
+    const setP = (x: Harness, patch: Partial<HarnessProvider>): Harness => ({
+      ...x,
+      provider: { type: x.provider?.type ?? types[0]!, baseUrl: x.provider?.baseUrl ?? '', ...x.provider, ...patch },
+      // Another endpoint serves other models.
+      models: 'baseUrl' in patch || 'type' in patch ? undefined : x.models,
+    })
+    return (
+      <Box key="h-provider" flexDirection="column" gap={1}>
+        <Select
+          key="h-provider-type"
+          label="Model API"
+          options={[{ value: '', label: "The CLI's own service" }, ...PROVIDER_TYPES.filter(t => types.includes(t.value))]}
+          value={p?.type ?? ''}
+          onSelect={s =>
+            void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined, models: undefined }))
+          }
+        />
+        {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
+        {p && field('h-provider-key', 'API key', p.apiKey ?? '', (x, s) => setP(x, { apiKey: s }))}
+        {p && p.type !== 'anthropic' && d.parser === 'copilot' && (
+          <Select
+            key="h-provider-wire"
+            label="Wire format"
+            options={[
+              { value: 'completions', label: 'Chat Completions' },
+              { value: 'responses', label: 'Responses (GPT-5 series)' },
+            ]}
+            value={p.wireApi ?? 'completions'}
+            onSelect={s => void patchDraft(x => setP(x, { wireApi: s as HarnessProvider['wireApi'] }))}
+          />
+        )}
+        {p && d.parser === 'copilot' && (
+          <Box flexDirection="column" gap={1}>
+            {p.type === 'anthropic' && <Text dimColor wrap="wrap">Use the API root or its /v1 URL; Copilot adds /v1 to requests.</Text>}
+            {field('h-provider-model-id', 'Base model id (optional)', p.modelId ?? '', (x, s) => setP(x, { modelId: s }))}
+            {field('h-provider-wire-model', 'Deployment / wire model (optional)', p.wireModel ?? '', (x, s) => setP(x, { wireModel: s }))}
+            {p.type !== 'anthropic' && p.wireApi === 'responses' && (
+              <Select
+                key="h-provider-transport"
+                label="Responses transport"
+                options={[{ value: 'http', label: 'HTTP' }, { value: 'websockets', label: 'WebSockets' }]}
+                value={p.transport ?? 'http'}
+                onSelect={s => void patchDraft(x => setP(x, { transport: s as HarnessProvider['transport'] }))}
+              />
+            )}
+            <Text dimColor wrap="wrap">Leave these empty to use the selected model for both. For Azure or a fine-tune, give a known base model and the deployment name your API expects.</Text>
+          </Box>
+        )}
+        {p && (
+          <Text dimColor wrap="wrap">
+            {`The key is kept in agent-deck's settings as plain text and handed to the CLI as ${
+              d.parser === 'copilot' ? 'COPILOT_PROVIDER_API_KEY' : 'ANTHROPIC_API_KEY'
+            }; it is not written into run files.`}
+          </Text>
+        )}
+      </Box>
+    )
+  }
+
+  /** Asks the harness for its models; a fixed list fills in at once. */
+  const loadModels = async (d: Harness) => {
+    const how = modelQuery(d)
+    if (!how) return
+    // An answer that comes back after the form moved on to another harness or endpoint is dropped.
+    const isSame = (x: Harness) => x.parser === d.parser && x.command === d.command && x.provider?.baseUrl === d.provider?.baseUrl
+    const patchEdit = (fn: (cur: Extract<HarnessView, { mode: 'edit' }>) => HarnessView) =>
+      update($, viewAtom, cur => (cur.mode === 'edit' && isSame(cur.draft) ? fn(cur) : cur))
+    if ('models' in how) return patchEdit(cur => ({ ...cur, modelsState: undefined, draft: { ...cur.draft, models: how.models } }))
+    await patchEdit(cur => ({ ...cur, modelsState: 'loading' }))
+    const r = await queryModels($, how.query, d)
+    await patchEdit(cur =>
+      'error' in r
+        ? { ...cur, modelsState: { error: r.error } }
+        : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
+    )
+  }
+
+  /** Opens the edit form, asking for the harness's models right away when it has none yet. */
+  const openEdit = async (draft: Harness, originalId?: string) => {
+    await setView({ mode: 'edit', draft, originalId })
+    if (!draft.models?.length) await loadModels(draft)
+  }
+
+  const OTHER_MODEL = '__other__'
+
+  /**
+   * The model, as one control: a dropdown of what the harness reports (its default first,
+   * Other… last), or a text field where it reports nothing.
+   */
+  const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
+    const d = v.draft
+    const how = modelQuery(d)
+    const known: HarnessModel[] = d.models ?? []
+    const st = v.modelsState
+    const isLoading = st === 'loading'
+    const isCustom = !!d.model && !known.some(m => m.id === d.model)
+    const typed = (label: string) => field('h-model', label, d.model ?? '', (x, s) => ({ ...x, model: s }))
+    const refresh = (label: string) => (
+      <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
+    )
+    if (known.length && Select) {
+      const options = [
+        { value: '', label: "Default (the CLI's choice)" },
+        ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
+        { value: OTHER_MODEL, label: 'Other…' },
+      ]
+      const isTyping = v.isTypingModel || isCustom
+      return (
+        <Box key="h-models" flexDirection="column" gap={1}>
+          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+            <Select
+              key="h-model-pick"
+              label="Model"
+              options={options}
+              value={isTyping ? OTHER_MODEL : (d.model ?? '')}
+              onSelect={s =>
+                void update($, viewAtom, cur =>
+                  cur.mode !== 'edit'
+                    ? cur
+                    : s === OTHER_MODEL
+                      ? { ...cur, isTypingModel: true }
+                      : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
+                )
+              }
+            />
+            {isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻')}
+          </Box>
+          {isTyping && typed('Model id')}
+          {st && st !== 'loading' && (
+            <Text color="error" wrap="wrap">
+              {`Could not refresh the models: ${st.error}`}
+            </Text>
+          )}
+        </Box>
+      )
+    }
+    return (
+      <Box key="h-models" flexDirection="column" gap={1}>
+        {isLoading ? (
+          <Text>
+            Model <Text dimColor>· asking {d.provider?.baseUrl ? 'the API' : d.command || 'the CLI'} which models it has…</Text>
+          </Text>
+        ) : (
+          typed('Model')
+        )}
+        {!how && <Text dimColor wrap="wrap">This CLI can't list its models: type the id it takes, or leave it empty for its default.</Text>}
+        {how && st && st !== 'loading' && (
+          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+            <Text color="error" wrap="wrap">
+              {`Could not list models: ${st.error}`}
+            </Text>
+            {refresh('Try again')}
+          </Box>
+        )}
+        {how && !st && refresh('List models')}
+      </Box>
+    )
+  }
+
+  const editView = (v: Extract<HarnessView, { mode: 'edit' }>) => {
+    const d = v.draft
+    const preset = PRESETS.find(p => p.id === d.preset)
+    const others = hs.filter(h => h.id !== v.originalId)
+    const save = async () => {
+      const clean: Harness = {
+        ...d,
+        id: d.id.trim(),
+        name: d.name.trim(),
+        command: d.command.trim(),
+        args: d.args.trim(),
+        color: d.color.trim() || '#14B8A6',
+        model: d.model?.trim() || undefined,
+        autoTier: d.parser === 'copilot' && !d.provider ? d.autoTier?.trim() || undefined : undefined,
+        maxAiCredits: d.parser === 'copilot' ? d.maxAiCredits : undefined,
+        provider: d.provider && {
+          type: d.provider.type,
+          baseUrl: d.provider.baseUrl.trim().replace(/\/+$/, ''),
+          apiKey: d.provider.apiKey?.trim() || undefined,
+          wireApi: d.provider.type !== 'anthropic' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
+          transport: d.provider.type !== 'anthropic' && d.parser === 'copilot' && d.provider.wireApi === 'responses' ? d.provider.transport : undefined,
+          modelId: d.parser === 'copilot' ? d.provider.modelId?.trim() || undefined : undefined,
+          wireModel: d.parser === 'copilot' ? d.provider.wireModel?.trim() || undefined : undefined,
+        },
+      }
+      const error = harnessError(clean, others)
+      if (error) return setView({ ...v, error })
+      await saveHarnesses($, v.originalId ? hs.map(h => (h.id === v.originalId ? clean : h)) : [...hs, clean])
+      return backToHarnesses()
+    }
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text bold>
+          {v.originalId ? 'Edit' : 'Add'} <Text color={d.color}>● {d.name || 'harness'}</Text>
+        </Text>
+        {preset && (
+          <Text dimColor wrap="wrap">
+            {preset.note}
+          </Text>
+        )}
+        {field('h-name', 'Name', d.name, (x, s) => ({
+          ...x,
+          name: s,
+          // A new harness's id follows its name until the id is edited.
+          id: !v.originalId && (x.id === slugId(x.name) || !x.id) ? slugId(s) : x.id,
+        }))}
+        {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
+        {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
+        {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }))}
+        {Select && (
+          <Select
+            key="h-parser"
+            label="Output"
+            options={PARSERS}
+            value={d.parser}
+            onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser, models: undefined }))}
+          />
+        )}
+        {providerSection(d)}
+        {modelSection(v)}
+        {d.parser === 'copilot' && (
+          <Box key="h-copilot" flexDirection="column" gap={1}>
+            {!d.provider && Select && (
+              <Select
+                key="h-auto-tier"
+                label="Auto routing profile"
+                options={[
+                  { value: '', label: "CLI's default" },
+                  { value: 'efficiency', label: 'Efficiency' },
+                  { value: 'balance', label: 'Balance' },
+                  { value: 'intelligence', label: 'Intelligence' },
+                  { value: 'hydrafusion', label: 'Copilot Fusion Standard (preview)' },
+                  { value: 'hydrafusion-max', label: 'Copilot Fusion Max (preview)' },
+                  ...(d.autoTier && !['efficiency', 'balance', 'intelligence', 'hydrafusion', 'hydrafusion-max'].includes(d.autoTier) ? [{ value: d.autoTier, label: d.autoTier }] : []),
+                ]}
+                value={d.autoTier ?? ''}
+                onSelect={s => void patchDraft(x => ({ ...x, autoTier: s || undefined, model: s ? 'auto' : x.model }))}
+              />
+            )}
+            {field('h-max-credits', 'AI credit limit (optional, minimum 30)', d.maxAiCredits === undefined ? '' : String(d.maxAiCredits), (x, s) => ({ ...x, maxAiCredits: s.trim() ? Number(s) : undefined }))}
+            <Text dimColor wrap="wrap">Fusion availability depends on your CLI and account. Limits include subagents and may be exceeded by the final response; BYOK provider charges are separate.</Text>
+          </Box>
+        )}
+        {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
+        <Text dimColor wrap="wrap">
+          {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
+        </Text>
+        <Text dimColor wrap="wrap">
+          runs: <Text>{copilotOptionsError(d) ?? `${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', usageFile: '<run usage file>' }))}`}</Text>
+          {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
+        </Text>
+        {v.error && (
+          <Text color="error" wrap="wrap">
+            {v.error}
+          </Text>
+        )}
+        <Box flexDirection="row" gap={1} flexWrap="wrap">
+          <Button key="h-save" label="Save" variant="primary" onPress={() => void save()} />
+          <Button key="h-cancel" label="Cancel" onPress={() => void backToHarnesses()} />
+          {v.originalId && (
+            <Button
+              key="h-delete"
+              label="Delete"
+              onPress={() => {
+                void saveHarnesses($, hs.filter(h => h.id !== v.originalId)).then(() => backToHarnesses())
+              }}
+            />
+          )}
+        </Box>
+      </Box>
+    )
+  }
+
+  // ---- task routing: a card per kind of task, and the switch that tells Claude ----
+
+  const targetName = (t: string) =>
+    !t ? 'not set' : t === 'codex' ? 'Codex (built in)' : t === 'claude' ? 'Claude subagent' : (hs.find(h => h.id === t)?.name ?? t)
+
+  const setRoute = (task: string, patch: Partial<TaskRoute>) =>
+    saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
+
+  /** The route's model: a picker of what its agent reports, with ↻ to ask again, or a field to type the id. */
+  const routeModelField = (r: TaskRoute) => {
+    const target = hs.find(x => x.id === r.target)
+    const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
+    const defaultModel = r.target === 'codex' ? codexDefaults.model : target?.model
+    const how = target && modelQuery(target)
+    const canRefresh = r.target === 'codex' || (!!how && 'query' in how)
+    const refreshButton = canRefresh && (
+      <Button key={`r-refresh-${r.task}`} label="↻" plain dimColor onPress={() => void refreshRoutedModels($, { only: r.target, force: true })} />
+    )
+    const picked = known.find(k => k.value === r.model)
+    const note = r.model ? picked?.detail : defaultModel && r.target !== 'claude' ? `default: ${defaultModel}` : undefined
+    let control: RenderElement | undefined
+    if (Select && known.length) {
+      const options = [
+        { value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' },
+        ...known.map(k => ({ value: k.value, label: k.label })),
+        ...(r.model && !picked ? [{ value: r.model, label: r.model }] : []),
+      ]
+      control = (
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Select key={`r-model-${r.task}`} options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
+          </Box>
+          {refreshButton}
+        </Box>
+      )
+    } else if (Input) {
+      control = (
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Input
+              key={`r-model-${r.task}`}
+              value={r.model ?? ''}
+              placeholder={defaultModel ?? 'default'}
+              submitLabel="keep"
+              onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
+            />
+          </Box>
+          {refreshButton}
+        </Box>
+      )
+    }
+    return control && fieldBox(`r-f-model-${r.task}`, 'Model', 22, control, note)
+  }
+
+  /** The route's effort: the levels its agent takes, in sentence case, or a dim line where it takes none. */
+  const routeEffortField = (r: TaskRoute) => {
+    const choices = routeEffortChoices(r.target, hs.find(x => x.id === r.target))
+    if (!choices) return undefined
+    if ('reason' in choices) {
+      return fieldBox(
+        `r-f-effort-${r.task}`,
+        'Effort',
+        12,
+        <Text dimColor>No effort setting</Text>,
+        choices.reason,
+      )
+    }
+    if (!Select) return undefined
+    const options = [
+      { value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' },
+      ...choices.levels.map(l => ({ value: l, label: effortLabel(l) })),
+      ...(r.effort && !choices.levels.includes(r.effort) ? [{ value: r.effort, label: `${effortLabel(r.effort)} · not taken` }] : []),
+    ]
+    return fieldBox(
+      `r-f-effort-${r.task}`,
+      'Effort',
+      12,
+      <Select key={`r-effort-${r.task}`} options={options} value={r.effort ?? ''} onSelect={v => void setRoute(r.task, { effort: v || undefined })} />,
+    )
+  }
+
+  const routeCard = (r: TaskRoute) => {
+    const problem = routeProblem(r, hs, isCodexOn)
+    const hint = taskHint(r.task)
+    const targets = [
+      { value: '', label: 'Not set' },
+      { value: 'claude', label: 'Claude subagent' },
+      { value: 'codex', label: `Codex (built in)${isCodexOn ? '' : ' · off'}` },
+      ...hs.map(h => ({ value: h.id, label: `${h.name}${h.isEnabled ? '' : ' · off'}` })),
+      ...(r.target && r.target !== 'claude' && r.target !== 'codex' && !hs.some(h => h.id === r.target) ? [{ value: r.target, label: `${r.target} · missing` }] : []),
+    ]
+    return (
+      <Box key={`r-${r.task}`} {...CARD}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+          <Box flexDirection="row" columnGap={1} flexShrink={1} minWidth={0} overflow="hidden">
+            <Text bold>{r.task}</Text>
+            {hint && (
+              <Text dimColor wrap="truncate-end">
+                {hint}
+              </Text>
+            )}
+          </Box>
+          {Select && (
+            <Button
+              key={`r-remove-${r.task}`}
+              label="Remove"
+              plain
+              dimColor
+              onPress={() => void saveRouting($, { ...routingState, routes: routingState.routes.filter(x => x.task !== r.task) })}
+            />
+          )}
+        </Box>
+        {Select ? (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2} rowGap={0}>
+            {fieldBox(
+              `r-f-agent-${r.task}`,
+              'Agent',
+              16,
+              <Select
+                key={`r-target-${r.task}`}
+                options={targets}
+                value={r.target}
+                onSelect={v => void setRoute(r.task, { target: v, model: undefined, effort: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))}
+              />,
+              r.target ? undefined : 'Pick one to choose its model and effort.',
+            )}
+            {r.target ? routeModelField(r) : undefined}
+            {r.target ? routeEffortField(r) : undefined}
+          </Box>
+        ) : (
+          <Text dimColor wrap="wrap">{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}${r.effort ? ` · effort ${effortLabel(r.effort)}` : ''}`}</Text>
+        )}
+        {problem && <Text color="warning" wrap="wrap">{`Can't run: ${problem}.`}</Text>}
+      </Box>
+    )
+  }
+
+  const addTask = (text: string) => {
+    const task = taskSlug(text)
+    if (!task || routingState.routes.some(r => r.task === task)) return
+    void saveRouting($, { ...routingState, routes: [...routingState.routes, { task, target: '' }] }).then(() => update($, taskDraftAtom, () => ''))
+  }
+
+  const routingSection = () => {
+    const isOn = routingState.isOn
+    const missing = DEFAULT_TASKS.filter(t => !routingState.routes.some(r => r.task === t.task))
+    return (
+      <Box flexDirection="column" gap={1}>
+        {sectionHead(
+          'Task routing',
+          'Who does each kind of work: an agent, its model and its effort per task.',
+          <Button key="r-toggle" label={isOn ? 'On' : 'Off'} variant={isOn ? 'primary' : undefined} onPress={() => void saveRouting($, { ...routingState, isOn: !isOn })} />,
+        )}
+        <Text dimColor wrap="wrap">
+          {isOn
+            ? 'On: Claude hands each kind of task to the agent you pick here, and keeps quick questions and small edits itself. Changes reach Claude with your next message.'
+            : 'Off: Claude places work as usual. Pick an agent for each kind of task, then switch this on, here or with /agent-deck routing on.'}
+        </Text>
+        {routingState.routes.map(routeCard)}
+        {routingState.routes.length === 0 && <Text dimColor>No tasks yet.</Text>}
+        {Input && (
+          <Box flexDirection="row" columnGap={1} alignItems="center">
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Input
+                key="r-add"
+                value={taskDraft}
+                placeholder="Add a task, for example tests or docs"
+                submitLabel="add"
+                onInput={v => void update($, taskDraftAtom, () => v)}
+                onSubmit={v => addTask(v)}
+              />
+            </Box>
+            <Button key="r-add-button" label="Add" onPress={() => addTask(taskDraft)} />
+          </Box>
+        )}
+        {Select && missing.length > 0 && (
+          <Button
+            key="r-defaults"
+            label={`Add back ${missing.map(t => t.task).join(', ')}`}
+            plain
+            dimColor
+            onPress={() => void saveRouting($, { ...routingState, routes: [...routingState.routes, ...missing.map(t => ({ task: t.task, target: '' }))] })}
+          />
+        )}
+      </Box>
+    )
+  }
+
+  // ---- usage meters: which providers show, and how many Antigravity windows ----
+
+  const METER_MODES: { value: MeterChoice['mode']; label: string }[] = [
+    { value: 'all', label: 'All connected' },
+    { value: 'session', label: 'Used in this session' },
+    { value: 'selected', label: 'Selected' },
+  ]
+  const meterNote = (id: MeterProvider): string => {
+    if (id === 'claude') return 'this session.'
+    if (id === 'antigravity') return hasReading.antigravity ? 'read from agy, as /usage shows them.' : 'needs an Antigravity harness switched on, and agy signed in.'
+    if (id === 'codex') return isCodexOn ? 'read live from the Codex CLI, falling back to its last session file.' : 'needs the built-in Codex on.'
+    return hasReading.copilot ? 'AI credits via gh.' : 'needs the GitHub CLI (gh) signed in to an account with Copilot.'
+  }
+  const agyView = meters.agyView ?? 'basic'
+
+  const metersSection = () => (
+    <Box flexDirection="column" gap={1}>
+      {sectionHead('Usage meters', "Which providers' limits show in the deck, and how many of Antigravity's.")}
+      <Box {...CARD}>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2} rowGap={0}>
+          {fieldBox(
+            'm-f-mode',
+            'Show',
+            20,
+            Select ? (
+              <Select key="m-mode" options={METER_MODES} value={meters.mode} onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })} />
+            ) : (
+              <Text>{METER_MODES.find(m => m.value === meters.mode)?.label ?? meters.mode}</Text>
+            ),
+          )}
+          {fieldBox(
+            'm-f-agy',
+            'Antigravity',
+            20,
+            Select ? (
+              <Select key="m-agy-view" options={AGY_VIEWS} value={agyView} onSelect={v => void saveMeters($, { ...meters, agyView: v as AgyView })} />
+            ) : (
+              <Text>{AGY_VIEWS.find(v => v.value === agyView)?.label ?? agyView}</Text>
+            ),
+            AGY_VIEW_NOTES[agyView],
+          )}
+        </Box>
+        {meters.mode === 'selected' && (
+          <Box flexDirection="row" gap={1} flexWrap="wrap" marginTop={1}>
+            {METER_PROVIDERS.map(({ id: x, name }) => {
+              const isOn = meters.selected.includes(x)
+              return (
+                <Button
+                  key={`m-${x}`}
+                  label={`${name} ${isOn ? '✓' : '·'}`}
+                  variant={isOn ? 'primary' : undefined}
+                  onPress={() => void saveMeters($, { ...meters, selected: isOn ? meters.selected.filter(y => y !== x) : [...meters.selected, x] })}
+                />
+              )
+            })}
+          </Box>
+        )}
+      </Box>
+      <Box {...CARD}>
+        {METER_PROVIDERS.map(({ id, name }) => (
+          <Text key={`m-note-${id}`} wrap="wrap">
+            <Text bold>{name}</Text>
+            <Text dimColor>{`: ${meterNote(id)}`}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Text dimColor wrap="wrap">
+        The Usage limits header in the deck switches between these views too, folds the meters into one line, and refreshes
+        them. The Antigravity title there switches its view.
+      </Text>
+    </Box>
+  )
+
+  // ---- Codex: built in, a custom harness, or off; and which CLI runs start with ----
+
+  const codexHarnesses = hs.filter(x => x.preset === 'codex-cli')
+  const codexMode = isCodexOn ? 'builtin' : codexHarnesses.some(x => x.isEnabled) ? 'custom' : 'off'
+
+  const pickCodexMode = async (mode: string) => {
+    if (mode === 'builtin' || mode === 'off') {
+      if (codexHarnesses.some(x => x.isEnabled)) {
+        await saveHarnesses($, hs.map(x => (x.preset === 'codex-cli' ? { ...x, isEnabled: false } : x)))
+      }
+      await setCodexEnabled($, mode === 'builtin')
+      return
+    }
+    await setCodexEnabled($, false)
+    const existing = codexHarnesses[0]
+    if (existing) {
+      await saveHarnesses($, hs.map(x => (x.id === existing.id ? { ...x, isEnabled: true } : x)))
+      return openEdit({ ...existing, isEnabled: true }, existing.id)
+    }
+    const preset = PRESETS.find(x => x.id === 'codex-cli')
+    if (preset) return openEdit(fromPreset(preset, hs.map(x => x.id)))
+  }
+
+  /** Which Codex CLI runs start with: the newest found, or a path set here or in CODEX_PATH. */
+  const codexBinSection = () => {
+    const b = codexBin
+    const note = codexUpdateNote(b.chosen, b.latest)
+    const others = (b.candidates ?? []).filter(c => c.path !== b.chosen?.path)
+    return (
+      <Box flexDirection="column">
+        <Text bold>Codex CLI</Text>
+        {b.at === undefined && !b.isChecking && <Text dimColor>Not checked yet. Look for Codex to see which one runs start with.</Text>}
+        {b.chosen && (
+          <Text wrap="wrap">
+            Runs start with codex-cli {b.chosen.version} · {b.chosen.path}
+            {b.override ? ' (set by hand)' : ' (the newest found)'}
+          </Text>
+        )}
+        {b.at !== undefined && !b.chosen && (
+          <Text color="error" wrap="wrap">
+            {b.override
+              ? `The Codex set by hand (${b.override}) does not run: ${b.candidates?.[0]?.error ?? 'unknown error'}`
+              : `No Codex CLI found. Install it with: ${CODEX_UPDATE_COMMAND}`}
+          </Text>
+        )}
+        {note && (
+          <Text color="warning" wrap="wrap">
+            {note}
+          </Text>
+        )}
+        {b.latest && !note && b.chosen && <Text dimColor>That is the newest published version.</Text>}
+        {b.updateError && (
+          <Text color="error" wrap="wrap">
+            The update failed: {b.updateError}
+          </Text>
+        )}
+        {others.map(c => (
+          <Text key={`cx-c-${c.path}`} dimColor wrap="truncate-end">
+            also: {c.version ? `codex-cli ${c.version}` : c.error} · {c.path}
+          </Text>
+        ))}
+        {Input && (
+          <Input
+            key="cx-path"
+            label="Codex path (blank: the newest found; CODEX_PATH wins)"
+            value={b.override && !b.isEnvOverride ? b.override : ''}
+            submitLabel="save"
+            onSubmit={v =>
+              void (async () => {
+                await $.store.set(KEY_CODEX_PATH, v.trim())
+                await findCodex($, { force: true })
+              })()
+            }
+          />
+        )}
+        <Box flexDirection="row" gap={1}>
+          <Button key="cx-find" label={b.isChecking && !b.isUpdating ? 'Looking…' : 'Look again'} onPress={() => void findCodex($, { force: true })} />
+          <Button
+            key="cx-update"
+            label={b.isUpdating ? 'Updating…' : 'Update Codex (npm)'}
+            variant={note ? 'primary' : undefined}
+            onPress={() => void findCodex($, { update: true })}
+          />
+        </Box>
+      </Box>
+    )
+  }
+
+  const codexSection = () => (
+    <Box flexDirection="column" gap={1}>
+      {sectionHead('Codex', 'How Codex runs, and which Codex CLI it starts.')}
+      <Box {...CARD}>
+        {Select && (
+          <Select
+            key="cx-mode"
+            label="Runs as"
+            options={[
+              { value: 'builtin', label: 'Built in' },
+              { value: 'custom', label: 'Custom harness' },
+              { value: 'off', label: 'Off' },
+            ]}
+            value={codexMode}
+            onSelect={v => void pickCodexMode(v)}
+          />
+        )}
+        <Text dimColor wrap="wrap">
+          Built in: the codex tool (model, effort, sandbox, resume), a live card for every Codex run, also ones started in a
+          terminal or the Codex app, and Codex usage meters.
+        </Text>
+        <Text dimColor wrap="wrap">
+          Custom harness: Codex runs through agent_run like the other harnesses, with a command and arguments you edit.
+          Only its own runs get cards, and there are no usage meters.
+        </Text>
+      </Box>
+      <Box {...CARD}>{codexBinSection()}</Box>
+    </Box>
+  )
+
+  // A settings view that fails to draw says why and keeps a way back, not a blank pane.
+  const orBack = (draw: () => RenderElement): RenderElement => {
+    try {
+      return draw()
+    } catch (err) {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="error" wrap="wrap">{`agent-deck could not draw this view: ${String((err as Error)?.message ?? err)}`}</Text>
+          <Button key="h-recover" label="Back to agents" onPress={() => void closeSettings($)} />
+        </Box>
+      )
+    }
+  }
+  if (view.mode === 'edit') return orBack(() => frame(editView(view), false))
+  if (section === 'codex' && codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
+  return orBack(() =>
+    frame(section === 'routing' ? routingSection() : section === 'meters' ? metersSection() : section === 'codex' ? codexSection() : harnessesSection(), true),
+  )
+}
+
+
 export const register: Register = on => {
   // ---- the main conversation's prompt cache ----
 
@@ -2652,12 +3583,11 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const view = await read($, viewAtom)
     const hs = await read($, harnessesAtom)
-    const found = await read($, foundAtom)
-    const codexBin = await read($, codexBinAtom)
     const isCodexOn = await read($, codexAtom)
     const meters = await read($, metersAtom)
     const routingState = await read($, routingAtom)
-    const Input = e.surface !== 'mobile' && 'Input' in ui ? ui.Input : undefined
+    // Where settings could not open a pane of their own, this pane draws them until Done.
+    if (view.mode !== 'cards' && (await read($, settingsInlineAtom))) return renderSettings($, e, true)
     // Surfaces that draw SVG get thick bars; the terminal keeps its text meters.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
     // The body's own width: the viewport is the whole window, wider than a docked pane.
@@ -2712,44 +3642,58 @@ export const register: Register = on => {
     const bar = (key: string, percent: number, fill: string) =>
       Svg && <Svg key={key} source={barSvg(percent, fill)} alt={`${Math.round(percent)}% used`} height={6} />
 
-    const limitBars = (name: string, color: string, ws: LimitWindow[], extra?: string) => (
-      <Box key={`lim-${name}`} flexDirection="column" marginBottom={1}>
+    const limitBars = (name: string, color: string, ws: LimitWindow[], extra?: string, control?: RenderElement, empty = 'no reading yet') => {
+      const title = (
         <Text wrap="wrap">
           <Text bold color={color}>
             {name}
           </Text>
           {extra && <Text dimColor> · {extra}</Text>}
         </Text>
-        {ws.length === 0 && <Text dimColor>no reading yet</Text>}
-        {ws.map(w => {
-          const isPast = isResetPast(w, now)
-          return (
-            <Box key={`${name}-${w.label}`} flexDirection="column">
-              <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
-                <Text wrap="truncate-end">{windowName(w)}</Text>
-                <Box flexDirection="row" columnGap={1} flexShrink={0}>
-                  {w.resetsAt !== undefined && <Text dimColor={!isPast} color={isPast ? 'warning' : undefined}>{resetNote(w, now)}</Text>}
-                  <Text bold color={isPast ? undefined : limitColor(w.percent)} dimColor={isPast}>
-                    {`${Math.round(w.percent)}%`}
-                  </Text>
-                </Box>
+      )
+      return (
+        <Box key={`lim-${name}`} flexDirection="column" marginBottom={1}>
+          {control ? (
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+              <Box flexShrink={1} minWidth={0}>
+                {title}
               </Box>
-              {bar(`${name}-${w.label}-bar`, w.percent, isPast ? '#8B949E' : SVG_COLORS[limitColor(w.percent)])}
+              <Box flexShrink={0}>{control}</Box>
             </Box>
-          )
-        })}
-      </Box>
-    )
+          ) : (
+            title
+          )}
+          {ws.length === 0 && <Text dimColor>{empty}</Text>}
+          {ws.map(w => {
+            const isPast = isResetPast(w, now)
+            return (
+              <Box key={`${name}-${w.label}`} flexDirection="column">
+                <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
+                  <Text wrap="truncate-end">{windowName(w)}</Text>
+                  <Box flexDirection="row" columnGap={1} flexShrink={0}>
+                    {w.resetsAt !== undefined && <Text dimColor={!isPast} color={isPast ? 'warning' : undefined}>{resetNote(w, now)}</Text>}
+                    <Text bold color={isPast ? undefined : limitColor(w.percent)} dimColor={isPast}>
+                      {`${Math.round(w.percent)}%`}
+                    </Text>
+                  </Box>
+                </Box>
+                {bar(`${name}-${w.label}-bar`, w.percent, isPast ? '#8B949E' : SVG_COLORS[limitColor(w.percent)])}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
 
     /** A provider's meters, with how old the reading is once that matters. */
-    const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string) => {
+    const limitRow = (p: MeterProvider, name: string, color: string, ws: LimitWindow[], plan?: string, control?: RenderElement, empty?: string) => {
       const hasPast = ws.some(w => isResetPast(w, now))
       const isCodexFallback = p === 'codex' && lim.codexSource === 'rollout'
       const extra =
         [plan, isCodexFallback ? 'from last session' : undefined, readingAge(lim.readAt?.[p], now, hasPast)].filter(Boolean).join(' · ') || undefined
       return (
         <Box key={`lim-row-${p}`} flexDirection="column">
-          {Svg ? limitBars(name, color, ws, extra) : limitText(name, color, ws, extra)}
+          {Svg ? limitBars(name, color, ws, extra, control, empty) : limitText(name, color, ws, extra, control, empty)}
           {isCodexFallback && hasPast && (
             <Text dimColor wrap="wrap">
               Could not read Codex's limits live, so this is from its last session file. Press Refresh to try again, or run Codex.
@@ -2759,13 +3703,14 @@ export const register: Register = on => {
       )
     }
 
-    const limitText = (name: string, color: string, ws: LimitWindow[], extra?: string) =>
+    const limitText = (name: string, color: string, ws: LimitWindow[], extra?: string, control?: RenderElement, empty = 'no reading yet') =>
       (isSideBySide && ws.length <= maxWindows) || ws.length === 0 ? (
         <Box key={`lim-${name}`} flexDirection="row" columnGap={2}>
           {nameCell(name, color, true)}
-          {ws.length === 0 && <Text dimColor>no reading yet</Text>}
+          {ws.length === 0 && <Text dimColor>{empty}</Text>}
           {ws.map(w => limitWindow(name, w))}
           {extra && <Text dimColor>{extra}</Text>}
+          {control}
         </Box>
       ) : (
         <Box key={`lim-${name}`} flexDirection="column">
@@ -2774,6 +3719,7 @@ export const register: Register = on => {
               {nameCell(name, color, i === 0)}
               {limitWindow(name, w)}
               {i === ws.length - 1 && extra && <Text dimColor>{extra}</Text>}
+              {i === 0 && control}
             </Box>
           ))}
         </Box>
@@ -3061,732 +4007,9 @@ export const register: Register = on => {
       )
     }
 
-    // ---- harnesses: the list, and the form that adds or edits one ----
-
-    const setView = (v: HarnessView) => update($, viewAtom, () => v)
-    const patchDraft = (fn: (d: Harness) => Harness) =>
-      update($, viewAtom, cur => (cur.mode === 'edit' ? { ...cur, draft: fn(cur.draft), error: undefined } : cur))
-    const parserLabel = (p: HarnessParser) => PARSERS.find(x => x.value === p)?.label ?? p
-    const showArgs = (words: string[]) => words.map(w => (/\s/.test(w) || !w ? `"${w}"` : w)).join(' ')
-
-    const harnessRow = (hr: Harness) => (
-      <Box key={`h-${hr.id}`} flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-        <Box flexDirection="column" flexShrink={1} minWidth={0}>
-          <Text wrap="truncate-end">
-            <Text bold color={hr.color}>
-              ● {hr.name}
-            </Text>
-            <Text dimColor> {hr.id}</Text>
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            {[hr.command, parserLabel(hr.parser), hr.model ?? '', hr.provider ? `API ${hr.provider.baseUrl}` : ''].filter(Boolean).join(' · ')}
-          </Text>
-          {found[hr.id] === false && <Text color="warning">{hr.command} is not on PATH</Text>}
-        </Box>
-        <Box flexDirection="row" gap={1} flexShrink={0}>
-          <Button
-            key={`h-toggle-${hr.id}`}
-            label={hr.isEnabled ? 'On' : 'Off'}
-            variant={hr.isEnabled ? 'primary' : undefined}
-            onPress={() => void saveHarnesses($, hs.map(x => (x.id === hr.id ? { ...x, isEnabled: !x.isEnabled } : x)))}
-          />
-          {Input && <Button key={`h-edit-${hr.id}`} label="Edit" onPress={() => void openEdit({ ...hr }, hr.id)} />}
-        </Box>
-      </Box>
-    )
-
-    const listView = () => (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text bold>Settings</Text>
-          <Button key="h-done" label="Done" onPress={() => void setView({ mode: 'cards' })} />
-        </Box>
-        <Text dimColor wrap="wrap">
-          Coding agents Claude can start in the background with agent_run. Each run gets a live card here.
-        </Text>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-          <Box flexDirection="column" flexShrink={1} minWidth={0}>
-            <Text wrap="truncate-end">
-              <Text bold color={CODEX_ACCENT}>
-                ● Codex
-              </Text>
-              <Text dimColor> built in</Text>
-            </Text>
-            <Text dimColor wrap="truncate-end">
-              {isCodexOn ? 'the codex tool · live view of every Codex run · usage meters' : 'off'}
-            </Text>
-            {found.codex === false && <Text color="warning">codex is not on PATH</Text>}
-          </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Button
-              key="cx-toggle"
-              label={isCodexOn ? 'On' : 'Off'}
-              variant={isCodexOn ? 'primary' : undefined}
-              onPress={() => void setCodexEnabled($, !isCodexOn)}
-            />
-            {Select && <Button key="cx-edit" label="Edit" onPress={() => void setView({ mode: 'codex' })} />}
-          </Box>
-        </Box>
-        {hs.map(harnessRow)}
-        {hs.length === 0 && <Text dimColor>No other harness yet.</Text>}
-        {Select && Input && (
-          <Text dimColor wrap="wrap">
-            Edit a harness to pick its model from the ones it reports. Copilot and Claude Code can also run on your own API
-            key (BYOK): Edit → Model API, or add the Copilot (own API) preset.
-          </Text>
-        )}
-        {Select && Input ? (
-          <Select
-            key="h-add"
-            label="Add"
-            options={[{ value: '', label: 'Choose a preset…' }, ...PRESETS.map(p => ({ value: p.id, label: p.name }))]}
-            value=""
-            onSelect={v => {
-              const p = PRESETS.find(x => x.id === v)
-              if (p) void openEdit(fromPreset(p, hs.map(h => h.id)))
-            }}
-          />
-        ) : (
-          <Text dimColor wrap="wrap">
-            Adding and editing harnesses needs the desktop app or the terminal.
-          </Text>
-        )}
-        {routingSection()}
-        {metersSection()}
-      </Box>
-    )
-
-    const field = (key: string, label: string, value: string, set: (d: Harness, v: string) => Harness) =>
-      Input && (
-        <Input
-          key={key}
-          label={label}
-          value={value}
-          submitLabel="keep"
-          onInput={v => void patchDraft(d => set(d, v))}
-          onSubmit={v => void patchDraft(d => set(d, v))}
-        />
-      )
-
-    /** Where the CLI sends its model calls: its own service, or an API set here (BYOK). */
-    const providerSection = (d: Harness) => {
-      const types = providerTypesFor(d.parser)
-      if (!types.length || !Select) return undefined
-      const p = d.provider
-      const setP = (x: Harness, patch: Partial<HarnessProvider>): Harness => ({
-        ...x,
-        provider: { type: x.provider?.type ?? types[0]!, baseUrl: x.provider?.baseUrl ?? '', ...x.provider, ...patch },
-        // Another endpoint serves other models.
-        models: 'baseUrl' in patch || 'type' in patch ? undefined : x.models,
-      })
-      return (
-        <Box key="h-provider" flexDirection="column" gap={1}>
-          <Select
-            key="h-provider-type"
-            label="Model API"
-            options={[{ value: '', label: "The CLI's own service" }, ...PROVIDER_TYPES.filter(t => types.includes(t.value))]}
-            value={p?.type ?? ''}
-            onSelect={s =>
-              void patchDraft(x => (s ? setP(x, { type: s as HarnessProvider['type'] }) : { ...x, provider: undefined, models: undefined }))
-            }
-          />
-          {p && field('h-provider-url', 'API base URL', p.baseUrl, (x, s) => setP(x, { baseUrl: s }))}
-          {p && field('h-provider-key', 'API key', p.apiKey ?? '', (x, s) => setP(x, { apiKey: s }))}
-          {p && p.type !== 'anthropic' && d.parser === 'copilot' && (
-            <Select
-              key="h-provider-wire"
-              label="Wire format"
-              options={[
-                { value: 'completions', label: 'Chat Completions' },
-                { value: 'responses', label: 'Responses (GPT-5 series)' },
-              ]}
-              value={p.wireApi ?? 'completions'}
-              onSelect={s => void patchDraft(x => setP(x, { wireApi: s as HarnessProvider['wireApi'] }))}
-            />
-          )}
-          {p && d.parser === 'copilot' && (
-            <Box flexDirection="column" gap={1}>
-              {p.type === 'anthropic' && <Text dimColor wrap="wrap">Use the API root or its /v1 URL; Copilot adds /v1 to requests.</Text>}
-              {field('h-provider-model-id', 'Base model id (optional)', p.modelId ?? '', (x, s) => setP(x, { modelId: s }))}
-              {field('h-provider-wire-model', 'Deployment / wire model (optional)', p.wireModel ?? '', (x, s) => setP(x, { wireModel: s }))}
-              {p.type !== 'anthropic' && p.wireApi === 'responses' && (
-                <Select
-                  key="h-provider-transport"
-                  label="Responses transport"
-                  options={[{ value: 'http', label: 'HTTP' }, { value: 'websockets', label: 'WebSockets' }]}
-                  value={p.transport ?? 'http'}
-                  onSelect={s => void patchDraft(x => setP(x, { transport: s as HarnessProvider['transport'] }))}
-                />
-              )}
-              <Text dimColor wrap="wrap">Leave these empty to use the selected model for both. For Azure or a fine-tune, give a known base model and the deployment name your API expects.</Text>
-            </Box>
-          )}
-          {p && (
-            <Text dimColor wrap="wrap">
-              {`The key is kept in agent-deck's settings as plain text and handed to the CLI as ${
-                d.parser === 'copilot' ? 'COPILOT_PROVIDER_API_KEY' : 'ANTHROPIC_API_KEY'
-              }; it is not written into run files.`}
-            </Text>
-          )}
-        </Box>
-      )
-    }
-
-    /** Asks the harness for its models; a fixed list fills in at once. */
-    const loadModels = async (d: Harness) => {
-      const how = modelQuery(d)
-      if (!how) return
-      // An answer that comes back after the form moved on to another harness or endpoint is dropped.
-      const isSame = (x: Harness) => x.parser === d.parser && x.command === d.command && x.provider?.baseUrl === d.provider?.baseUrl
-      const patchEdit = (fn: (cur: Extract<HarnessView, { mode: 'edit' }>) => HarnessView) =>
-        update($, viewAtom, cur => (cur.mode === 'edit' && isSame(cur.draft) ? fn(cur) : cur))
-      if ('models' in how) return patchEdit(cur => ({ ...cur, modelsState: undefined, draft: { ...cur.draft, models: how.models } }))
-      await patchEdit(cur => ({ ...cur, modelsState: 'loading' }))
-      const r = await queryModels($, how.query, d)
-      await patchEdit(cur =>
-        'error' in r
-          ? { ...cur, modelsState: { error: r.error } }
-          : { ...cur, modelsState: undefined, draft: { ...cur.draft, models: r.models } },
-      )
-    }
-
-    /** Opens the edit form, asking for the harness's models right away when it has none yet. */
-    const openEdit = async (draft: Harness, originalId?: string) => {
-      await setView({ mode: 'edit', draft, originalId })
-      if (!draft.models?.length) await loadModels(draft)
-    }
-
-    const OTHER_MODEL = '__other__'
-
-    /**
-     * The model, as one control: a dropdown of what the harness reports (its default first,
-     * Other… last), or a text field where it reports nothing.
-     */
-    const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
-      const d = v.draft
-      const how = modelQuery(d)
-      const known: HarnessModel[] = d.models ?? []
-      const st = v.modelsState
-      const isLoading = st === 'loading'
-      const isCustom = !!d.model && !known.some(m => m.id === d.model)
-      const typed = (label: string) => field('h-model', label, d.model ?? '', (x, s) => ({ ...x, model: s }))
-      const refresh = (label: string) => (
-        <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
-      )
-      if (known.length && Select) {
-        const options = [
-          { value: '', label: "Default (the CLI's choice)" },
-          ...known.map(m => ({ value: m.id, label: modelLabel(m) })),
-          { value: OTHER_MODEL, label: 'Other…' },
-        ]
-        const isTyping = v.isTypingModel || isCustom
-        return (
-          <Box key="h-models" flexDirection="column" gap={1}>
-            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-              <Select
-                key="h-model-pick"
-                label="Model"
-                options={options}
-                value={isTyping ? OTHER_MODEL : (d.model ?? '')}
-                onSelect={s =>
-                  void update($, viewAtom, cur =>
-                    cur.mode !== 'edit'
-                      ? cur
-                      : s === OTHER_MODEL
-                        ? { ...cur, isTypingModel: true }
-                        : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
-                  )
-                }
-              />
-              {isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻')}
-            </Box>
-            {isTyping && typed('Model id')}
-            {st && st !== 'loading' && (
-              <Text color="error" wrap="wrap">
-                {`Could not refresh the models: ${st.error}`}
-              </Text>
-            )}
-          </Box>
-        )
-      }
-      return (
-        <Box key="h-models" flexDirection="column" gap={1}>
-          {isLoading ? (
-            <Text>
-              Model <Text dimColor>· asking {d.provider?.baseUrl ? 'the API' : d.command || 'the CLI'} which models it has…</Text>
-            </Text>
-          ) : (
-            typed('Model')
-          )}
-          {!how && <Text dimColor wrap="wrap">This CLI can't list its models: type the id it takes, or leave it empty for its default.</Text>}
-          {how && st && st !== 'loading' && (
-            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-              <Text color="error" wrap="wrap">
-                {`Could not list models: ${st.error}`}
-              </Text>
-              {refresh('Try again')}
-            </Box>
-          )}
-          {how && !st && refresh('List models')}
-        </Box>
-      )
-    }
-
-    const editView = (v: Extract<HarnessView, { mode: 'edit' }>) => {
-      const d = v.draft
-      const preset = PRESETS.find(p => p.id === d.preset)
-      const others = hs.filter(h => h.id !== v.originalId)
-      const save = async () => {
-        const clean: Harness = {
-          ...d,
-          id: d.id.trim(),
-          name: d.name.trim(),
-          command: d.command.trim(),
-          args: d.args.trim(),
-          color: d.color.trim() || '#14B8A6',
-          model: d.model?.trim() || undefined,
-          autoTier: d.parser === 'copilot' && !d.provider ? d.autoTier?.trim() || undefined : undefined,
-          maxAiCredits: d.parser === 'copilot' ? d.maxAiCredits : undefined,
-          provider: d.provider && {
-            type: d.provider.type,
-            baseUrl: d.provider.baseUrl.trim().replace(/\/+$/, ''),
-            apiKey: d.provider.apiKey?.trim() || undefined,
-            wireApi: d.provider.type !== 'anthropic' && d.parser === 'copilot' ? d.provider.wireApi : undefined,
-            transport: d.provider.type !== 'anthropic' && d.parser === 'copilot' && d.provider.wireApi === 'responses' ? d.provider.transport : undefined,
-            modelId: d.parser === 'copilot' ? d.provider.modelId?.trim() || undefined : undefined,
-            wireModel: d.parser === 'copilot' ? d.provider.wireModel?.trim() || undefined : undefined,
-          },
-        }
-        const error = harnessError(clean, others)
-        if (error) return setView({ ...v, error })
-        await saveHarnesses($, v.originalId ? hs.map(h => (h.id === v.originalId ? clean : h)) : [...hs, clean])
-        return setView({ mode: 'list' })
-      }
-      return (
-        <Box flexDirection="column" gap={1}>
-          <Text bold>
-            {v.originalId ? 'Edit' : 'Add'} <Text color={d.color}>● {d.name || 'harness'}</Text>
-          </Text>
-          {preset && (
-            <Text dimColor wrap="wrap">
-              {preset.note}
-            </Text>
-          )}
-          {field('h-name', 'Name', d.name, (x, s) => ({
-            ...x,
-            name: s,
-            // A new harness's id follows its name until the id is edited.
-            id: !v.originalId && (x.id === slugId(x.name) || !x.id) ? slugId(s) : x.id,
-          }))}
-          {field('h-id', 'Id', d.id, (x, s) => ({ ...x, id: s }))}
-          {field('h-command', 'Command', d.command, (x, s) => ({ ...x, command: s }))}
-          {field('h-args', 'Arguments', d.args, (x, s) => ({ ...x, args: s }))}
-          {Select && (
-            <Select
-              key="h-parser"
-              label="Output"
-              options={PARSERS}
-              value={d.parser}
-              onSelect={s => void patchDraft(x => ({ ...x, parser: s as HarnessParser, models: undefined }))}
-            />
-          )}
-          {providerSection(d)}
-          {modelSection(v)}
-          {d.parser === 'copilot' && (
-            <Box key="h-copilot" flexDirection="column" gap={1}>
-              {!d.provider && Select && (
-                <Select
-                  key="h-auto-tier"
-                  label="Auto routing profile"
-                  options={[
-                    { value: '', label: "CLI's default" },
-                    { value: 'efficiency', label: 'Efficiency' },
-                    { value: 'balance', label: 'Balance' },
-                    { value: 'intelligence', label: 'Intelligence' },
-                    { value: 'hydrafusion', label: 'Copilot Fusion Standard (preview)' },
-                    { value: 'hydrafusion-max', label: 'Copilot Fusion Max (preview)' },
-                    ...(d.autoTier && !['efficiency', 'balance', 'intelligence', 'hydrafusion', 'hydrafusion-max'].includes(d.autoTier) ? [{ value: d.autoTier, label: d.autoTier }] : []),
-                  ]}
-                  value={d.autoTier ?? ''}
-                  onSelect={s => void patchDraft(x => ({ ...x, autoTier: s || undefined, model: s ? 'auto' : x.model }))}
-                />
-              )}
-              {field('h-max-credits', 'AI credit limit (optional, minimum 30)', d.maxAiCredits === undefined ? '' : String(d.maxAiCredits), (x, s) => ({ ...x, maxAiCredits: s.trim() ? Number(s) : undefined }))}
-              <Text dimColor wrap="wrap">Fusion availability depends on your CLI and account. Limits include subagents and may be exceeded by the final response; BYOK provider charges are separate.</Text>
-            </Box>
-          )}
-          {field('h-color', 'Color', d.color, (x, s) => ({ ...x, color: s }))}
-          <Text dimColor wrap="wrap">
-            {'{prompt} {model} {session} {cwd} are filled in; a flag whose value is empty is left out.'}
-          </Text>
-          <Text dimColor wrap="wrap">
-            runs: <Text>{copilotOptionsError(d) ?? `${d.command} ${showArgs(harnessArgs(d, { prompt: '<task>', usageFile: '<run usage file>' }))}`}</Text>
-            {d.provider?.baseUrl.trim() ? ` against ${d.provider.baseUrl.trim()}` : ''}
-          </Text>
-          {v.error && (
-            <Text color="error" wrap="wrap">
-              {v.error}
-            </Text>
-          )}
-          <Box flexDirection="row" gap={1} flexWrap="wrap">
-            <Button key="h-save" label="Save" variant="primary" onPress={() => void save()} />
-            <Button key="h-cancel" label="Cancel" onPress={() => void setView({ mode: 'list' })} />
-            {v.originalId && (
-              <Button
-                key="h-delete"
-                label="Delete"
-                onPress={() => {
-                  void saveHarnesses($, hs.filter(h => h.id !== v.originalId)).then(() => setView({ mode: 'list' }))
-                }}
-              />
-            )}
-          </Box>
-        </Box>
-      )
-    }
-
-    const presetOf = (id?: string) => hs.find(x => x.id === id)?.preset
-    const used = new Set<MeterProvider>(['claude'])
-    for (const c of list) {
-      if (c.provider === 'codex' || presetOf(c.harness) === 'codex-cli') used.add('codex')
-      if (presetOf(c.harness) === 'copilot') used.add('copilot')
-      if (hs.find(x => x.id === c.harness)?.parser === 'antigravity') used.add('antigravity')
-    }
-    // A provider shows only with a reading: Codex also only while its built-in mode is on.
-    const hasReading: Record<MeterProvider, boolean> = {
-      claude: lim.claude.length > 0,
-      codex: isCodexOn && lim.codex.length > 0,
-      copilot: (lim.copilot ?? []).length > 0,
-      antigravity: (lim.antigravity ?? []).length > 0,
-    }
+    const { used, hasReading } = meterReadings(list, hs, lim, isCodexOn)
     const shown = new Set(METER_PROVIDERS.map(m => m.id).filter(x => hasReading[x] && isMeterShown(meters, x, used)))
-    // ---- task routing: a target and model per kind of task, and the switch that tells Claude ----
 
-    const targetName = (t: string) =>
-      !t ? 'not set' : t === 'codex' ? 'Codex (built in)' : t === 'claude' ? 'Claude subagent' : (hs.find(h => h.id === t)?.name ?? t)
-
-    const setRoute = (task: string, patch: Partial<TaskRoute>) =>
-      saveRouting($, { ...routingState, routes: routingState.routes.map(r => (r.task === task ? { ...r, ...patch } : r)) })
-
-    /** The route's effort: the levels its agent takes, or why it takes none. */
-    const routeEffortPicker = (r: TaskRoute) => {
-      const choices = routeEffortChoices(r.target, hs.find(x => x.id === r.target))
-      if (!choices) return undefined
-      if ('reason' in choices) {
-        return (
-          <Text key={`r-effort-none-${r.task}`} dimColor wrap="wrap">
-            {choices.reason}
-          </Text>
-        )
-      }
-      if (!Select) return undefined
-      const options = [
-        { value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' },
-        ...choices.levels.map(l => ({ value: l, label: l })),
-        ...(r.effort && !choices.levels.includes(r.effort) ? [{ value: r.effort, label: `${r.effort} · not taken` }] : []),
-      ]
-      return <Select key={`r-effort-${r.task}`} label="Effort" options={options} value={r.effort ?? ''} onSelect={v => void setRoute(r.task, { effort: v || undefined })} />
-    }
-
-    const routeModel = (r: TaskRoute) => {
-      const target = hs.find(x => x.id === r.target)
-      const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
-      if (!r.target) return undefined
-      const defaultModel = r.target === 'codex' ? codexDefaults.model : target?.model
-      const canRefresh = r.target === 'codex' || (!!target && !!modelQuery(target) && 'query' in modelQuery(target)!)
-      const refreshButton = canRefresh && (
-        <Button key={`r-refresh-${r.task}`} label="↻" plain dimColor onPress={() => void refreshRoutedModels($, { only: r.target, force: true })} />
-      )
-      if (Select && known.length) {
-        const options = [
-          { value: '', label: r.target === 'claude' ? "Claude's choice" : `Default${defaultModel ? ` (${defaultModel})` : ''}` },
-          ...known,
-          ...(r.model && !known.some(k => k.value === r.model) ? [{ value: r.model, label: r.model }] : []),
-        ]
-        return (
-          <Box key={`r-models-${r.task}`} flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-            <Select key={`r-model-${r.task}`} label="Model" options={options} value={r.model ?? ''} onSelect={v => void setRoute(r.task, { model: v || undefined })} />
-            {refreshButton}
-          </Box>
-        )
-      }
-      return (
-        Input && (
-          <Input
-            key={`r-model-${r.task}`}
-            label="Model"
-            value={r.model ?? ''}
-            placeholder={defaultModel ?? 'default'}
-            submitLabel="keep"
-            onSubmit={v => void setRoute(r.task, { model: v.trim() || undefined })}
-          />
-        )
-      )
-    }
-
-    const routeRow = (r: TaskRoute) => {
-      const problem = routeProblem(r, hs, isCodexOn)
-      const hint = taskHint(r.task)
-      const targets = [
-        { value: '', label: 'Not set' },
-        { value: 'claude', label: 'Claude subagent' },
-        { value: 'codex', label: `Codex (built in)${isCodexOn ? '' : ' · off'}` },
-        ...hs.map(h => ({ value: h.id, label: `${h.name}${h.isEnabled ? '' : ' · off'}` })),
-        ...(r.target && r.target !== 'claude' && r.target !== 'codex' && !hs.some(h => h.id === r.target) ? [{ value: r.target, label: `${r.target} · missing` }] : []),
-      ]
-      return (
-        <Box key={`r-${r.task}`} flexDirection="column" gap={0}>
-          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-            <Text wrap="truncate-end">
-              <Text bold>{r.task}</Text>
-              {hint && <Text dimColor> {hint}</Text>}
-            </Text>
-            {Select && <Button key={`r-remove-${r.task}`} label="Remove" plain dimColor onPress={() => void saveRouting($, { ...routingState, routes: routingState.routes.filter(x => x.task !== r.task) })} />}
-          </Box>
-          {Select ? (
-            <Box flexDirection="column" gap={0}>
-              <Select key={`r-target-${r.task}`} label="Agent" options={targets} value={r.target} onSelect={v => void setRoute(r.task, { target: v, model: undefined, effort: undefined }).then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))} />
-              {routeModel(r)}
-              {routeEffortPicker(r)}
-            </Box>
-          ) : (
-            <Text dimColor>{`${targetName(r.target)}${r.model ? ` · ${r.model}` : ''}${r.effort ? ` · effort ${r.effort}` : ''}`}</Text>
-          )}
-          {problem && <Text color="warning">{`Can't run: ${problem}.`}</Text>}
-        </Box>
-      )
-    }
-
-    const routingSection = () => {
-      const isOn = routingState.isOn
-      const missing = DEFAULT_TASKS.filter(t => !routingState.routes.some(r => r.task === t.task))
-      return (
-        <Box flexDirection="column" gap={1} marginTop={1}>
-          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-            <Text bold>Task routing</Text>
-            <Button key="r-toggle" label={isOn ? 'On' : 'Off'} variant={isOn ? 'primary' : undefined} onPress={() => void saveRouting($, { ...routingState, isOn: !isOn })} />
-          </Box>
-          <Text dimColor wrap="wrap">
-            {isOn
-              ? 'On: Claude hands each kind of task to the agent you pick here, and keeps quick questions and small edits itself. Changes reach Claude with your next message.'
-              : 'Off: Claude places work as usual. Pick an agent for each kind of task, then switch this on, here or with /agent-deck routing on.'}
-          </Text>
-          {routingState.routes.map(routeRow)}
-          {routingState.routes.length === 0 && <Text dimColor>No tasks yet.</Text>}
-          {Input && (
-            <Input
-              key="r-add"
-              label="Add a task"
-              value=""
-              placeholder="for example tests or docs"
-              submitLabel="add"
-              onSubmit={v => {
-                const task = taskSlug(v)
-                if (task && !routingState.routes.some(r => r.task === task)) void saveRouting($, { ...routingState, routes: [...routingState.routes, { task, target: '' }] })
-              }}
-            />
-          )}
-          {Select && missing.length > 0 && (
-            <Button
-              key="r-defaults"
-              label={`Add back ${missing.map(t => t.task).join(', ')}`}
-              plain
-              dimColor
-              onPress={() => void saveRouting($, { ...routingState, routes: [...routingState.routes, ...missing.map(t => ({ task: t.task, target: '' }))] })}
-            />
-          )}
-        </Box>
-      )
-    }
-
-    const metersSection = () => (
-      <Box flexDirection="column" gap={1} marginTop={1}>
-        <Text bold>Usage meters</Text>
-        {Select ? (
-          <Select
-            key="m-mode"
-            label="Show"
-            options={[
-              { value: 'all', label: 'All connected' },
-              { value: 'session', label: 'Used in this session' },
-              { value: 'selected', label: 'Selected' },
-            ]}
-            value={meters.mode}
-            onSelect={v => void saveMeters($, { ...meters, mode: v as MeterChoice['mode'] })}
-          />
-        ) : (
-          <Text dimColor>{meters.mode === 'all' ? 'All connected' : meters.mode === 'session' ? 'Used in this session' : 'Selected'}</Text>
-        )}
-        {meters.mode === 'selected' && (
-          <Box flexDirection="row" gap={1} flexWrap="wrap">
-            {METER_PROVIDERS.map(({ id: x, name }) => {
-              const isOn = meters.selected.includes(x)
-              return (
-                <Button
-                  key={`m-${x}`}
-                  label={`${name} ${isOn ? '✓' : '·'}`}
-                  variant={isOn ? 'primary' : undefined}
-                  onPress={() =>
-                    void saveMeters($, { ...meters, selected: isOn ? meters.selected.filter(y => y !== x) : [...meters.selected, x] })
-                  }
-                />
-              )
-            })}
-          </Box>
-        )}
-        <Text dimColor wrap="wrap">
-          {METER_PROVIDERS.map(({ id }) => {
-            if (id === 'claude') return 'Claude: this session.'
-            if (id === 'antigravity') return hasReading.antigravity ? 'Antigravity: read from agy, as /usage shows them.' : 'Antigravity: needs an Antigravity harness switched on, and agy signed in.'
-            if (id === 'codex') return isCodexOn ? 'Codex: read live from the Codex CLI, falling back to its last session file.' : 'Codex: needs the built-in Codex on.'
-            return hasReading.copilot ? 'Copilot: AI credits via gh.' : 'Copilot: needs the GitHub CLI (gh) signed in to an account with Copilot.'
-          }).join(' ')}
-        </Text>
-        <Text dimColor wrap="wrap">
-          The Usage limits header in the main view switches between these views too, folds the meters into one line, and
-          refreshes them.
-        </Text>
-      </Box>
-    )
-
-    const codexHarnesses = hs.filter(x => x.preset === 'codex-cli')
-    const codexMode = isCodexOn ? 'builtin' : codexHarnesses.some(x => x.isEnabled) ? 'custom' : 'off'
-
-    const pickCodexMode = async (mode: string) => {
-      if (mode === 'builtin' || mode === 'off') {
-        if (codexHarnesses.some(x => x.isEnabled)) {
-          await saveHarnesses($, hs.map(x => (x.preset === 'codex-cli' ? { ...x, isEnabled: false } : x)))
-        }
-        await setCodexEnabled($, mode === 'builtin')
-        return setView({ mode: 'list' })
-      }
-      await setCodexEnabled($, false)
-      const existing = codexHarnesses[0]
-      if (existing) {
-        await saveHarnesses($, hs.map(x => (x.id === existing.id ? { ...x, isEnabled: true } : x)))
-        return openEdit({ ...existing, isEnabled: true }, existing.id)
-      }
-      const preset = PRESETS.find(x => x.id === 'codex-cli')
-      if (preset) return openEdit(fromPreset(preset, hs.map(x => x.id)))
-    }
-
-    /** Which Codex CLI runs start with: the newest found, or a path set here or in CODEX_PATH. */
-    const codexBinSection = () => {
-      const b = codexBin
-      const note = codexUpdateNote(b.chosen, b.latest)
-      const others = (b.candidates ?? []).filter(c => c.path !== b.chosen?.path)
-      return (
-        <Box flexDirection="column">
-          <Text bold>Codex CLI</Text>
-          {b.at === undefined && !b.isChecking && <Text dimColor>Not checked yet. Look for Codex to see which one runs start with.</Text>}
-          {b.chosen && (
-            <Text wrap="wrap">
-              Runs start with codex-cli {b.chosen.version} · {b.chosen.path}
-              {b.override ? ' (set by hand)' : ' (the newest found)'}
-            </Text>
-          )}
-          {b.at !== undefined && !b.chosen && (
-            <Text color="error" wrap="wrap">
-              {b.override
-                ? `The Codex set by hand (${b.override}) does not run: ${b.candidates?.[0]?.error ?? 'unknown error'}`
-                : `No Codex CLI found. Install it with: ${CODEX_UPDATE_COMMAND}`}
-            </Text>
-          )}
-          {note && (
-            <Text color="warning" wrap="wrap">
-              {note}
-            </Text>
-          )}
-          {b.latest && !note && b.chosen && <Text dimColor>That is the newest published version.</Text>}
-          {b.updateError && (
-            <Text color="error" wrap="wrap">
-              The update failed: {b.updateError}
-            </Text>
-          )}
-          {others.map(c => (
-            <Text key={`cx-c-${c.path}`} dimColor wrap="truncate-end">
-              also: {c.version ? `codex-cli ${c.version}` : c.error} · {c.path}
-            </Text>
-          ))}
-          {Input && (
-            <Input
-              key="cx-path"
-              label="Codex path (blank: the newest found; CODEX_PATH wins)"
-              value={b.override && !b.isEnvOverride ? b.override : ''}
-              submitLabel="save"
-              onSubmit={v =>
-                void (async () => {
-                  await $.store.set(KEY_CODEX_PATH, v.trim())
-                  await findCodex($, { force: true })
-                })()
-              }
-            />
-          )}
-          <Box flexDirection="row" gap={1}>
-            <Button key="cx-find" label={b.isChecking && !b.isUpdating ? 'Looking…' : 'Look again'} onPress={() => void findCodex($, { force: true })} />
-            <Button
-              key="cx-update"
-              label={b.isUpdating ? 'Updating…' : 'Update Codex (npm)'}
-              variant={note ? 'primary' : undefined}
-              onPress={() => void findCodex($, { update: true })}
-            />
-          </Box>
-        </Box>
-      )
-    }
-
-    const codexView = () => (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text bold color={CODEX_ACCENT}>
-            ● Codex
-          </Text>
-          <Button key="cx-back" label="Back" onPress={() => void setView({ mode: 'list' })} />
-        </Box>
-        {Select && (
-          <Select
-            key="cx-mode"
-            label="Runs as"
-            options={[
-              { value: 'builtin', label: 'Built in' },
-              { value: 'custom', label: 'Custom harness' },
-              { value: 'off', label: 'Off' },
-            ]}
-            value={codexMode}
-            onSelect={v => void pickCodexMode(v)}
-          />
-        )}
-        <Text dimColor wrap="wrap">
-          Built in: the codex tool (model, effort, sandbox, resume), a live card for every Codex run, also ones started in a
-          terminal or the Codex app, and Codex usage meters.
-        </Text>
-        <Text dimColor wrap="wrap">
-          Custom harness: Codex runs through agent_run like the other harnesses, with a command and arguments you edit.
-          Only its own runs get cards, and there are no usage meters.
-        </Text>
-        {codexBinSection()}
-      </Box>
-    )
-
-    // A settings view that fails to draw says why and keeps a way back, not a blank pane.
-    const orBack = (draw: () => ReturnType<typeof listView>) => {
-      try {
-        return draw()
-      } catch (err) {
-        return (
-          <Box flexDirection="column" gap={1}>
-            <Text color="error" wrap="wrap">{`agent-deck could not draw this view: ${String((err as Error)?.message ?? err)}`}</Text>
-            <Button key="h-recover" label="Back to agents" onPress={() => void setView({ mode: 'cards' })} />
-          </Box>
-        )
-      }
-    }
-    if (view.mode === 'codex') {
-      if (codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
-      return orBack(codexView)
-    }
-    if (view.mode === 'list') return orBack(listView)
-    if (view.mode === 'edit') return orBack(() => editView(view))
 
     const running = list.filter(c => c.status === 'running')
     const finished = list.filter(c => c.status !== 'running').reverse()
@@ -3805,7 +4028,21 @@ export const register: Register = on => {
       codex: { color: CODEX_ACCENT, windows: lim.codex, plan: lim.codexPlan },
       copilot: { color: COPILOT_ACCENT, windows: lim.copilot ?? [], plan: lim.copilotPlan },
     }
-    const limitProviders = METER_PROVIDERS.map(({ id, name }) => ({ p: id, name, ...meterData[id] })).filter(x => shown.has(x.p))
+    // Each provider's windows as they show: the 5-hour before the weekly, and Antigravity's by its view.
+    const limitProviders = METER_PROVIDERS.map(({ id, name }) => ({ p: id, name, ...meterData[id], windows: shownWindows(id, meterData[id].windows, meters.agyView) })).filter(x => shown.has(x.p))
+    const agyView = meters.agyView ?? 'basic'
+    const agyIndex = Math.max(0, AGY_VIEWS.findIndex(v => v.value === agyView))
+    const agyControl = Select ? (
+      <Select key="lim-agy-view" options={AGY_VIEWS} value={agyView} onSelect={v => void saveMeters($, { ...meters, agyView: v as AgyView })} />
+    ) : (
+      <Button
+        key="lim-agy-view"
+        label={AGY_VIEWS[agyIndex]!.label}
+        plain
+        dimColor
+        onPress={() => void saveMeters($, { ...meters, agyView: AGY_VIEWS[(agyIndex + 1) % AGY_VIEWS.length]!.value })}
+      />
+    )
     const isCollapsed = meters.isCollapsed === true
     const viewIndex = Math.max(0, LIMIT_VIEWS.findIndex(v => v.value === meters.mode))
     const summary = limitSummary(limitProviders, now)
@@ -3855,7 +4092,11 @@ export const register: Register = on => {
             </Text>
           )
         ) : (
-          limitProviders.map(x => limitRow(x.p, x.name, x.color, x.windows, x.plan))
+          limitProviders.map(x =>
+            x.p === 'antigravity'
+              ? limitRow(x.p, x.name, x.color, x.windows, x.plan, agyControl, 'Nothing in this view: pick All to see every window.')
+              : limitRow(x.p, x.name, x.color, x.windows, x.plan),
+          )
         )}
       </Box>
     )
@@ -3873,7 +4114,7 @@ export const register: Register = on => {
           <Button
             key="h-open"
             label={`${ICON.settings} Settings`}
-            onPress={() => void setView({ mode: 'list' }).then(() => refreshRoutedModels($))}
+            onPress={() => void openSettings($)}
           />
         </Box>
         {cacheBox}
@@ -3892,4 +4133,8 @@ export const register: Register = on => {
       </Box>
     )
   })
+
+  // ---- settings: their own pane beside the deck ----
+
+  on('ui.render', { component: 'Pane', requestId: SETTINGS_PANE }, async ($, e) => renderSettings($, e, false))
 }

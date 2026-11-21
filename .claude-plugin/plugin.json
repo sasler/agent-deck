@@ -1,6 +1,6 @@
 {
   "name": "agent-deck",
-  "version": "0.16.2",
+  "version": "0.17.0",
   "description": "One live pane for every background agent: Codex, Claude subagents, GitHub Copilot, OpenCode, Google Antigravity and other CLI harnesses you add, task routing that sends each kind of task to the agent and model you pick, with streaming output, model, tokens, cost and usage limits, plus the prompt cache: its state, a keep-warm window and a cold-send guard.",
   "license": "MIT",
   "types": "./types/index.d.ts"

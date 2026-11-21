@@ -1,6 +1,6 @@
 import type { ToolSpec } from 'claude-code'
 
-import type { Activity, AgentCard, CodexLimitSource, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
+import type { Activity, AgentCard, AgyView, CodexLimitSource, CopilotModelUsage, Harness, HarnessModel, HarnessParser, HarnessProvider, LimitWindow, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
 
 // ---------- presets ----------
 
@@ -180,12 +180,21 @@ const CLAUDE_MODELS: HarnessModel[] = [
 export const SUBAGENT_MODELS: HarnessModel[] = CLAUDE_MODELS.filter(m => m.name).map(m => ({ id: m.name!.split(' ')[0]!.toLowerCase(), name: m.name }))
 
 /** The models a task's route can pick from: a harness's last list, the chosen Codex's, or Claude's families. */
-export const routeModelChoices = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): { value: string; label: string }[] =>
+export const routeModelChoices = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): RouteModelChoice[] =>
   target === 'claude'
-    ? SUBAGENT_MODELS.map(m => ({ value: m.id, label: m.name ?? m.id }))
+    ? SUBAGENT_MODELS.map(routeChoice)
     : target === 'codex'
       ? codexModels.map(id => ({ value: id, label: id }))
-      : (h?.models ?? []).map(m => ({ value: m.id, label: modelLabel(m) }))
+      : (h?.models ?? []).map(routeChoice)
+
+/** One model a route offers: its display name as the label; its id and note, where they add something, as the detail. */
+export type RouteModelChoice = { value: string; label: string; detail?: string }
+
+const routeChoice = (m: HarnessModel): RouteModelChoice => {
+  const label = m.name || m.id
+  const detail = [label !== m.id ? m.id : '', m.note ?? ''].filter(Boolean).join(' · ')
+  return detail ? { value: m.id, label, detail } : { value: m.id, label }
+}
 
 /** What bin/models.mjs is asked to do; the env and provider can hold a key, so it goes through a file it deletes. */
 export type ModelQuery = {
@@ -287,8 +296,13 @@ export const routeEffortChoices = (target: string, h: Harness | undefined): { le
   if (!h) return undefined
   const levels = harnessEfforts(h)
   if (levels.length) return { levels }
-  return { reason: h.parser === 'text' ? `No effort setting: put {effort} in ${h.name}'s arguments where its CLI takes one.` : `No effort setting: ${h.name}'s CLI has none.` }
+  return { reason: h.parser === 'text' ? `Put {effort} in ${h.name}'s arguments where its CLI takes one.` : `${h.name}'s CLI has none.` }
 }
+
+const EFFORT_LABELS: Record<string, string> = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' }
+
+/** An effort level as the pickers show it, in sentence case ("xhigh" → "Extra high"); the stored value stays as it is. */
+export const effortLabel = (level: string): string => EFFORT_LABELS[level] ?? (level ? level[0]!.toUpperCase() + level.slice(1) : level)
 
 /** Puts the effort flag in front of the prompt (and the flag before it), replacing one already there. */
 const placeEffort = (args: string[], parser: HarnessParser, effort: string, prompt: string) => {
@@ -513,6 +527,17 @@ export const harnessError = (h: Harness, others: readonly Harness[]): string | u
 /** A model group's short name: "Gemini Models" → "Gemini", "Claude and GPT models" → "Claude & GPT". */
 const agyGroupName = (name: string) => name.replace(/\s+models$/i, '').replace(/\s+and\s+/i, ' & ').trim()
 
+export type AgyFamily = 'gemini' | 'argon' | 'other'
+
+/**
+ * A bucket's model family, keyed on agy's bucket id (gemini-5h, gemini-weekly, gemini-argon-…, 3p-5h),
+ * which stays put where the group's display name may not; the display name only when there is no id.
+ */
+const agyFamilyOf = (key: string): AgyFamily => {
+  const s = key.toLowerCase()
+  return s.includes('argon') ? 'argon' : s.startsWith('gemini') ? 'gemini' : 'other'
+}
+
 /**
  * The windows of agy's RetrieveUserQuotaSummary (what `/usage` shows), as meters: each group's
  * weekly and 5-hour limit, used rather than remaining, so they read like the other providers'.
@@ -531,6 +556,8 @@ export const agyLimits = (quota: unknown): LimitWindow[] => {
         name: `${name} · ${window === '5h' ? '5-hour limit' : window === '7d' ? 'Weekly limit' : `${window} limit`}`,
         percent: Math.min(100, Math.max(0, Math.round((1 - b.remainingFraction) * 1000) / 10)),
         resetsAt: Number.isFinite(reset) ? reset : undefined,
+        group: agyFamilyOf(str(b.bucketId) ?? str(group.displayName) ?? ''),
+        span: window,
       })
     }
   }
@@ -1354,6 +1381,47 @@ export const limitSummary = (rows: readonly { name: string; windows: readonly Li
     const live = r.windows.filter(w => !isResetPast(w, now))
     return { name: r.name, percent: live.length ? Math.max(...live.map(w => w.percent)) : undefined }
   })
+
+// ---------- which usage windows show, and in what order ----------
+
+/** The Antigravity meter views: the Select at the right of its title row. */
+export const AGY_VIEWS: readonly { value: AgyView; label: string }[] = [
+  { value: 'basic', label: 'Basic' },
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'all', label: 'All' },
+]
+
+/** A window's length: its stable span, else the last word of its tag (a reading saved before spans were kept). */
+const spanOf = (w: LimitWindow): string => w.span ?? w.label.split(' ').pop() ?? w.label
+const SPAN_RANK: Record<string, number> = { '5h': 0, '7d': 1 }
+const spanRank = (w: LimitWindow) => SPAN_RANK[spanOf(w)] ?? 2
+
+/** An Antigravity window's model family: its stable group, else read from its tag (a reading saved before groups were kept). */
+export const agyFamily = (w: LimitWindow): AgyFamily =>
+  w.group === 'gemini' || w.group === 'argon' || w.group === 'other' ? w.group : agyFamilyOf(w.label)
+const FAMILY_RANK: Record<AgyFamily, number> = { gemini: 0, argon: 1, other: 2 }
+
+/**
+ * A provider's windows in the order the meters show them: the 5-hour window before the weekly one,
+ * anything else after, as it came. `byFamily` groups Antigravity's by model family first: Gemini,
+ * then Argon, then the rest (Claude & GPT).
+ */
+export const orderWindows = (ws: readonly LimitWindow[], byFamily = false): LimitWindow[] =>
+  ws
+    .map((w, i) => ({ w, i }))
+    .sort((a, b) => (byFamily ? FAMILY_RANK[agyFamily(a.w)] - FAMILY_RANK[agyFamily(b.w)] : 0) || spanRank(a.w) - spanRank(b.w) || a.i - b.i)
+    .map(x => x.w)
+
+/** The Antigravity windows a view shows, in order. Basic: Gemini's. Gemini: Gemini's and Argon's. All: every one. */
+export const agyWindows = (ws: readonly LimitWindow[], view: AgyView = 'basic'): LimitWindow[] =>
+  orderWindows(
+    ws.filter(w => view === 'all' || agyFamily(w) === 'gemini' || (view === 'gemini' && agyFamily(w) === 'argon')),
+    true,
+  )
+
+/** The windows a provider's meters show: Antigravity's by its view, every other provider's all of them; each in order. */
+export const shownWindows = (p: MeterProvider, ws: readonly LimitWindow[], agyView?: AgyView): LimitWindow[] =>
+  p === 'antigravity' ? agyWindows(ws, agyView) : orderWindows(ws)
 
 /**
  * Orders usage-meter entries: Claude first (this is Claude Code), then the rest

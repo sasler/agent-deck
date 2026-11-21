@@ -24,7 +24,7 @@ import {
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
-import { CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, cardModelName, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
+import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, cardModelName, effortLabel, orderWindows, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
 import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -1037,6 +1037,8 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   await ui.redraw()
   await ui.select({ key: 'cx-mode', value: 'builtin' })
   await ui.redraw()
+  await ui.press({ key: 's-tab-harnesses' } as never)
+  await ui.redraw()
   expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
   expect((await ui.findAll({ type: 'Button' } as never)).some(b => (b as { key?: string }).key === 'h-toggle-codex-cli' && (b as { text?: string }).text === 'Off')).toBe(true)
   await ui.unmount()
@@ -1151,6 +1153,8 @@ test('the meter choice is set in the Harnesses view', async ($, on) => {
     props: { title: 'Agents', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
   })
   await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-meters' } as never)
   await ui.redraw()
   expect(await ui.find({ text: /Usage meters/ })).toBeDefined()
   await ui.select({ key: 'm-mode', value: 'selected' })
@@ -1350,6 +1354,8 @@ test('the Task routing section switches routing and picks an agent per task', as
   })
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
+  await ui.redraw()
   expect(await ui.find({ text: /Task routing/ })).toBeDefined()
   expect(await ui.find({ text: /^Off: Claude places work as usual/ })).toBeDefined()
   await ui.select({ key: 'r-target-review', value: 'copilot' })
@@ -1392,6 +1398,8 @@ test('a routed harness with a model list offers its models in the Task routing t
   })
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
+  await ui.redraw()
   await ui.select({ key: 'r-target-research', value: 'antigravity' })
   await ui.redraw()
   expect(await ui.find({ key: 'r-model-research' })).toBeDefined()
@@ -1407,7 +1415,9 @@ test('routed tasks offer named Claude models, the Codex model list and a harness
   expect(routeModelChoices('claude', undefined).map(c => c.value)).toEqual(['fable', 'opus', 'sonnet', 'haiku'])
   expect(routeModelChoices('codex', undefined, ['gpt-6.1-terra'])).toEqual([{ value: 'gpt-6.1-terra', label: 'gpt-6.1-terra' }])
   const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
-  expect(routeModelChoices('antigravity', agy)).toEqual([{ value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High) (gemini-4-neon-high)' }])
+  expect(routeModelChoices('antigravity', agy)).toEqual([{ value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High)', detail: 'gemini-4-neon-high' }])
+  const copilot = { ...fromPreset(PRESETS.find(p => p.id === 'copilot')!), models: withFusion({ parser: 'copilot' }, []) }
+  expect(routeModelChoices('copilot', copilot)[0]).toEqual({ value: 'auto', label: 'Auto', detail: 'auto · picks a model per prompt' })
 })
 
 test('the routing switch sits next to Settings in the main view', async ($, on) => {
@@ -1428,6 +1438,8 @@ test('the routing switch sits next to Settings in the main view', async ($, on) 
   await ui.redraw()
   expect(await label('r-toggle-main')).toBe('⇄ Routing on')
   await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
   await ui.redraw()
   expect(await label('r-toggle')).toBe('On')
   await ui.unmount()
@@ -1451,10 +1463,10 @@ const AGY_QUOTA = {
 
 test("Antigravity's quota summary becomes used-percent meters per model group", () => {
   expect(agyLimits(AGY_QUOTA)).toEqual([
-    { label: 'Gemini 7d', name: 'Gemini · Weekly limit', percent: 1.6, resetsAt: Date.parse('2026-11-27T13:51:35Z') },
-    { label: 'Gemini 5h', name: 'Gemini · 5-hour limit', percent: 2.4, resetsAt: Date.parse('2026-11-20T18:51:35Z') },
-    { label: 'Claude & GPT 5h', name: 'Claude & GPT · 5-hour limit', percent: 0, resetsAt: Date.parse('2026-11-20T19:54:37Z') },
-    { label: 'Gemini 4 Argon 7d', name: 'Gemini 4 Argon · Weekly limit', percent: 50, resetsAt: undefined },
+    { label: 'Gemini 7d', name: 'Gemini · Weekly limit', percent: 1.6, resetsAt: Date.parse('2026-11-27T13:51:35Z'), group: 'gemini', span: '7d' },
+    { label: 'Gemini 5h', name: 'Gemini · 5-hour limit', percent: 2.4, resetsAt: Date.parse('2026-11-20T18:51:35Z'), group: 'gemini', span: '5h' },
+    { label: 'Claude & GPT 5h', name: 'Claude & GPT · 5-hour limit', percent: 0, resetsAt: Date.parse('2026-11-20T19:54:37Z'), group: 'other', span: '5h' },
+    { label: 'Gemini 4 Argon 7d', name: 'Gemini 4 Argon · Weekly limit', percent: 50, resetsAt: undefined, group: 'argon', span: '7d' },
   ])
   expect(agyLimits({})).toEqual([])
   expect(agyLimits({ response: { groups: [{ displayName: 'X', buckets: [{ window: '5h' }] }] } })).toEqual([])
@@ -1493,7 +1505,12 @@ test('an Antigravity harness brings its usage meters into the pane, and keeps th
   expect(quotaCalls[0]).toEqual(['agy', 'saved-1'])
   expect(await ui.find({ text: /^Antigravity$/ })).toBeDefined()
   expect(await ui.find({ text: /Gemini · Weekly limit/ })).toBeDefined()
+  // Basic, the default view, shows Gemini's windows only; the switch on Antigravity's title row shows more.
+  expect(await ui.find({ text: /Gemini 4 Argon · Weekly limit/ })).toBeUndefined()
+  await ui.select({ key: 'lim-agy-view', value: 'gemini' })
+  await ui.redraw()
   expect(await ui.find({ text: /Gemini 4 Argon · Weekly limit/ })).toBeDefined()
+  expect(await ui.find({ text: /Claude & GPT · 5-hour limit/ })).toBeUndefined()
   // The next check reopens the session the last one reported.
   await clock.advance(10 * 60_000)
   expect(quotaCalls.at(-1)).toEqual(['agy', 'saved-2'])
@@ -1959,7 +1976,7 @@ test('a route keeps its effort, the note names it, and agent_run with the task a
   const hs = [agy, preset('gemini')]
   expect(routeEffortChoices('codex', undefined)).toEqual({ levels: CODEX_EFFORTS })
   expect(routeEffortChoices('claude', undefined)).toEqual({ levels: SUBAGENT_EFFORTS })
-  expect(routeEffortChoices('gemini', hs[1])).toEqual({ reason: "No effort setting: Gemini's CLI has none." })
+  expect(routeEffortChoices('gemini', hs[1])).toEqual({ reason: "Gemini's CLI has none." })
   expect(routeEffortChoices('', undefined)).toBeUndefined()
   const routing = loadRouting({
     isOn: true,
@@ -2152,6 +2169,8 @@ test('usage limits fold into one line, switch views, and Refresh reads them live
   await ui.redraw()
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  await ui.press({ key: 's-tab-meters' } as never)
+  await ui.redraw()
   expect(((await ui.find({ key: 'm-mode' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('selected')
   await ui.select({ key: 'm-mode', value: 'session' })
   await ui.press({ key: 'h-done' } as never)
@@ -2236,11 +2255,14 @@ test('usage meters keep the same order (Claude, Antigravity, Codex, Copilot) in 
   // 2. Folded one-line summary order
   await ui.press({ key: 'lim-toggle' } as never)
   await ui.redraw()
-  expect(await ui.find({ type: 'Text', text: /^Claude 15% · Antigravity 50% · Codex 25% · Copilot 42%$/ })).toBeDefined()
+  // Antigravity's highest counts only the windows its view shows: Basic, Gemini's.
+  expect(await ui.find({ type: 'Text', text: /^Claude 15% · Antigravity 2% · Codex 25% · Copilot 42%$/ })).toBeDefined()
 
   // 3. Settings → Usage meters Selected buttons order
   await ui.select({ key: 'lim-view', value: 'selected' })
   await ui.press({ key: 'h-open' } as never)
+  await ui.redraw()
+  await ui.press({ key: 's-tab-meters' } as never)
   await ui.redraw()
   const meterButtons = (await ui.findAll({ type: 'Button' } as never))
     .map(b => (b as { key?: string }).key)
@@ -2266,6 +2288,8 @@ test('Task routing offers an effort per route where the agent takes one, and say
   const ui = await mountPane($, 60)
   await ui.press({ key: 'h-open' } as never)
   await ui.redraw()
+  await ui.press({ key: 's-tab-routing' } as never)
+  await ui.redraw()
   await ui.select({ key: 'r-target-ui', value: 'antigravity' })
   await ui.redraw()
   const effort = async (task: string) => (await ui.find({ key: `r-effort-${task}` })) as { props?: { value?: string; options?: { value: string }[] } } | undefined
@@ -2277,10 +2301,13 @@ test('Task routing offers an effort per route where the agent takes one, and say
   await ui.select({ key: 'r-target-review', value: 'gemini' })
   await ui.redraw()
   expect(await effort('review')).toBeUndefined()
-  expect(await ui.find({ text: "No effort setting: Gemini's CLI has none." })).toBeDefined()
+  expect(await ui.find({ text: 'No effort setting' })).toBeDefined()
+  expect(await ui.find({ text: "Gemini's CLI has none." })).toBeDefined()
   await ui.select({ key: 'r-target-implement', value: 'claude' })
   await ui.redraw()
   expect((await effort('implement'))?.props?.options?.map(o => o.value)).toEqual(['', 'low', 'medium', 'high', 'xhigh', 'max'])
+  // Efforts read in sentence case; the stored values stay as they are.
+  expect(((await effort('implement')) as { props?: { options?: { label?: string }[] } } | undefined)?.props?.options?.map(o => o.label)).toEqual(["Claude's choice", 'Low', 'Medium', 'High', 'Extra high', 'Max'])
   // Another agent starts the route over: its effort goes with the old one.
   await ui.select({ key: 'r-target-ui', value: 'claude' })
   await ui.redraw()
@@ -2391,4 +2418,268 @@ test('the Codex watcher starts with the session project root, not the shell cwd'
   const watchArgv = spawned.find(argv => argv.some(a => a.endsWith('/bin/watch.mjs')))
   expect(watchArgv).toBeDefined()
   expect(watchArgv?.[4]).toBe('C:\\src\\JumpInn')
+})
+
+// ---------- settings in their own pane ----------
+
+const mountSettings = ($: TestEngine, bodyColumns = 60) =>
+  $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck-settings',
+    props: { title: 'Agent Deck settings', isFocused: true, bodyColumns, placement: 'dock' } as never,
+  })
+
+/** A store in memory the test can read back. */
+type TestOn = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
+
+const memStore = (on: TestOn, entries: Record<string, unknown>) => {
+  const store = new Map<string, unknown>(Object.entries(entries))
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  return store
+}
+
+/** The hooks a session start needs, with no CLI found. */
+const quietSession = (on: TestOn, sid: string) => {
+  on('session.id', () => ({ value: sid }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+}
+
+test('Settings open in their own pane beside the deck, and Done closes it', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [routedCopilot()], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-settings' }))
+  on('env.get', () => ({ value: undefined }))
+  const opened: unknown[] = []
+  const closed: string[] = []
+  on('ui.open', (_$, e) => {
+    opened.push({ ...e })
+    return { value: { isPlaced: true } } as never
+  })
+  on('ui.close', (_$, e) => {
+    closed.push(e.id)
+    return { value: undefined } as never
+  })
+  const deck = await mountPane($, 60)
+  await deck.press({ key: 'h-open' } as never)
+  await deck.redraw()
+  expect(opened.at(-1)).toEqual({ id: 'agent-deck-settings', title: 'Agent Deck settings', focus: true, closeOnEscape: true })
+  // The deck stays the deck: no settings in it.
+  expect(await deck.find({ key: 'h-done' })).toBeUndefined()
+  expect(await deck.find({ key: 'h-open' })).toBeDefined()
+
+  const settings = await mountSettings($)
+  const tabs = ((await settings.findAll({ type: 'Button' } as never)) as { key?: string }[]).map(b => b.key).filter(k => k?.startsWith('s-tab-'))
+  expect(tabs).toEqual(['s-tab-harnesses', 's-tab-routing', 's-tab-meters', 's-tab-codex'])
+  expect(await settings.find({ key: 'cx-toggle' })).toBeDefined()
+  await settings.press({ key: 's-tab-routing' } as never)
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-target-review' })).toBeDefined()
+  expect(await settings.find({ key: 'cx-toggle' })).toBeUndefined()
+  await settings.press({ key: 'h-done' } as never)
+  expect(closed).toEqual(['agent-deck-settings'])
+  await deck.redraw()
+  expect(await deck.find({ key: 'h-done' })).toBeUndefined()
+  await settings.unmount()
+  await deck.unmount()
+})
+
+test('where a second pane cannot open, settings draw in the main pane until Done', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { harnesses: [] })
+  on('session.id', () => ({ value: 'sid-inline' }))
+  on('env.get', () => ({ value: undefined }))
+  const closed: string[] = []
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'no-surface' } }) as never)
+  on('ui.close', (_$, e) => {
+    closed.push(e.id)
+    return { value: undefined } as never
+  })
+  const deck = await mountPane($, 60)
+  await deck.press({ key: 'h-open' } as never)
+  await deck.redraw()
+  // The pane that would wait undrawn is closed, and the deck draws settings instead.
+  expect(closed).toEqual(['agent-deck-settings'])
+  expect(await deck.find({ key: 's-tab-routing' })).toBeDefined()
+  expect(await deck.find({ key: 'cache' })).toBeUndefined()
+  await deck.press({ key: 'h-done' } as never)
+  await deck.redraw()
+  expect(closed).toEqual(['agent-deck-settings'])
+  expect(await deck.find({ key: 'cache' })).toBeDefined()
+  await deck.unmount()
+})
+
+test('Task routing draws a card per task, and its Agent, Model and Effort pickers save by key', async ($, on) => {
+  mock.clock(on)
+  const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  const store = memStore(on, { harnesses: [agy, preset('gemini')], 'codex-enabled': false })
+  quietSession(on, 'sid-cards')
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  const settings = await mountSettings($, 40)
+  await settings.press({ key: 's-tab-routing' } as never)
+  await settings.redraw()
+  const card = (await settings.find({ key: 'r-research' })) as { props?: { borderStyle?: string } } | undefined
+  expect(card?.props?.borderStyle).toBe('round')
+  expect(await settings.find({ text: 'finding things out from docs, the web or a codebase' })).toBeDefined()
+  expect(await settings.find({ key: 'r-remove-research' })).toBeDefined()
+
+  await settings.select({ key: 'r-target-research', value: 'antigravity' })
+  await settings.redraw()
+  const model = (await settings.find({ key: 'r-model-research' })) as { props?: { options?: { value: string; label?: string }[] } } | undefined
+  // The label is the model's name; its id goes on a dim line under the field.
+  expect(model?.props?.options).toEqual([
+    { value: '', label: 'Default' },
+    { value: 'gemini-4-neon-high', label: 'Gemini 4 Neon (High)' },
+  ])
+  expect(await settings.find({ key: 'r-refresh-research' })).toBeDefined()
+  await settings.select({ key: 'r-model-research', value: 'gemini-4-neon-high' })
+  await settings.redraw()
+  expect(await settings.find({ text: 'gemini-4-neon-high' })).toBeDefined()
+  await settings.select({ key: 'r-effort-research', value: 'xhigh' })
+  await settings.redraw()
+  const effort = (await settings.find({ key: 'r-effort-research' })) as { props?: { value?: string; options?: { value: string; label?: string }[] } } | undefined
+  expect(effort?.props?.value).toBe('xhigh')
+  expect(effort?.props?.options?.find(o => o.value === 'xhigh')?.label).toBe('Extra high')
+  const saved = store.get('routing') as { routes: { task: string; target: string; model?: string; effort?: string }[] }
+  expect(saved.routes.find(r => r.task === 'research')).toEqual({ task: 'research', target: 'antigravity', model: 'gemini-4-neon-high', effort: 'xhigh' })
+
+  // An agent without an effort setting says so in place of the field.
+  await settings.select({ key: 'r-target-review', value: 'gemini' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-effort-review' })).toBeUndefined()
+  expect(await settings.find({ text: 'No effort setting' })).toBeDefined()
+
+  // Add a task: the field and its Add button.
+  await settings.input({ key: 'r-add', text: 'Docs', kind: 'change' })
+  await settings.redraw()
+  await settings.press({ key: 'r-add-button' } as never)
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-target-docs' })).toBeDefined()
+  expect(((await settings.find({ key: 'r-add' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('')
+  await settings.unmount()
+})
+
+test('efforts read in sentence case', () => {
+  expect(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'turbo'].map(effortLabel)).toEqual(['None', 'Minimal', 'Low', 'Medium', 'High', 'Extra high', 'Max', 'Turbo'])
+})
+
+// ---------- Antigravity's meter view ----------
+
+test("Antigravity's view picks its windows by model family, and every provider shows its 5-hour window first", () => {
+  const ws = agyLimits(AGY_QUOTA)
+  const names = (xs: { name?: string }[]) => xs.map(w => w.name)
+  expect(AGY_VIEWS.map(v => v.value)).toEqual(['basic', 'gemini', 'all'])
+  expect(names(agyWindows(ws))).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit'])
+  expect(names(agyWindows(ws, 'gemini'))).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit', 'Gemini 4 Argon · Weekly limit'])
+  expect(names(agyWindows(ws, 'all'))).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit', 'Gemini 4 Argon · Weekly limit', 'Claude & GPT · 5-hour limit'])
+  // A reading saved before groups and spans were kept is sorted by its tags.
+  const old = ws.map(({ group: _g, span: _s, ...w }) => w)
+  expect(names(agyWindows(old, 'all'))).toEqual(names(agyWindows(ws, 'all')))
+  // The filter keys on agy's bucket ids, not on the group's display name.
+  const renamed = agyLimits({ response: { groups: [{ displayName: 'Flash models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.5 }] }] } })
+  expect(agyWindows(renamed).map(w => w.percent)).toEqual([50])
+  const claude = [
+    { label: '7d', percent: 10 },
+    { label: 'Opus', percent: 5 },
+    { label: '5h', percent: 20 },
+  ]
+  expect(orderWindows(claude).map(w => w.label)).toEqual(['5h', '7d', 'Opus'])
+  expect(shownWindows('claude', claude).map(w => w.label)).toEqual(['5h', '7d', 'Opus'])
+  expect(shownWindows('antigravity', ws, 'gemini').length).toBe(3)
+  // The folded summary's highest percent counts only the shown windows.
+  expect(limitSummary([{ name: 'Antigravity', windows: agyWindows(ws) }], 0)).toEqual([{ name: 'Antigravity', percent: 2.4 }])
+  expect(limitSummary([{ name: 'Antigravity', windows: agyWindows(ws, 'gemini') }], 0)).toEqual([{ name: 'Antigravity', percent: 50 }])
+})
+
+test('the Antigravity view switch sits on its title row, persists, and sets the folded summary', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-11-20T12:00:00Z') })
+  const store = memStore(on, { harnesses: [fromPreset(PRESETS.find(p => p.id === 'antigravity')!)], 'codex-enabled': false })
+  quietSession(on, 'sid-agy-view')
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('process.run', (_$, e) => {
+    const argv = (e as { argv?: string[] }).argv ?? []
+    if (argv.some(a => a.endsWith('agy-quota.mjs'))) {
+      return { value: { exitCode: 0, stdout: JSON.stringify({ sessionId: 's1', quota: AGY_QUOTA }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await mountPane($, 60)
+  await ui.redraw()
+  const rowText = async () =>
+    ((await ui.findAll({ type: 'Text' } as never)) as { text?: string }[]).map(t => t.text ?? '').filter(t => /^[^·]+ · (5-hour|Weekly) limit$/.test(t))
+  expect(((await ui.find({ key: 'lim-agy-view' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('basic')
+  expect(await rowText()).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit'])
+  await ui.select({ key: 'lim-agy-view', value: 'all' })
+  await ui.redraw()
+  expect(await rowText()).toEqual(['Gemini · 5-hour limit', 'Gemini · Weekly limit', 'Gemini 4 Argon · Weekly limit', 'Claude & GPT · 5-hour limit'])
+  expect((store.get('meters') as { agyView?: string }).agyView).toBe('all')
+  await ui.select({ key: 'lim-agy-view', value: 'basic' })
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /Antigravity 2%/ })).toBeDefined()
+  // Folded, the switch is out of sight: open, pick Gemini, fold again.
+  expect(await ui.find({ key: 'lim-agy-view' })).toBeUndefined()
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  await ui.select({ key: 'lim-agy-view', value: 'gemini' })
+  await ui.press({ key: 'lim-toggle' } as never)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /Antigravity 50%/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('every settings tab draws on every surface, a narrow pane too', async ($, on) => {
+  mock.clock(on)
+  const agy = { ...fromPreset(PRESETS.find(p => p.id === 'antigravity')!), models: [{ id: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }] }
+  memStore(on, { harnesses: [agy, preset('gemini')], 'codex-enabled': false, routing: { isOn: true, routes: [{ task: 'ui', target: 'antigravity', model: 'gemini-4-neon-high', effort: 'xhigh' }, { task: 'review', target: 'gemini' }] } })
+  quietSession(on, 'sid-surfaces')
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.spawn', async function* () {
+    return { value: { exitCode: 1 } } as never
+  } as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    for (const bodyColumns of [36, 90]) {
+      const ui = await $.ui.mount({
+        plugin: 'agent-deck',
+        surface,
+        component: 'Pane',
+        requestId: 'agent-deck-settings',
+        props: { title: 'Agent Deck settings', isFocused: true, bodyColumns, placement: 'dock' } as never,
+      })
+      for (const tab of ['harnesses', 'routing', 'meters', 'codex']) {
+        await ui.press({ key: `s-tab-${tab}` } as never)
+        await ui.redraw()
+        expect(await ui.find({ key: 'h-done' })).toBeDefined()
+      }
+      await ui.press({ key: 's-tab-routing' } as never)
+      await ui.redraw()
+      expect(await ui.find({ text: 'Task routing' })).toBeDefined()
+      // Mobile draws no Select: each route reads as one line.
+      expect(await ui.find({ text: surface === 'mobile' ? 'Antigravity · gemini-4-neon-high · effort Extra high' : 'gemini-4-neon-high' })).toBeDefined()
+      if (surface !== 'mobile') expect(((await ui.find({ key: 'r-effort-ui' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('xhigh')
+      await ui.unmount()
+    }
+  }
 })
