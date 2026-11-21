@@ -38,10 +38,9 @@ Open the **Agent Deck** pane (`/agent-deck`, or the **Agents** button above the 
 
 A row of tabs at the top switches between the sections:
 
-- **Harnesses**: Codex and the other coding-agent CLIs, each on a card with its **On/Off** switch and **Edit**;
+- **Harnesses**: Codex and the other coding-agent CLIs, each on a card with its **On/Off** switch and **Edit** (Codex's **Edit** opens how Codex runs and which Codex CLI it starts, just like the other harnesses);
 - **Task routing**: who does each kind of work (see [Task routing](#task-routing-who-does-which-kind-of-task));
-- **Usage meters**: which providers' limits show, and the Antigravity view;
-- **Codex**: how Codex runs, and which Codex CLI it starts.
+- **Usage meters**: which providers' limits show, and the Antigravity view.
 
 **Done** closes the settings pane, and so does Escape. Where a second pane can't open, the settings show in the deck itself until you press **Done**.
 
@@ -52,7 +51,7 @@ Under ⚙ Settings → **Harnesses** you can:
 - **Add** a harness from a preset (Copilot, OpenCode, Antigravity, Gemini CLI, Cursor Agent, Claude Code) or as a **Custom** command.
 - **Edit** a harness's command, arguments, default model, color and output format.
 - **Switch** each harness on or off.
-- **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in one **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. The list comes from:
+- **Pick a model** for each harness. The edit form asks the harness which models it can run as it opens and offers them in a **Model** dropdown: the CLI's default first, **Other…** last to type an id, and ↻ to ask again. When a harness reports more than 64 models (for example OpenCode through LiteLLM), the picker groups them by `/` provider prefixes — or alphabetical runs when ids don't share prefixes — and adds a **Search models** box that matches ids and names across all groups so every model is reachable. The currently selected model stays preselected along its group path. The list comes from:
   - Copilot: its ACP server (`copilot --acp --stdio`), which reports the models your account has, with their price category (low, medium or high);
     it also offers **Auto** and **Copilot Fusion** Standard and Max. Fusion selections, including ones saved by earlier versions of agent-deck, run as `--model auto --auto-tier hydrafusion` or `hydrafusion-max`, with `--experimental`. The CLI checks whether your account supports that profile. A rejected profile or a routing fallback is shown on the card rather than hidden;
   - OpenCode: `opencode models`;
@@ -77,7 +76,7 @@ Claude starts a harness with the `agent_run` tool, for example: "have Copilot wr
 
 Fusion's draft, critique, and revision phases show as separate activities with the model doing the work when the CLI reports them. Intermediate phase drafts are not delivered as the final report. The CLI's JSON stream may omit usage events, so agent-deck also asks for `--usage-output-file` and reads its final per-model totals before marking the run finished. Checkpoints and final totals replace running totals, so phases and subagents are not counted twice. Per-model usage is included in the completion report as well as the card. If you set a custom usage file in Arguments, don't share it between concurrent runs.
 
-**Codex** has three modes, chosen under ⚙ Settings → **Codex** (Codex's **Edit** button under Harnesses opens it too):
+**Codex** has three modes, chosen from **Codex** → **Edit** under ⚙ Settings → **Harnesses**:
 
 - **Built in.** The `codex` and `codex_result` tools, with model, effort, sandbox and resume. It also gives a live card for every Codex run, including ones started in a terminal or the Codex app, and the Codex usage meters.
 - **Custom harness.** Codex runs through `agent_run` like any other harness, from a `codex exec --json` command you can edit.
@@ -85,7 +84,7 @@ Fusion's draft, critique, and revision phases show as separate activities with t
 
 On first start, the built-in Codex is on if `codex` is on your PATH. Its On/Off button switches it any time.
 
-**Which Codex CLI runs use.** You may have more than one Codex installed: the npm one (`npm i -g @openai/codex`), the standalone installer's, WinGet's. agent-deck looks at all of them and starts the newest, not just the first one on your PATH. An old Codex doesn't know the newest models. It also checks npm for the latest published version and tells you when yours is older. agent-deck looks again every ten minutes at most, so this doesn't slow down runs. The **Codex** tab shows which Codex runs start with, every other one it found, and these controls:
+**Which Codex CLI runs use.** You may have more than one Codex installed: the npm one (`npm i -g @openai/codex`), the standalone installer's, WinGet's. agent-deck looks at all of them and starts the newest, not just the first one on your PATH. An old Codex doesn't know the newest models. It also checks npm for the latest published version and tells you when yours is older. agent-deck looks again every ten minutes at most, so this doesn't slow down runs. Codex's **Edit** view under **Harnesses** shows which Codex runs start with, every other one it found, and these controls:
 
 - **Codex path** starts a Codex of your choice instead. You can also set the `CODEX_PATH` environment variable, which wins over this field.
 - **Look again** checks for installs right away.
@@ -155,7 +154,7 @@ Set it up under ⚙ Settings → **Task routing**. Each kind of task has a card:
 
 - The cards start with **implement**, **review**, **research**, **image** and **ui**. Add your own at the bottom: type a name, for example `tests` or `docs`, and press **Add** (or Enter). **Remove** the ones you don't need.
 - For each task, pick the **Agent**: any harness, the built-in **Codex**, or a **Claude subagent**. Then pick its **Model**, or leave it at the agent's default:
-  - a harness offers the models its CLI reports, by name (for example `Gemini 4 Neon (High)`), with the model's id in a dim line under the field. agent-deck asks the CLI again when you pick the harness and when you open Settings (at most every ten minutes), and **↻** at the end of the Model field asks right away;
+  - a harness offers the models its CLI reports, by name (for example `Gemini 4 Neon (High)`), with the model's id in a dim line under the field. For harnesses with more than 64 models, the card shows the same provider groups and **Search models** box as the harness edit form. agent-deck asks the CLI again when you pick the harness and when you open Settings (at most every ten minutes), and **↻** at the end of the Model field asks right away;
   - Codex offers the models of the Codex CLI it starts;
   - a Claude subagent offers Fable, Opus, Sonnet and Haiku, named with the version each runs.
 

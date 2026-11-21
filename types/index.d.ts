@@ -62,12 +62,13 @@ export type TaskRoute = { task: string; target: string; model?: string; effort?:
 export type Routing = { isOn: boolean; routes: TaskRoute[] }
 
 /** The settings pane's sections, one tab each. */
-export type SettingsSection = 'harnesses' | 'routing' | 'meters' | 'codex'
+export type SettingsSection = 'harnesses' | 'routing' | 'meters'
 
-/** What settings show: nothing (the deck), a section's list, or the form that adds or edits a harness. */
+/** What settings show: nothing (the deck), a section's list, Codex's settings, or the form that adds or edits a harness. */
 export type HarnessView =
   | { mode: 'cards' }
   | { mode: 'list' }
+  | { mode: 'codex' }
   | {
       mode: 'edit'
       draft: Harness
@@ -269,6 +270,8 @@ declare module 'claude-code' {
       taskDraft: string
       /** Task names whose routing Model field is typing a custom id via Other…. */
       routeTyping: string[]
+      /** Model picker group path and search text, keyed `h` for the edit view and `r-<task>` for routing cards. */
+      modelPicker: Record<string, { group?: string[]; filter?: string }>
       /** Harness id → whether its command was found on PATH. */
       found: Record<string, boolean>
       /** Whether the built-in Codex (codex tools, live view, usage meters) is on. */

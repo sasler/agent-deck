@@ -24,7 +24,7 @@ import {
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
 import { DELIVERY_CLAIM_TTL_MS, deliveryClaim, isDeliveryTaken, readDeliveryMark } from '../hooks/harness'
-import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, capSelectOptions, cardModelName, codexLiveError, effortLabel, orderWindows, parseCodexLimitsOutput, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
+import { AGY_VIEWS, CODEX_EFFORTS, METER_PROVIDERS, SUBAGENT_EFFORTS, agyWindows, buildModelTree, capSelectOptions, cardModelName, codexLiveError, effortLabel, filterModels, groupModels, orderWindows, parseCodexLimitsOutput, pickerLevels, shownWindows, effortProblem, harnessEfforts, isResetPast, limitSummary, orderMeters, readingAge, resetNote, routeEffortChoices, shouldTakeCodexLimits } from '../hooks/harness'
 import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
@@ -1027,6 +1027,10 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
   await ui.press({ key: 'cx-edit' } as never)
   await ui.redraw()
+  expect(await ui.find({ text: /Edit ● Codex/ })).toBeDefined()
+  expect(await ui.find({ key: 's-tab-harnesses' })).toBeUndefined()
+  expect(await ui.find({ key: 'cx-find' })).toBeDefined()
+  expect(await ui.find({ key: 'cx-update' })).toBeDefined()
   await ui.select({ key: 'cx-mode', value: 'custom' })
   await ui.redraw()
   expect(await ui.find({ text: /exec --json --skip-git-repo-check/ })).toBeDefined()
@@ -1037,7 +1041,7 @@ test('the built-in Codex switches off, or becomes a custom harness', async ($, o
   await ui.redraw()
   await ui.select({ key: 'cx-mode', value: 'builtin' })
   await ui.redraw()
-  await ui.press({ key: 's-tab-harnesses' } as never)
+  await ui.press({ key: 'cx-done' } as never)
   await ui.redraw()
   expect(await ui.find({ text: /live view of every Codex run/ })).toBeDefined()
   expect((await ui.findAll({ type: 'Button' } as never)).some(b => (b as { key?: string }).key === 'h-toggle-codex-cli' && (b as { text?: string }).text === 'Off')).toBe(true)
@@ -2619,6 +2623,10 @@ test('Settings open in their own pane beside the deck, and Done closes it', asyn
   mock.store(on, { harnesses: [routedCopilot()], 'codex-enabled': false })
   on('session.id', () => ({ value: 'sid-settings' }))
   on('env.get', () => ({ value: undefined }))
+  let staleCodex = false
+  on('state.get', (_$, e, next) =>
+    staleCodex && e.key === 'settingsSection' ? ({ value: { value: 'codex', version: 1 } } as never) : next(e),
+  )
   const opened: unknown[] = []
   const closed: string[] = []
   on('ui.open', (_$, e) => {
@@ -2639,8 +2647,15 @@ test('Settings open in their own pane beside the deck, and Done closes it', asyn
 
   const settings = await mountSettings($)
   const tabs = ((await settings.findAll({ type: 'Button' } as never)) as { key?: string }[]).map(b => b.key).filter(k => k?.startsWith('s-tab-'))
-  expect(tabs).toEqual(['s-tab-harnesses', 's-tab-routing', 's-tab-meters', 's-tab-codex'])
+  expect(tabs).toEqual(['s-tab-harnesses', 's-tab-routing', 's-tab-meters'])
   expect(await settings.find({ key: 'cx-toggle' })).toBeDefined()
+  // An old settingsSection: 'codex' left in session state maps back to Harnesses.
+  staleCodex = true
+  await settings.redraw()
+  expect(await settings.find({ key: 'cx-toggle' })).toBeDefined()
+  expect(await settings.find({ key: 'cx-edit' })).toBeDefined()
+  expect(((await settings.find({ key: 's-tab-harnesses' })) as { props?: { variant?: string } } | undefined)?.props?.variant).toBe('primary')
+  staleCodex = false
   await settings.press({ key: 's-tab-routing' } as never)
   await settings.redraw()
   expect(await settings.find({ key: 'r-target-review' })).toBeDefined()
@@ -2758,54 +2773,186 @@ test('capSelectOptions stays within max while keeping head, tail and the selecte
   expect(capped.options[62]?.value).toBe('m-90')
 })
 
-test('settings draw cleanly when a harness has 100 models, capping model Selects to 64 with Other…', async ($, on) => {
+test('model picker helpers group 300 models across providers and sub-groups, preselect paths, filter, and split flat lists into runs', () => {
+  // 300 models across 3 providers; litellm has 150 split across bedrock (90) and vertex (60).
+  const models = [
+    ...Array.from({ length: 90 }, (_, i) => ({ id: `litellm/bedrock/us.anthropic.claude-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 60 }, (_, i) => ({ id: `litellm/vertex/gemini-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `openai/gpt-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `github-copilot/model-${String(i).padStart(2, '0')}` })),
+  ]
+  expect(models.length).toBe(300)
+
+  // Every level stays <= 64, and a selected model preselects its full path with prefix dropped from labels.
+  const pre = pickerLevels(models, { selected: 'litellm/vertex/gemini-42' })
+  expect(pre.showSearch).toBe(true)
+  expect(pre.group).toEqual(['litellm', 'vertex'])
+  expect(pre.levels.map(l => l.kind)).toEqual(['group', 'group', 'model'])
+  for (const level of pre.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+  expect(pre.levels[0]?.value).toBe('litellm')
+  expect(pre.levels[0]?.options.map(o => o.label)).toEqual(['github-copilot (75)', 'litellm (150)', 'openai (75)'])
+  expect(pre.levels[1]?.value).toBe('vertex')
+  expect(pre.levels[1]?.options.map(o => o.label)).toEqual(['bedrock (90)', 'vertex (60)'])
+  const leaf = pre.levels[2]!
+  expect(leaf.value).toBe('litellm/vertex/gemini-42')
+  expect(leaf.options.find(o => o.value === 'litellm/vertex/gemini-42')?.label).toBe('gemini-42')
+
+  // Browsing another provider keeps the currently selected model visible and selected in the leaf.
+  const browsed = pickerLevels(models, { selected: 'litellm/vertex/gemini-42', group: ['openai'] })
+  const browsedLeaf = browsed.levels.at(-1)!
+  expect(browsedLeaf.options.length).toBeLessThanOrEqual(64)
+  expect(browsedLeaf.value).toBe('litellm/vertex/gemini-42')
+  expect(browsedLeaf.options.some(o => o.value === 'litellm/vertex/gemini-42')).toBe(true)
+
+  // Bedrock (90 models > 61) splits into balanced runs; every level stays <= 64.
+  const bedrock = pickerLevels(models, { selected: 'litellm/bedrock/us.anthropic.claude-85' })
+  expect(bedrock.levels.map(l => l.kind)).toEqual(['group', 'group', 'group', 'model'])
+  for (const level of bedrock.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+  expect(bedrock.levels.at(-1)?.value).toBe('litellm/bedrock/us.anthropic.claude-85')
+  expect(bedrock.levels.at(-1)?.options.find(o => o.value === 'litellm/bedrock/us.anthropic.claude-85')?.label).toBe('us.anthropic.claude-85')
+
+  // Filter: <= 61 matches collapses to one Select; > 61 keeps group Selects with a narrow hint.
+  expect(filterModels(models, 'VERTEX').length).toBe(60)
+  const narrow = pickerLevels(models, { filter: 'gemini-4', selected: 'openai/gpt-01' })
+  expect(narrow.levels.length).toBe(1)
+  expect(narrow.narrowHint).toBeUndefined()
+  expect(narrow.matchCount).toBe(10)
+  expect(narrow.levels[0]?.options.some(o => o.value === 'openai/gpt-01')).toBe(true)
+
+  const broad = pickerLevels(models, { filter: 'litellm' })
+  expect(broad.narrowHint).toBe('150 matches · type more to narrow')
+  expect(broad.levels.length).toBeGreaterThan(1)
+  // Every match starts with litellm/, so the shared prefix is skipped down to bedrock / vertex.
+  expect(broad.levels[0]?.options.map(o => o.value)).toEqual(['bedrock', 'vertex'])
+  for (const level of broad.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+
+  // Single models gather under "other models", and shared prefixes skip a level.
+  const withSingletons = [
+    ...Array.from({ length: 70 }, (_, i) => ({ id: `acme/m-${i}` })),
+    { id: 'solo-a/one' },
+    { id: 'solo-b/two' },
+  ]
+  const grouped = groupModels(withSingletons, 0)
+  expect(grouped.kind).toBe('split')
+  if (grouped.kind === 'split') {
+    expect(grouped.groups.map(g => g.label)).toEqual(['acme (70)', 'other models (2)'])
+  }
+
+  // Flat ids without '/' fall back to name-ordered runs ("a … f (45)"), every level <= 64.
+  const letters = 'abcdefghijklmnopqrstuvwxyz'
+  const flat = Array.from({ length: 130 }, (_, i) => ({ id: `${letters[i % 26]}-model-${String(i).padStart(3, '0')}` }))
+  const flatState = pickerLevels(flat, { selected: 'z-model-129' })
+  expect(flatState.levels.length).toBe(2)
+  expect(flatState.levels[0]?.options.every(o => /^[a-z] … [a-z] \(\d+\)$/.test(o.label))).toBe(true)
+  expect(flatState.levels[1]?.value).toBe('z-model-129')
+  expect(flatState.levels[1]?.options.length).toBeLessThanOrEqual(64)
+
+  // More than 63 child groups wrap those children into runs too.
+  const manyProviders = Array.from({ length: 140 }, (_, i) => [
+    { id: `p${String(i).padStart(3, '0')}/m1` },
+    { id: `p${String(i).padStart(3, '0')}/m2` },
+  ]).flat()
+  const wrappedTree = buildModelTree(manyProviders)
+  expect(wrappedTree.kind).toBe('branch')
+  if (wrappedTree.kind === 'branch') expect(wrappedTree.children.length).toBeLessThanOrEqual(63)
+  const wrappedState = pickerLevels(manyProviders, { selected: 'p139/m2' })
+  for (const level of wrappedState.levels) expect(level.options.length).toBeLessThanOrEqual(64)
+  expect(wrappedState.levels.at(-1)?.value).toBe('p139/m2')
+
+  // Under 64 models keeps a single ungrouped Select without search.
+  const small = Array.from({ length: 20 }, (_, i) => ({ id: `a/m-${i}` }))
+  const smallState = pickerLevels(small, { selected: 'a/m-5' })
+  expect(smallState.showSearch).toBe(false)
+  expect(smallState.levels.length).toBe(1)
+  expect(smallState.levels[0]?.value).toBe('a/m-5')
+})
+
+test('settings model pickers reach every model through provider groups, sub-groups and search in both edit view and Task routing', async ($, on) => {
   mock.clock(on)
-  const models = Array.from({ length: 100 }, (_, i) => ({ id: `provider/model-${i}`, name: `Model ${i}` }))
-  const oc = { ...fromPreset(PRESETS.find(p => p.id === 'opencode')!), model: 'provider/model-90', models }
+  const models = [
+    ...Array.from({ length: 90 }, (_, i) => ({ id: `litellm/bedrock/us.anthropic.claude-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 60 }, (_, i) => ({ id: `litellm/vertex/gemini-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `openai/gpt-${String(i).padStart(2, '0')}` })),
+    ...Array.from({ length: 75 }, (_, i) => ({ id: `github-copilot/model-${String(i).padStart(2, '0')}` })),
+  ]
+  const oc = { ...fromPreset(PRESETS.find(p => p.id === 'opencode')!), model: 'openai/gpt-70', models }
   const store = memStore(on, {
     harnesses: [oc],
     'codex-enabled': false,
-    routing: { isOn: true, routes: [{ task: 'implement', target: 'opencode', model: 'provider/model-85' }] },
+    routing: { isOn: true, routes: [{ task: 'implement', target: 'opencode', model: 'openai/gpt-65' }] },
   })
   quietSession(on, 'sid-many-models')
   on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('ui.open', () => ({ value: { isPlaced: true } }) as never)
   await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
 
-  // 1. Harness edit view: Select is capped at 64, keeps the selected model #90, and shows the hint.
+  // 1. Harness edit view: preselected on openai/gpt-70, no "Showing 62 of" hint; pick litellm -> vertex -> gemini-55 and save.
   const settings = await mountSettings($, 56)
   await settings.press({ key: 'h-edit-opencode' } as never)
   await settings.redraw()
-  const editPick = (await settings.find({ key: 'h-model-pick' })) as { props?: { options?: { value: string; label?: string }[]; value?: string } } | undefined
-  expect(editPick).toBeDefined()
-  expect(editPick?.props?.options?.length).toBeLessThanOrEqual(64)
-  expect(editPick?.props?.options?.length).toBe(64)
-  expect(editPick?.props?.value).toBe('provider/model-90')
-  expect(editPick?.props?.options?.some(o => o.value === 'provider/model-90')).toBe(true)
-  expect(editPick?.props?.options?.at(-1)).toEqual({ value: '__other__', label: 'Other…' })
-  expect(await settings.find({ text: /Showing 62 of 100 models/ })).toBeDefined()
+  expect(await settings.find({ text: /Showing 62 of/ })).toBeUndefined()
+  expect(await settings.find({ key: 'h-model-pick-search' })).toBeDefined()
+  expect(((await settings.find({ key: 'h-model-pick-g-0' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai')
+  expect(((await settings.find({ key: 'h-model-pick' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai/gpt-70')
 
-  // 2. Task routing card: Select is also capped at 64, keeps model #85, shows the hint, and Other… lets you type any id.
-  await settings.press({ key: 'h-cancel' } as never)
+  await settings.select({ key: 'h-model-pick-g-0', value: 'litellm' })
   await settings.redraw()
+  await settings.select({ key: 'h-model-pick-g-1', value: 'vertex' })
+  await settings.redraw()
+  const editLeaf = (await settings.find({ key: 'h-model-pick' })) as { props?: { options?: { value: string; label?: string }[] } } | undefined
+  expect(editLeaf?.props?.options?.length).toBeLessThanOrEqual(64)
+  expect(editLeaf?.props?.options?.find(o => o.value === 'litellm/vertex/gemini-55')?.label).toBe('gemini-55')
+  await settings.select({ key: 'h-model-pick', value: 'litellm/vertex/gemini-55' })
+  await settings.redraw()
+
+  // Search in edit view narrows across all groups to one Select when <= 61 matches.
+  await settings.input({ key: 'h-model-pick-search', text: 'claude-8', kind: 'change' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'h-model-pick-g-0' })).toBeUndefined()
+  const editSearchLeaf = (await settings.find({ key: 'h-model-pick' })) as { props?: { options?: { value: string; label?: string }[] } } | undefined
+  expect(editSearchLeaf?.props?.options?.some(o => o.value === 'litellm/bedrock/us.anthropic.claude-88')).toBe(true)
+  expect(editSearchLeaf?.props?.options?.some(o => o.value === 'litellm/vertex/gemini-55')).toBe(true)
+  await settings.press({ key: 'h-save' } as never)
+  await settings.redraw()
+  const savedHarnesses = store.get('harnesses') as { id: string; model?: string }[]
+  expect(savedHarnesses.find(h => h.id === 'opencode')?.model).toBe('litellm/vertex/gemini-55')
+
+  // 2. Task routing card: provider -> sub-group -> model saves, search narrows, and Other… still lets you type any id.
   await settings.press({ key: 's-tab-routing' } as never)
   await settings.redraw()
-  const routePick = (await settings.find({ key: 'r-model-implement' })) as { props?: { options?: { value: string; label?: string }[]; value?: string } } | undefined
-  expect(routePick).toBeDefined()
-  expect(routePick?.props?.options?.length).toBeLessThanOrEqual(64)
-  expect(routePick?.props?.options?.length).toBe(64)
-  expect(routePick?.props?.value).toBe('provider/model-85')
-  expect(routePick?.props?.options?.some(o => o.value === 'provider/model-85')).toBe(true)
-  expect(routePick?.props?.options?.at(-1)).toEqual({ value: '__other__', label: 'Other…' })
-  expect(await settings.find({ text: /Showing 62 of 100 models/ })).toBeDefined()
+  expect(await settings.find({ text: /Showing 62 of/ })).toBeUndefined()
+  expect(await settings.find({ key: 'r-model-implement-search' })).toBeDefined()
+  expect(((await settings.find({ key: 'r-model-implement-g-0' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai')
+  expect(((await settings.find({ key: 'r-model-implement' })) as { props?: { value?: string } } | undefined)?.props?.value).toBe('openai/gpt-65')
+
+  await settings.select({ key: 'r-model-implement-g-0', value: 'litellm' })
+  await settings.redraw()
+  await settings.select({ key: 'r-model-implement-g-1', value: 'vertex' })
+  await settings.redraw()
+  await settings.select({ key: 'r-model-implement', value: 'litellm/vertex/gemini-33' })
+  await settings.redraw()
+  let savedRouting = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(savedRouting.routes.find(r => r.task === 'implement')?.model).toBe('litellm/vertex/gemini-33')
+
+  // Search narrows on the routing card too (> 61 shows hint, <= 61 collapses to one Select).
+  await settings.input({ key: 'r-model-implement-search', text: 'litellm', kind: 'change' })
+  await settings.redraw()
+  expect(await settings.find({ text: '150 matches · type more to narrow' })).toBeDefined()
+  await settings.input({ key: 'r-model-implement-search', text: 'claude-88', kind: 'change' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'r-model-implement-g-0' })).toBeUndefined()
+  await settings.select({ key: 'r-model-implement', value: 'litellm/bedrock/us.anthropic.claude-88' })
+  await settings.redraw()
+  savedRouting = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(savedRouting.routes.find(r => r.task === 'implement')?.model).toBe('litellm/bedrock/us.anthropic.claude-88')
 
   await settings.select({ key: 'r-model-implement', value: '__other__' })
   await settings.redraw()
   expect(await settings.find({ key: 'r-model-input-implement' })).toBeDefined()
   await settings.input({ key: 'r-model-input-implement', text: 'provider/custom-999', kind: 'submit' })
   await settings.redraw()
-  const saved = store.get('routing') as { routes: { task: string; model?: string }[] }
-  expect(saved.routes.find(r => r.task === 'implement')?.model).toBe('provider/custom-999')
+  savedRouting = store.get('routing') as { routes: { task: string; model?: string }[] }
+  expect(savedRouting.routes.find(r => r.task === 'implement')?.model).toBe('provider/custom-999')
   await settings.unmount()
 })
 
@@ -2900,11 +3047,18 @@ test('every settings tab draws on every surface, a narrow pane too', async ($, o
         requestId: 'agent-deck-settings',
         props: { title: 'Agent Deck settings', isFocused: true, bodyColumns, placement: 'dock' } as never,
       })
-      for (const tab of ['harnesses', 'routing', 'meters', 'codex']) {
+      for (const tab of ['harnesses', 'routing', 'meters']) {
         await ui.press({ key: `s-tab-${tab}` } as never)
         await ui.redraw()
         expect(await ui.find({ key: 'h-done' })).toBeDefined()
       }
+      await ui.press({ key: 's-tab-harnesses' } as never)
+      await ui.redraw()
+      await ui.press({ key: 'cx-edit' } as never)
+      await ui.redraw()
+      expect(await ui.find({ key: 'cx-done' })).toBeDefined()
+      await ui.press({ key: 'cx-done' } as never)
+      await ui.redraw()
       await ui.press({ key: 's-tab-routing' } as never)
       await ui.redraw()
       expect(await ui.find({ text: 'Task routing' })).toBeDefined()

@@ -179,13 +179,13 @@ const CLAUDE_MODELS: HarnessModel[] = [
 /** What a Claude subagent takes (the Agent tool's model: a family), named by the version it runs now. */
 export const SUBAGENT_MODELS: HarnessModel[] = CLAUDE_MODELS.filter(m => m.name).map(m => ({ id: m.name!.split(' ')[0]!.toLowerCase(), name: m.name }))
 
+/** The raw models a task's route can pick from: a harness's last list, the chosen Codex's, or Claude's families. */
+export const routeModels = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): HarnessModel[] =>
+  target === 'claude' ? SUBAGENT_MODELS : target === 'codex' ? codexModels.map(id => ({ id })) : (h?.models ?? [])
+
 /** The models a task's route can pick from: a harness's last list, the chosen Codex's, or Claude's families. */
 export const routeModelChoices = (target: string, h: Harness | undefined, codexModels: readonly string[] = []): RouteModelChoice[] =>
-  target === 'claude'
-    ? SUBAGENT_MODELS.map(routeChoice)
-    : target === 'codex'
-      ? codexModels.map(id => ({ value: id, label: id }))
-      : (h?.models ?? []).map(routeChoice)
+  routeModels(target, h, codexModels).map(routeChoice)
 
 /** One model a route offers: its display name as the label; its id and note, where they add something, as the detail. */
 export type RouteModelChoice = { value: string; label: string; detail?: string }
@@ -234,6 +234,414 @@ export const capSelectOptions = <T extends SelectOption>(
     shown: taken.length,
     total,
     isCapped: true,
+  }
+}
+
+// ---------- multi-level model picker (prefix groups, alphabetical runs, search) ----------
+
+/** Option budgets for model picker Selects at a given Select limit (default 64). */
+export const modelPickerBudget = (max = MAX_SELECT_OPTIONS) => {
+  const cap = Math.max(4, max)
+  return {
+    /** Max options a Select can hold. */
+    max: cap,
+    /** Max models in a leaf Select alongside Default, Other… and an already-selected model (61 at 64). */
+    leaf: Math.max(1, cap - 3),
+    /** Max models in one ungrouped Select alongside Default and Other… (62 at 64). */
+    single: Math.max(1, cap - 2),
+    /** Max children in a group Select before wrapping those children into runs (63 at 64). */
+    group: Math.max(2, cap - 1),
+  }
+}
+
+export const OTHER_MODELS_GROUP = '__other_models__'
+
+export const stripModelPrefix = (text: string, prefix: string): string =>
+  prefix && text.startsWith(prefix) && text.length > prefix.length ? text.slice(prefix.length) : text
+
+export const modelOptionLabel = (m: HarnessModel, prefix = ''): string => {
+  const id = stripModelPrefix(m.id, prefix)
+  const name = m.name ? stripModelPrefix(m.name, prefix) : undefined
+  return [name && name !== id && name !== m.id ? `${name} (${id})` : id, m.note].filter(Boolean).join(' · ')
+}
+
+export const routeModelOptionLabel = (m: HarnessModel, prefix = ''): string => stripModelPrefix(m.name || m.id, prefix)
+
+/** Case-insensitive search matching a model's id or display name across all groups. */
+export const filterModels = (models: readonly HarnessModel[], text: string): HarnessModel[] => {
+  const q = text.trim().toLowerCase()
+  if (!q) return [...models]
+  return models.filter(m => m.id.toLowerCase().includes(q) || (m.name?.toLowerCase().includes(q) ?? false))
+}
+
+export type ModelGroup = {
+  key: string
+  label: string
+  /** Prefix segment (without `/`) when this group came from a `/` segment; absent for "other models". */
+  segment?: string
+  models: HarnessModel[]
+}
+
+export type GroupedModels =
+  | { kind: 'shared'; segment: string }
+  | { kind: 'split'; groups: ModelGroup[] }
+  | { kind: 'none' }
+
+const compareNames = (a: string, b: string): number => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true })
+
+/**
+ * Splits `models` by the `/` segment at `prefixDepth` when most ids have one.
+ * A prefix shared by every model returns `shared` (so the caller skips down a level);
+ * prefixes with two or more models become groups, and singletons + non-segmented ids
+ * gather under "other models".
+ */
+export const groupModels = (models: readonly HarnessModel[], prefixDepth = 0): GroupedModels => {
+  const bySeg = new Map<string, HarnessModel[]>()
+  const withoutSeg: HarnessModel[] = []
+  for (const m of models) {
+    const parts = m.id.split('/')
+    const seg = parts.length > prefixDepth + 1 ? parts[prefixDepth] : ''
+    if (seg) {
+      let bucket = bySeg.get(seg)
+      if (!bucket) {
+        bucket = []
+        bySeg.set(seg, bucket)
+      }
+      bucket.push(m)
+    } else {
+      withoutSeg.push(m)
+    }
+  }
+  const withSegCount = models.length - withoutSeg.length
+  if (withSegCount <= models.length / 2) return { kind: 'none' }
+  if (withoutSeg.length === 0 && bySeg.size === 1) {
+    const [segment] = bySeg.keys()
+    return { kind: 'shared', segment: segment! }
+  }
+  const real: { seg: string; models: HarnessModel[] }[] = []
+  const other: HarnessModel[] = []
+  for (const [seg, list] of bySeg) {
+    if (list.length >= 2) real.push({ seg, models: list })
+    else other.push(...list)
+  }
+  other.push(...withoutSeg)
+  if (real.length === 0) return { kind: 'none' }
+  real.sort((a, b) => compareNames(a.seg, b.seg))
+  const groups: ModelGroup[] = real.map(({ seg, models: list }) => ({
+    key: seg === OTHER_MODELS_GROUP ? `seg:${seg}` : seg,
+    label: `${seg} (${list.length})`,
+    segment: seg,
+    models: list,
+  }))
+  if (other.length > 0) {
+    groups.push({ key: OTHER_MODELS_GROUP, label: `other models (${other.length})`, models: other })
+  }
+  return { kind: 'split', groups }
+}
+
+export type ModelTreeLeaf = {
+  kind: 'leaf'
+  /** Chosen `/` prefix (ending in `/` or empty) to drop from model labels. */
+  prefix: string
+  models: HarnessModel[]
+}
+
+export type ModelTreeChild = {
+  key: string
+  label: string
+  count: number
+  node: ModelTreeNode
+}
+
+export type ModelTreeBranch = {
+  kind: 'branch'
+  by: 'prefix' | 'run'
+  prefix: string
+  children: ModelTreeChild[]
+}
+
+export type ModelTreeNode = ModelTreeLeaf | ModelTreeBranch
+
+const balancedChunks = <T>(items: readonly T[], maxPerChunk: number): T[][] => {
+  const count = Math.ceil(items.length / maxPerChunk)
+  const out: T[][] = []
+  let at = 0
+  for (let i = 0; i < count; i++) {
+    const size = Math.ceil((items.length - at) / (count - i))
+    out.push(items.slice(at, at + size))
+    at += size
+  }
+  return out
+}
+
+const commonPrefixLen = (strings: readonly string[]): number => {
+  if (strings.length < 2) return 0
+  const first = strings[0]!
+  let len = first.length
+  for (let i = 1; i < strings.length && len > 0; i++) {
+    const s = strings[i]!
+    len = Math.min(len, s.length)
+    for (let j = 0; j < len; j++) {
+      if (first[j] !== s[j]) {
+        len = j
+        break
+      }
+    }
+  }
+  // Back up to a natural boundary so names stay readable.
+  const sep = Math.max(first.lastIndexOf('/', len - 1), first.lastIndexOf('.', len - 1), first.lastIndexOf('-', len - 1), first.lastIndexOf('_', len - 1), first.lastIndexOf(' ', len - 1))
+  return sep >= 0 ? sep + 1 : 0
+}
+
+const trimTag = (s: string, skip = 0): string => {
+  const t = s.slice(skip).trim() || s.trim()
+  return t.length <= 20 ? t : `${t.slice(0, 19)}…`
+}
+
+const rangeLabels = <T>(chunks: readonly T[][], keyOf: (item: T) => string, countOf: (chunk: T[]) => number): string[] => {
+  const pairs = chunks.map(c => ({ first: keyOf(c[0]!).trim(), last: keyOf(c[c.length - 1]!).trim(), count: countOf(c) }))
+  const oneChar = pairs.map(({ first, last }) => {
+    const lo = (first[0] ?? '?').toLowerCase()
+    const hi = (last[0] ?? '?').toLowerCase()
+    return lo === hi ? lo : `${lo} … ${hi}`
+  })
+  if (new Set(oneChar).size === oneChar.length) {
+    return pairs.map((p, i) => `${oneChar[i]} (${p.count})`)
+  }
+  const direct = pairs.map(({ first, last }) => {
+    const lo = trimTag(first)
+    const hi = trimTag(last)
+    return lo === hi ? lo : `${lo} … ${hi}`
+  })
+  if (new Set(direct).size === direct.length) {
+    return pairs.map((p, i) => `${direct[i]} (${p.count})`)
+  }
+  const skip = commonPrefixLen(pairs.flatMap(p => [p.first, p.last]))
+  return pairs.map(({ first, last, count }) => {
+    const lo = trimTag(first, skip)
+    const hi = trimTag(last, skip)
+    return `${lo === hi ? lo : `${lo} … ${hi}`} (${count})`
+  })
+}
+
+const wrapBranch = (by: 'prefix' | 'run', prefix: string, children: ModelTreeChild[], maxChildren: number): ModelTreeBranch => {
+  if (children.length <= maxChildren) return { kind: 'branch', by, prefix, children }
+  const chunks = balancedChunks(children, maxChildren)
+  const labels = rangeLabels(
+    chunks,
+    c => (c.key === OTHER_MODELS_GROUP ? 'other' : c.label.replace(/\s*\(\d+\)$/, '')),
+    chunk => chunk.reduce((n, c) => n + c.count, 0),
+  )
+  const wrapped: ModelTreeChild[] = chunks.map((chunk, i) => ({
+    key: `run:${i}`,
+    label: labels[i]!,
+    count: chunk.reduce((n, c) => n + c.count, 0),
+    node: { kind: 'branch', by, prefix, children: chunk },
+  }))
+  return wrapBranch('run', prefix, wrapped, maxChildren)
+}
+
+/**
+ * Builds a tree of model groups so every Select stays within `max` options (default 64):
+ * leaves hold at most `leaf` models (61 at 64); larger nodes split by `/` segments (skipping
+ * a segment shared by every model) or fall back to name-ordered runs.
+ */
+export const buildModelTree = (models: readonly HarnessModel[], opts: { max?: number } = {}): ModelTreeNode => {
+  const budget = modelPickerBudget(opts.max)
+  const build = (list: readonly HarnessModel[], depth: number, prefix: string, allowPrefix: boolean): ModelTreeNode => {
+    if (list.length <= budget.leaf) return { kind: 'leaf', prefix, models: [...list] }
+    if (allowPrefix) {
+      const grouped = groupModels(list, depth)
+      if (grouped.kind === 'shared') {
+        return build(list, depth + 1, `${prefix}${grouped.segment}/`, true)
+      }
+      if (grouped.kind === 'split') {
+        const children: ModelTreeChild[] = grouped.groups.map(g => ({
+          key: g.key,
+          label: g.label,
+          count: g.models.length,
+          node:
+            g.segment !== undefined
+              ? build(g.models, depth + 1, `${prefix}${g.segment}/`, true)
+              : build(g.models, depth, prefix, false),
+        }))
+        return wrapBranch('prefix', prefix, children, budget.group)
+      }
+    }
+    const keyOf = (m: HarnessModel) => stripModelPrefix(m.name || m.id, prefix)
+    const sorted = [...list].sort((a, b) => compareNames(keyOf(a), keyOf(b)))
+    const chunks = balancedChunks(sorted, budget.leaf)
+    const labels = rangeLabels(chunks, keyOf, c => c.length)
+    const children: ModelTreeChild[] = chunks.map((chunk, i) => ({
+      key: `run:${i}`,
+      label: labels[i]!,
+      count: chunk.length,
+      node: { kind: 'leaf', prefix, models: chunk },
+    }))
+    return wrapBranch('run', prefix, children, budget.group)
+  }
+  return build(models, 0, '', true)
+}
+
+const findModelPath = (node: ModelTreeNode, id: string): string[] | undefined => {
+  if (node.kind === 'leaf') return node.models.some(m => m.id === id) ? [] : undefined
+  for (const child of node.children) {
+    const rest = findModelPath(child.node, id)
+    if (rest) return [child.key, ...rest]
+  }
+  return undefined
+}
+
+export type PickerLevel =
+  | {
+      kind: 'group'
+      depth: number
+      label: string
+      value: string
+      options: SelectOption[]
+    }
+  | {
+      kind: 'model'
+      depth: number
+      label: string
+      value: string
+      options: SelectOption[]
+      prefix: string
+    }
+
+export type PickerLevelsOptions = {
+  selected?: string
+  group?: readonly string[]
+  filter?: string
+  max?: number
+  defaultLabel?: string
+  hasOther?: boolean
+  otherValue?: string
+  isTyping?: boolean
+  labelOf?: (model: HarnessModel, prefix: string) => string
+}
+
+export type PickerState = {
+  levels: PickerLevel[]
+  group: string[]
+  showSearch: boolean
+  matchCount: number
+  narrowHint?: string
+}
+
+const uniqueOptions = (options: readonly SelectOption[]): SelectOption[] => {
+  const seen = new Set<string>()
+  const out: SelectOption[] = []
+  for (const o of options) {
+    if (seen.has(o.value)) continue
+    seen.add(o.value)
+    out.push(o)
+  }
+  return out
+}
+
+/**
+ * Turns a harness's model list into the Selects to draw, keeping every Select within `max`
+ * options (default 64). Under the single-Select limit it returns one flat Select unchanged;
+ * above it, returns group Selects down to a leaf model Select plus search state.
+ */
+export const pickerLevels = (models: readonly HarnessModel[], opts: PickerLevelsOptions = {}): PickerState => {
+  const budget = modelPickerBudget(opts.max)
+  const defaultLabel = opts.defaultLabel ?? 'Default'
+  const otherValue = opts.otherValue ?? '__other__'
+  const hasOther = opts.hasOther ?? true
+  const labelOf = opts.labelOf ?? modelOptionLabel
+  const selected = opts.selected || undefined
+  const isKnownSelected = !!selected && models.some(m => m.id === selected)
+  const isTyping = opts.isTyping || (hasOther && !!selected && !isKnownSelected)
+  const fixedHead: SelectOption[] = [{ value: '', label: defaultLabel }]
+  const fixedTail: SelectOption[] = hasOther ? [{ value: otherValue, label: 'Other…' }] : []
+  const filter = opts.filter?.trim() ?? ''
+  const showSearch = models.length > budget.single
+
+  const buildLeaf = (leafModels: readonly HarnessModel[], prefix: string, depth: number): PickerLevel => {
+    const middle: SelectOption[] = leafModels.map(m => ({ value: m.id, label: labelOf(m, prefix) }))
+    if (!isTyping && selected && !leafModels.some(m => m.id === selected) && selected !== otherValue) {
+      const selModel = models.find(m => m.id === selected)
+      middle.unshift({ value: selected, label: selModel ? labelOf(selModel, '') : selected })
+    }
+    const capped = capSelectOptions(uniqueOptions(middle), {
+      max: budget.max,
+      keep: isTyping ? undefined : selected,
+      fixedHead,
+      fixedTail,
+    })
+    return {
+      kind: 'model',
+      depth,
+      label: 'Model',
+      value: isTyping ? otherValue : (selected ?? ''),
+      options: uniqueOptions(capped.options),
+      prefix,
+    }
+  }
+
+  if (!showSearch) {
+    return {
+      levels: [buildLeaf(models, '', 0)],
+      group: [],
+      showSearch: false,
+      matchCount: models.length,
+    }
+  }
+
+  const matched = filter ? filterModels(models, filter) : [...models]
+  if (filter && matched.length <= budget.leaf) {
+    return {
+      levels: [buildLeaf(matched, '', 0)],
+      group: [],
+      showSearch: true,
+      matchCount: matched.length,
+    }
+  }
+
+  const narrowHint = filter ? `${matched.length} matches · type more to narrow` : undefined
+  const tree = buildModelTree(matched, { max: budget.max })
+  const selectedPath = selected ? findModelPath(tree, selected) : undefined
+  const levels: PickerLevel[] = []
+  const resolvedGroup: string[] = []
+  let node: ModelTreeNode = tree
+  let depth = 0
+  let followsSelected = !!selectedPath
+
+  while (node.kind === 'branch') {
+    const wanted = opts.group?.[depth]
+    const byWanted = wanted !== undefined ? node.children.find(c => c.key === wanted) : undefined
+    const bySelected =
+      !byWanted && followsSelected && selectedPath?.[depth] !== undefined
+        ? node.children.find(c => c.key === selectedPath[depth])
+        : undefined
+    const chosen = byWanted ?? bySelected ?? node.children[0]!
+    if (byWanted && selectedPath?.[depth] !== byWanted.key) followsSelected = false
+    const groupLabel = node.by === 'run' ? 'Range' : depth === 0 ? 'Provider' : 'Group'
+    const cappedGroup = capSelectOptions(
+      uniqueOptions(node.children.map(c => ({ value: c.key, label: c.label }))),
+      { max: budget.max, keep: chosen.key },
+    )
+    levels.push({
+      kind: 'group',
+      depth,
+      label: groupLabel,
+      value: chosen.key,
+      options: uniqueOptions(cappedGroup.options),
+    })
+    resolvedGroup.push(chosen.key)
+    node = chosen.node
+    depth++
+  }
+
+  levels.push(buildLeaf(node.models, node.prefix, depth))
+  return {
+    levels,
+    group: resolvedGroup,
+    showSearch: true,
+    matchCount: matched.length,
+    narrowHint,
   }
 }
 

@@ -9,7 +9,6 @@ import {
   shownWindows,
   CARD_STALE_MS,
   METER_PROVIDERS,
-  capSelectOptions,
   cardModelName,
   effortProblem,
   fmtSpan,
@@ -17,10 +16,14 @@ import {
   limitSummary,
   codexLiveError,
   parseCodexLimitsOutput,
+  pickerLevels,
   readingAge,
   resetNote,
   routeEffortChoices,
+  routeModelOptionLabel,
+  routeModels,
   shouldTakeCodexLimits,
+  type PickerLevel,
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
@@ -53,7 +56,6 @@ import {
   harnessCommand,
   fromPreset,
   harnessError,
-  modelLabel,
   modelQuery,
   parseLine,
   parseModels,
@@ -106,6 +108,7 @@ const settingsSectionAtom = atom({ plugin: 'agent-deck', key: 'settingsSection' 
 const settingsInlineAtom = atom({ plugin: 'agent-deck', key: 'settingsInline' } as const, false)
 const taskDraftAtom = atom({ plugin: 'agent-deck', key: 'taskDraft' } as const, '')
 const routeTypingAtom = atom({ plugin: 'agent-deck', key: 'routeTyping' } as const, [] as string[])
+const modelPickerAtom = atom({ plugin: 'agent-deck', key: 'modelPicker' } as const, {} as Record<string, { group?: string[]; filter?: string }>)
 const foundAtom = atom({ plugin: 'agent-deck', key: 'found' } as const, {} as Record<string, boolean>)
 const codexAtom = atom({ plugin: 'agent-deck', key: 'codexEnabled' } as const, false)
 const codexBinAtom = atom({ plugin: 'agent-deck', key: 'codexBin' } as const, {} as CodexBin)
@@ -2276,6 +2279,7 @@ const openSettings = async ($: $T) => {
 const closeSettings = async ($: $T) => {
   const isInline = await read($, settingsInlineAtom)
   await update($, viewAtom, () => ({ mode: 'cards' }))
+  await update($, modelPickerAtom, () => ({}))
   await update($, settingsInlineAtom, () => false)
   if (!isInline) await $.ui.close({ id: SETTINGS_PANE }).catch(() => undefined)
 }
@@ -2302,7 +2306,6 @@ const SETTINGS_TABS: readonly { value: SettingsSection; label: string }[] = [
   { value: 'harnesses', label: 'Harnesses' },
   { value: 'routing', label: 'Task routing' },
   { value: 'meters', label: 'Usage meters' },
-  { value: 'codex', label: 'Codex' },
 ]
 
 /** What each Antigravity view shows, under its picker in Usage meters. */
@@ -2328,7 +2331,9 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
   const list = await read($, agents)
   const lim = await read($, limits)
   const view = await read($, viewAtom)
-  const section = await read($, settingsSectionAtom)
+  const rawSection = await read($, settingsSectionAtom)
+  // An old settingsSection: 'codex' left in session state falls back to Harnesses.
+  const section: SettingsSection = rawSection === 'routing' || rawSection === 'meters' ? rawSection : 'harnesses'
   const hs = await read($, harnessesAtom)
   const found = await read($, foundAtom)
   const codexBin = await read($, codexBinAtom)
@@ -2337,6 +2342,7 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
   const routingState = await read($, routingAtom)
   const taskDraft = await read($, taskDraftAtom)
   const routeTyping = await read($, routeTypingAtom)
+  const modelPicker = await read($, modelPickerAtom)
   const { hasReading } = meterReadings(list, hs, lim, isCodexOn)
   const cols = Math.max(24, e.props.bodyColumns || e.viewport?.columns || 60)
   // A field's least width: it wraps to the next line below that, and never asks for more than a card holds.
@@ -2455,7 +2461,7 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
             variant={isCodexOn ? 'primary' : undefined}
             onPress={() => void setCodexEnabled($, !isCodexOn)}
           />
-          <Button key="cx-edit" label="Edit" onPress={() => void showSection('codex')} />
+          <Button key="cx-edit" label="Edit" onPress={() => void setView({ mode: 'codex' })} />
         </Box>
       </Box>
     </Box>
@@ -2588,6 +2594,11 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
 
   /** Opens the edit form, asking for the harness's models right away when it has none yet. */
   const openEdit = async (draft: Harness, originalId?: string) => {
+    await update($, modelPickerAtom, cur => {
+      if (!('h' in cur)) return cur
+      const { h: _h, ...rest } = cur
+      return rest
+    })
     await setView({ mode: 'edit', draft, originalId })
     if (!draft.models?.length) await loadModels(draft)
   }
@@ -2595,8 +2606,113 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
   const OTHER_MODEL = '__other__'
 
   /**
-   * The model, as one control: a dropdown of what the harness reports (its default first,
-   * Other… last), or a text field where it reports nothing.
+   * Shared model picker used by both the harness edit view and Task routing cards.
+   * Under 64 models it draws one Select; above it, draws a Search models input and
+   * prefix/run group Selects so every model is reachable within 64 options per Select.
+   */
+  const modelPickerControl = (opts: {
+    pickerId: string
+    selectKey: string
+    models: readonly HarnessModel[]
+    selected: string | undefined
+    defaultLabel: string
+    isTyping: boolean
+    hasOther: boolean
+    showLabels: boolean
+    labelOf?: (model: HarnessModel, prefix: string) => string
+    right?: RenderElement | false
+    onSelectModel: (value: string) => void
+    customInput?: RenderElement | false
+  }) => {
+    if (!Select) return undefined
+    const saved = modelPicker[opts.pickerId] ?? {}
+    const filter = saved.filter ?? ''
+    const state = pickerLevels(opts.models, {
+      selected: opts.selected,
+      group: saved.group,
+      filter,
+      defaultLabel: opts.defaultLabel,
+      hasOther: opts.hasOther,
+      otherValue: OTHER_MODEL,
+      isTyping: opts.isTyping,
+      labelOf: opts.labelOf,
+    })
+    const setFilter = (text: string) =>
+      void update($, modelPickerAtom, cur => ({ ...cur, [opts.pickerId]: { ...cur[opts.pickerId], filter: text, group: undefined } }))
+    const setGroup = (depth: number, value: string) =>
+      void update($, modelPickerAtom, cur => ({
+        ...cur,
+        [opts.pickerId]: { ...cur[opts.pickerId], group: [...state.group.slice(0, depth), value] },
+      }))
+    const groupLevels = state.levels.filter((l): l is Extract<PickerLevel, { kind: 'group' }> => l.kind === 'group')
+    const modelLevel = state.levels.find((l): l is Extract<PickerLevel, { kind: 'model' }> => l.kind === 'model')!
+    const isMulti = state.showSearch || groupLevels.length > 0
+    const modelSelect = (
+      <Select
+        key={opts.selectKey}
+        label={opts.showLabels || isMulti ? modelLevel.label : undefined}
+        options={modelLevel.options}
+        value={modelLevel.value}
+        onSelect={v => {
+          if (v && v !== OTHER_MODEL) {
+            void update($, modelPickerAtom, cur =>
+              cur[opts.pickerId]?.group ? { ...cur, [opts.pickerId]: { ...cur[opts.pickerId], group: undefined } } : cur,
+            )
+          }
+          opts.onSelectModel(v)
+        }}
+      />
+    )
+    return (
+      <Box flexDirection="column" gap={opts.showLabels ? 1 : 0}>
+        {state.showSearch && Input && (
+          <Input
+            key={`${opts.selectKey}-search`}
+            label="Search models"
+            placeholder="id or name"
+            value={filter}
+            submitLabel="filter"
+            onInput={setFilter}
+            onSubmit={setFilter}
+          />
+        )}
+        {state.narrowHint && (
+          <Text dimColor wrap="wrap">
+            {state.narrowHint}
+          </Text>
+        )}
+        {filter.trim() && state.matchCount === 0 && (
+          <Text dimColor wrap="wrap">
+            {opts.hasOther ? 'No matching models · pick Other… to type any id' : 'No matching models'}
+          </Text>
+        )}
+        {groupLevels.map(g => (
+          <Select
+            key={`${opts.selectKey}-g-${g.depth}`}
+            label={g.label}
+            options={g.options}
+            value={g.value}
+            onSelect={v => setGroup(g.depth, v)}
+          />
+        ))}
+        <Box flexDirection="row" columnGap={1} alignItems="center" flexWrap={opts.showLabels ? 'wrap' : undefined}>
+          {opts.showLabels ? (
+            modelSelect
+          ) : (
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              {modelSelect}
+            </Box>
+          )}
+          {opts.right}
+        </Box>
+        {opts.isTyping && opts.customInput}
+      </Box>
+    )
+  }
+
+  /**
+   * The model, as one control: a dropdown (or grouped dropdowns + search for large lists) of what
+   * the harness reports (its default first, Other… last), or a text field where it reports nothing.
    */
   const modelSection = (v: Extract<HarnessView, { mode: 'edit' }>) => {
     const d = v.draft
@@ -2610,39 +2726,29 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
       <Button key="h-models-list" label={label} onPress={() => void loadModels(d)} />
     )
     if (known.length && Select) {
-      const capped = capSelectOptions(
-        known.map(m => ({ value: m.id, label: modelLabel(m) })),
-        {
-          keep: d.model,
-          fixedHead: [{ value: '', label: "Default (the CLI's choice)" }],
-          fixedTail: [{ value: OTHER_MODEL, label: 'Other…' }],
-        },
-      )
       const isTyping = v.isTypingModel || isCustom
       return (
         <Box key="h-models" flexDirection="column" gap={1}>
-          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-            <Select
-              key="h-model-pick"
-              label="Model"
-              options={capped.options}
-              value={isTyping ? OTHER_MODEL : (d.model ?? '')}
-              onSelect={s =>
-                void update($, viewAtom, cur =>
-                  cur.mode !== 'edit'
-                    ? cur
-                    : s === OTHER_MODEL
-                      ? { ...cur, isTypingModel: true }
-                      : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
-                )
-              }
-            />
-            {isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻')}
-          </Box>
-          {capped.isCapped && (
-            <Text dimColor wrap="wrap">{`Showing ${capped.shown} of ${capped.total} models · pick Other… to type any id`}</Text>
-          )}
-          {isTyping && typed('Model id')}
+          {modelPickerControl({
+            pickerId: 'h',
+            selectKey: 'h-model-pick',
+            models: known,
+            selected: d.model,
+            defaultLabel: "Default (the CLI's choice)",
+            isTyping,
+            hasOther: true,
+            showLabels: true,
+            right: isLoading ? <Text dimColor>refreshing…</Text> : refresh('↻'),
+            onSelectModel: s =>
+              void update($, viewAtom, cur =>
+                cur.mode !== 'edit'
+                  ? cur
+                  : s === OTHER_MODEL
+                    ? { ...cur, isTypingModel: true }
+                    : { ...cur, isTypingModel: false, error: undefined, draft: { ...cur.draft, model: s || undefined, autoTier: s === 'auto' || !s ? cur.draft.autoTier : undefined } },
+              ),
+            customInput: typed('Model id'),
+          })}
           {st && st !== 'loading' && (
             <Text color="error" wrap="wrap">
               {`Could not refresh the models: ${st.error}`}
@@ -2798,9 +2904,10 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
   const setRouteTyping = (task: string, on: boolean) =>
     update($, routeTypingAtom, cur => (on ? (cur.includes(task) ? cur : [...cur, task]) : cur.filter(t => t !== task)))
 
-  /** The route's model: a picker of what its agent reports (capped to 64 with Other…), with ↻ to ask again, or a field to type the id. */
+  /** The route's model: a picker of what its agent reports (grouped + searchable above 64, with Other…), with ↻ to ask again, or a field to type the id. */
   const routeModelField = (r: TaskRoute) => {
     const target = hs.find(x => x.id === r.target)
+    const models = routeModels(r.target, target, codexBin.chosen?.models)
     const known = routeModelChoices(r.target, target, codexBin.chosen?.models)
     const defaultModel = r.target === 'codex' ? codexDefaults.model : target?.model
     const how = target && modelQuery(target)
@@ -2812,51 +2919,37 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
     const isCustom = !!r.model && !picked
     const note = r.model ? picked?.detail : defaultModel && r.target !== 'claude' ? `default: ${defaultModel}` : undefined
     let control: RenderElement | undefined
-    if (Select && known.length) {
+    if (Select && models.length) {
       const isTyping = !!Input && (routeTyping.includes(r.task) || isCustom)
-      const middle = [
-        ...known.map(k => ({ value: k.value, label: k.label })),
-        ...(!Input && isCustom ? [{ value: r.model!, label: r.model! }] : []),
-      ]
-      const capped = capSelectOptions(middle, {
-        keep: isTyping ? undefined : r.model,
-        fixedHead: [{ value: '', label: r.target === 'claude' ? "Claude's choice" : 'Default' }],
-        fixedTail: Input ? [{ value: OTHER_MODEL, label: 'Other…' }] : [],
+      control = modelPickerControl({
+        pickerId: `r-${r.task}`,
+        selectKey: `r-model-${r.task}`,
+        models,
+        selected: r.model,
+        defaultLabel: r.target === 'claude' ? "Claude's choice" : 'Default',
+        isTyping,
+        hasOther: !!Input,
+        showLabels: false,
+        labelOf: routeModelOptionLabel,
+        right: refreshButton,
+        onSelectModel: v => {
+          if (v === OTHER_MODEL) void setRouteTyping(r.task, true)
+          else void setRouteTyping(r.task, false).then(() => setRoute(r.task, { model: v || undefined }))
+        },
+        customInput: Input && (
+          <Input
+            key={`r-model-input-${r.task}`}
+            value={r.model ?? ''}
+            placeholder={defaultModel ?? 'model id'}
+            submitLabel="keep"
+            onSubmit={v => {
+              const clean = v.trim() || undefined
+              const isKnown = !clean || known.some(k => k.value === clean)
+              void setRouteTyping(r.task, !isKnown).then(() => setRoute(r.task, { model: clean }))
+            }}
+          />
+        ),
       })
-      control = (
-        <Box flexDirection="column" gap={0}>
-          <Box flexDirection="row" columnGap={1} alignItems="center">
-            <Box flexGrow={1} flexShrink={1} minWidth={0}>
-              <Select
-                key={`r-model-${r.task}`}
-                options={capped.options}
-                value={isTyping ? OTHER_MODEL : (r.model ?? '')}
-                onSelect={v => {
-                  if (v === OTHER_MODEL) void setRouteTyping(r.task, true)
-                  else void setRouteTyping(r.task, false).then(() => setRoute(r.task, { model: v || undefined }))
-                }}
-              />
-            </Box>
-            {refreshButton}
-          </Box>
-          {capped.isCapped && (
-            <Text dimColor wrap="wrap">{`Showing ${capped.shown} of ${capped.total} models · pick Other… to type any id`}</Text>
-          )}
-          {isTyping && Input && (
-            <Input
-              key={`r-model-input-${r.task}`}
-              value={r.model ?? ''}
-              placeholder={defaultModel ?? 'model id'}
-              submitLabel="keep"
-              onSubmit={v => {
-                const clean = v.trim() || undefined
-                const isKnown = !clean || known.some(k => k.value === clean)
-                void setRouteTyping(r.task, !isKnown).then(() => setRoute(r.task, { model: clean }))
-              }}
-            />
-          )}
-        </Box>
-      )
     } else if (Input) {
       control = (
         <Box flexDirection="row" columnGap={1} alignItems="center">
@@ -2946,6 +3039,14 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
                 value={r.target}
                 onSelect={v =>
                   void setRouteTyping(r.task, false)
+                    .then(() =>
+                      update($, modelPickerAtom, cur => {
+                        const k = `r-${r.task}`
+                        if (!(k in cur)) return cur
+                        const { [k]: _drop, ...rest } = cur
+                        return rest
+                      }),
+                    )
                     .then(() => setRoute(r.task, { target: v, model: undefined, effort: undefined }))
                     .then(() => (v ? refreshRoutedModels($, { only: v }) : undefined))
                 }
@@ -3175,9 +3276,14 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
     )
   }
 
-  const codexSection = () => (
+  const codexEditView = () => (
     <Box flexDirection="column" gap={1}>
-      {sectionHead('Codex', 'How Codex runs, and which Codex CLI it starts.')}
+      <Text bold>
+        Edit <Text color={CODEX_ACCENT}>● Codex</Text>
+      </Text>
+      <Text dimColor wrap="wrap">
+        How Codex runs, and which Codex CLI it starts.
+      </Text>
       <Box {...CARD}>
         {Select && (
           <Select
@@ -3202,6 +3308,9 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
         </Text>
       </Box>
       <Box {...CARD}>{codexBinSection()}</Box>
+      <Box flexDirection="row" gap={1} flexWrap="wrap">
+        <Button key="cx-done" label="Done" variant="primary" onPress={() => void backToHarnesses()} />
+      </Box>
     </Box>
   )
 
@@ -3219,9 +3328,12 @@ const renderSettings = async ($: $T, e: RenderInput<'Pane'>, isInline: boolean):
     }
   }
   if (view.mode === 'edit') return orBack(() => frame(editView(view), false))
-  if (section === 'codex' && codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
+  if (view.mode === 'codex') {
+    if (codexBin.at === undefined && !codexBin.isChecking) void findCodex($).catch(() => undefined)
+    return orBack(() => frame(codexEditView(), false))
+  }
   return orBack(() =>
-    frame(section === 'routing' ? routingSection() : section === 'meters' ? metersSection() : section === 'codex' ? codexSection() : harnessesSection(), true),
+    frame(section === 'routing' ? routingSection() : section === 'meters' ? metersSection() : harnessesSection(), true),
   )
 }
 
