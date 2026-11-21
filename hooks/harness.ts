@@ -1123,13 +1123,16 @@ export const loadSessionCards = (stored: unknown, sessionId: string, maxOutput =
 }
 
 /**
- * Adjusts a restored card's status after a reload or restart: a running Claude subagent
- * can't outlive the process, and a running external Codex card with no recent rollout
- * event shouldn't spin forever.
+ * Adjusts a restored card's status after a reload or restart. On a hot reload
+ * (`isSameProcess`), Claude Code is still running, so running Claude subagents stay
+ * running; on a fresh start they can't outlive the old process and become aborted.
+ * A running external Codex card with no recent rollout event shouldn't spin forever.
  */
-export const restoreCard = (card: AgentCard, now: number, staleMs = CARD_STALE_MS): AgentCard => {
+export const restoreCard = (card: AgentCard, now: number, staleMs = CARD_STALE_MS, isSameProcess = false): AgentCard => {
   if (card.status !== 'running') return card
-  if (card.provider === 'claude') return { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? now }
+  if (card.provider === 'claude') {
+    return isSameProcess ? card : { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? now }
+  }
   if (card.isExternal && card.provider === 'codex') {
     const last = card.lastEventAt ?? card.startedAt
     if (now - last > staleMs) return { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? last }

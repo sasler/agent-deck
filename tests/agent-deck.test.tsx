@@ -1537,11 +1537,17 @@ test('saved cards merge, trim, prune entries older than 3 days, and restore stat
   expect(loadSessionCards(null, 'sid-1')).toEqual([])
 
   const runningClaude = sampleCard({ id: 'cl-1', provider: 'claude', status: 'running', isThinking: true })
+  // Fresh start (new process): running Claude subagent becomes aborted.
   expect(restoreCard(runningClaude, now)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now })
+  // Hot reload (same process): running Claude subagent keeps running.
+  const keptClaude = restoreCard(runningClaude, now, CARD_STALE_MS, true)
+  expect(keptClaude).toMatchObject({ status: 'running', isThinking: true })
+  expect(keptClaude.endedAt).toBeUndefined()
   expect(restoreCard({ ...runningClaude, status: 'done' }, now).status).toBe('done')
 
   const staleExt = sampleCard({ id: 'codex-t1', provider: 'codex', isExternal: true, status: 'running', isThinking: true, lastEventAt: now - CARD_STALE_MS - 1000 })
   expect(restoreCard(staleExt, now)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now - CARD_STALE_MS - 1000 })
+  expect(restoreCard(staleExt, now, CARD_STALE_MS, true)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now - CARD_STALE_MS - 1000 })
 
   const freshExt = sampleCard({ id: 'codex-t2', provider: 'codex', isExternal: true, status: 'running', lastEventAt: now - 30_000 })
   expect(restoreCard(freshExt, now).status).toBe('running')
@@ -1655,6 +1661,118 @@ test('a reopened session restores its saved cards after a restart, aborts stale 
   })
   expect(await band.find({ text: /no agents running/ })).toBeDefined()
   await band.unmount()
+})
+
+test('a hot reload keeps a running Claude subagent running, and late events revive or finish an aborted one', async ($, on) => {
+  const startNow = 10 * 86_400_000
+  const clock = mock.clock(on, { now: startNow })
+  mock.store(on, { harnesses: [], 'codex-enabled': false })
+  on('session.id', () => ({ value: 'sid-reload-claude' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-live' }))
+  on('turn.complete', () => ({ text: '' }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({
+    tool_use_id: 't-live', prompt: 'edit repo', description: 'Refactor parser', subagentType: 'general-purpose',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await clock.advance(60_000)
+
+  // Hot reload: session.start runs again while the agents atom still holds the running card.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  expect(await ui.find({ text: /general-purpose · Refactor parser/ })).toBeDefined()
+  expect(await ui.find({ text: /^running$/ })).toBeDefined()
+  expect(await ui.find({ text: /^■$/ })).toBeUndefined()
+
+  // The real turn.complete arrives later and marks it done.
+  await clock.advance(120_000)
+  await $.turn.complete({ agentId: 'agent-live', answer: 'all done', reason: 'end_turn', durationMs: 180_000, isAborted: false } as never)
+  await clock.advance(250)
+  await ui.redraw()
+  expect(await ui.find({ text: /Finished · 1/ })).toBeDefined()
+  expect(await ui.find({ text: /^✓$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('turn.complete finishes an aborted Claude card without touching done cards, and turn.step/tool.call revive aborted ones', async ($, on) => {
+  const startNow = 20 * 86_400_000
+  const restartNow = startNow + 5 * 60_000
+  const clock = mock.clock(on, { now: restartNow })
+  const agentFinish = sampleCard({ id: 'agent-finish', provider: 'claude', title: 'Explore · Finish me', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow })
+  const agentStep = sampleCard({ id: 'agent-step', provider: 'claude', title: 'Explore · Step me', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow })
+  const agentTool = sampleCard({ id: 'agent-tool', provider: 'claude', title: 'Explore · Tool me', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow })
+  const agentDone = sampleCard({ id: 'agent-done', provider: 'claude', title: 'Explore · Already done', model: 'claude-haiku-5-5', status: 'done', startedAt: startNow, endedAt: startNow + 10_000 })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: { 'sid-revive': { savedAt: startNow + 10_000, cards: [agentFinish, agentStep, agentTool, agentDone] } },
+  })
+  on('session.id', () => ({ value: 'sid-revive' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('turn.step', async function* (_$, e) {
+    yield { kind: 'text', text: 'still working', index: 0 } as never
+    return { turnId: e.turnId, index: e.index, answer: 'still working', toolUses: [], stopReason: 'end_turn' }
+  })
+  on('tool.call', () => ({ result: 'ok' }) as never)
+
+  // Loaded from store (empty atom): the three running Claude cards start as aborted.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  // 1. turn.complete on an aborted Claude card marks it done; on an already-done card does nothing.
+  await clock.advance(10_000)
+  await $.turn.complete({ agentId: 'agent-finish', answer: 'finished', reason: 'end_turn', durationMs: 60_000, isAborted: false } as never)
+  await $.turn.complete({ agentId: 'agent-done', answer: '', reason: 'error', durationMs: 60_000, isAborted: false } as never)
+
+  // 2. turn.step revives an aborted Claude card back to running.
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, agentId: 'agent-step', model: 'claude-haiku-5-5', messageCount: 2 })) {
+    // consume stream
+  }
+
+  // 3. tool.call revives an aborted Claude card back to running.
+  await $.tool.call({ agentId: 'agent-tool', tool: 'Read', tool_use_id: 'tu-revive', file_path: 'README.md' } as never)
+  await clock.advance(250)
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  // Two cards are running (agent-step and agent-tool), two are finished as done (agent-finish and agent-done).
+  expect((await ui.findAll({ text: /^running$/ })).length).toBe(2)
+  expect(await ui.find({ text: /still working/ })).toBeDefined()
+  expect(await ui.find({ text: /Finished · 2/ })).toBeDefined()
+  expect((await ui.findAll({ text: /^✓$/ })).length).toBe(2)
+  expect(await ui.find({ text: /^■$/ })).toBeUndefined()
+  expect(await ui.find({ text: /^✗$/ })).toBeUndefined()
+  await ui.unmount()
 })
 
 test('restored harness run cards are not duplicated when loadHarnessRuns reloads them from disk', async ($, on) => {

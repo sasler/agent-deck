@@ -459,6 +459,14 @@ const startTicking = ($: $T) => {
   })
 }
 
+const reviveClaudeCard = ($: $T, card: AgentCard) => {
+  if (card.provider === 'claude' && card.status === 'aborted') {
+    card.status = 'running'
+    card.endedAt = undefined
+    startTicking($)
+  }
+}
+
 const setLimits = async ($: $T, fn: (l: Limits) => Limits) => {
   const next = await update($, limits, fn)
   $.ui.status(statusText(next ?? (await read($, limits))))
@@ -2227,12 +2235,14 @@ export const register: Register = on => {
     cards.clear()
     threadToCard.clear()
     const fromAtom = await read($, agents)
-    const initial = fromAtom.length
+    const isSameProcess = fromAtom.length > 0
+    const initial = isSameProcess
       ? fromAtom
       : loadSessionCards(await $.store.get(KEY_CARDS).catch(() => undefined), sessionId, MAX_OUTPUT)
     for (const raw of initial) {
-      // Claude subagents can't outlive a reload; stale external Codex cards shouldn't spin forever.
-      const c = restoreCard(raw, now, STALE_MS)
+      // On a hot reload (cards came from $.state), running Claude subagents are still alive;
+      // on a fresh start (loaded from $.store), they aren't. Stale external Codex cards still stop.
+      const c = restoreCard(raw, now, STALE_MS, isSameProcess)
       cards.set(c.id, c)
       if (c.threadId) threadToCard.set(c.threadId, c.id)
     }
@@ -2309,7 +2319,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
-    if (card && card.status === 'running') {
+    if (card && (card.status === 'running' || (card.provider === 'claude' && card.status === 'aborted'))) {
       card.status = e.isAborted ? 'aborted' : e.reason === 'error' ? 'error' : 'done'
       card.endedAt = await $.clock.now()
       card.isThinking = false
@@ -2348,6 +2358,7 @@ export const register: Register = on => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
     if (!card) return yield* next(e)
 
+    reviveClaudeCard($, card)
     card.model = e.model
     if (e.effort !== undefined) card.effort = String(e.effort)
     if (card.output && !card.output.endsWith('\n')) appendOutput(card, '\n')
@@ -2390,6 +2401,7 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const card = e.agentId ? cards.get(e.agentId) : undefined
     if (!card || [TOOL, RESULT_TOOL, AGENT_TOOL, AGENT_RESULT_TOOL].includes(e.tool)) return next(e)
+    reviveClaudeCard($, card)
     const mark = (status: Activity['status'], label?: string) => {
       card.activity = card.activity.map(a =>
         a.id === e.tool_use_id ? { ...a, status, label: label ?? a.label } : a,
