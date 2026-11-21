@@ -23,7 +23,7 @@ import {
   toLimitWindows,
 } from '../hooks/register'
 import { cacheView, fmtDuration, freshCache, isCold, parseDuration, ttlFor, isGatewayUrl } from '../hooks/cache'
-import { DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, resolveRun, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
+import { CARD_STALE_MS, CARD_TTL_MS, DEFAULT_ROUTING, PRESETS, ROUTING_OFF_NOTE, agentRunSpec, agyLimits, loadRouting, loadSessionCards, mergeSavedCards, resolveRun, restoreCard, routeModelChoices, routeProblem, routedTasks, routingContext, routingNote, applyHarnessEvent, codexErrorText, codexFailure, codexModelProblem, codexUpdateNote, compareVersions, pickCodex, copilotOptionsError, expandArgs, fromPreset, harnessArgs, harnessCommand, harnessError, modelQuery, parseLine, parseModels, providerEnv, slugId, tokenizeArgs, withFusion } from '../hooks/harness'
 import type { AgentCard } from '../types'
 
 test('builds codex exec arguments for new and resumed runs', async () => {
@@ -1493,5 +1493,217 @@ test('an Antigravity harness brings its usage meters into the pane, and keeps th
   // The next check reopens the session the last one reported.
   await clock.advance(10 * 60_000)
   expect(quotaCalls.at(-1)).toEqual(['agy', 'saved-2'])
+  await ui.unmount()
+})
+
+// ---------- persisting cards across restarts ----------
+
+const sampleCard = (overrides: Partial<AgentCard>): AgentCard => ({
+  id: 'card-1',
+  provider: 'codex',
+  title: 'Review branch',
+  model: 'gpt-6.1-sol',
+  status: 'done',
+  startedAt: 1000,
+  output: '',
+  isThinking: false,
+  activity: [],
+  tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+  ...overrides,
+})
+
+test('saved cards merge, trim, prune entries older than 3 days, and restore statuses', () => {
+  const now = 10 * 86_400_000
+  const old = sampleCard({ id: 'old-card', title: 'Old session card' })
+  const other = sampleCard({ id: 'other-card', title: 'Other session card' })
+  const big = sampleCard({ id: 'big-card', output: 'x'.repeat(200) })
+  const stored = {
+    'sid-old': { savedAt: now - CARD_TTL_MS - 1, cards: [old] },
+    'sid-other': { savedAt: now - 60_000, cards: [other] },
+    'sid-bad': { savedAt: 'nope', cards: [old] },
+  }
+  const merged = mergeSavedCards(stored, 'sid-1', [sampleCard({ id: 'c1' }), big], now, { maxCards: 1, maxOutput: 50 })
+  expect(Object.keys(merged).sort()).toEqual(['sid-1', 'sid-other'])
+  expect(merged['sid-1']?.savedAt).toBe(now)
+  expect(merged['sid-1']?.cards.map(c => c.id)).toEqual(['big-card'])
+  expect(merged['sid-1']?.cards[0]?.output.length).toBe(50)
+
+  expect(loadSessionCards(merged, 'sid-other').map(c => c.id)).toEqual(['other-card'])
+  expect(loadSessionCards(merged, 'sid-missing')).toEqual([])
+  expect(loadSessionCards(null, 'sid-1')).toEqual([])
+
+  const runningClaude = sampleCard({ id: 'cl-1', provider: 'claude', status: 'running', isThinking: true })
+  expect(restoreCard(runningClaude, now)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now })
+  expect(restoreCard({ ...runningClaude, status: 'done' }, now).status).toBe('done')
+
+  const staleExt = sampleCard({ id: 'codex-t1', provider: 'codex', isExternal: true, status: 'running', isThinking: true, lastEventAt: now - CARD_STALE_MS - 1000 })
+  expect(restoreCard(staleExt, now)).toMatchObject({ status: 'aborted', isThinking: false, endedAt: now - CARD_STALE_MS - 1000 })
+
+  const freshExt = sampleCard({ id: 'codex-t2', provider: 'codex', isExternal: true, status: 'running', lastEventAt: now - 30_000 })
+  expect(restoreCard(freshExt, now).status).toBe('running')
+
+  const managedRun = sampleCard({ id: 'codex-run-r1', provider: 'codex', runId: 'r1', status: 'running', lastEventAt: now - CARD_STALE_MS - 1000 })
+  expect(restoreCard(managedRun, now).status).toBe('running')
+})
+
+test('saving cards writes the session to the store and prunes entries older than 3 days', async ($, on) => {
+  const startNow = 10 * 86_400_000
+  const clock = mock.clock(on, { now: startNow })
+  const otherCard = sampleCard({ id: 'codex-other', provider: 'codex', isExternal: true, title: 'Other session work', status: 'done', startedAt: startNow - 60_000, endedAt: startNow - 30_000 })
+  const expiredCard = sampleCard({ id: 'codex-expired', title: 'Expired work' })
+  const store = new Map<string, unknown>(Object.entries({
+    harnesses: [],
+    'codex-enabled': false,
+    cards: {
+      'sid-expired': { savedAt: startNow - CARD_TTL_MS - 1000, cards: [expiredCard] },
+      'sid-other': { savedAt: startNow - 60_000, cards: [otherCard] },
+    },
+  }))
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('session.id', () => ({ value: 'sid-keep' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'agent-keep' }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({
+    tool_use_id: 't-keep', prompt: 'scan', description: 'Inspect routes', subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-sonnet-5-5', background: true, fork: false,
+  })
+  await clock.advance(250)
+
+  const saved = store.get('cards') as Record<string, { savedAt: number; cards: AgentCard[] }>
+  expect(Object.keys(saved).sort()).toEqual(['sid-keep', 'sid-other'])
+  expect(saved['sid-keep']?.cards.map(c => [c.id, c.title, c.status])).toEqual([
+    ['agent-keep', 'Explore · Inspect routes', 'running'],
+  ])
+})
+
+test('a reopened session restores its saved cards after a restart, aborts stale ones, and hides other sessions', async ($, on) => {
+  const startNow = 10 * 86_400_000
+  const restartNow = startNow + 5 * 60_000
+  mock.clock(on, { now: restartNow })
+  const claudeRunning = sampleCard({ id: 'agent-keep', provider: 'claude', title: 'Explore · Inspect routes', model: 'claude-haiku-5-5', status: 'running', startedAt: startNow, isThinking: true })
+  const extDone = sampleCard({ id: 'codex-th-done', provider: 'codex', isExternal: true, threadId: 'th-done', title: 'Review diff via Bash', model: 'gpt-6.1-sol', status: 'done', startedAt: startNow, endedAt: startNow + 2000, lastEventAt: startNow + 2000 })
+  const extStale = sampleCard({ id: 'codex-th-stale', provider: 'codex', isExternal: true, threadId: 'th-stale', title: 'Abandoned Codex exec', model: 'gpt-6.1-sol', status: 'running', startedAt: startNow, lastEventAt: startNow + 1000, isThinking: true })
+  const otherCard = sampleCard({ id: 'codex-other', provider: 'codex', isExternal: true, title: 'Other session work', status: 'done', startedAt: startNow, endedAt: startNow + 500 })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: {
+      'sid-keep': { savedAt: startNow + 2000, cards: [claudeRunning, extDone, extStale] },
+      'sid-other': { savedAt: startNow + 500, cards: [otherCard] },
+    },
+  })
+  on('session.id', () => ({ value: 'sid-keep' }))
+  on('session.cwd', () => ({ value: 'project' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+
+  // Fresh test starts with an empty agents atom, simulating an app restart.
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  // All 3 cards came back as finished (the running Claude card and stale external Codex card became aborted).
+  expect(await ui.find({ text: /Finished · 3/ })).toBeDefined()
+  expect(await ui.find({ text: /Review diff via Bash/ })).toBeDefined()
+  expect(await ui.find({ text: /Explore · Inspect routes/ })).toBeDefined()
+  expect(await ui.find({ text: /Abandoned Codex exec/ })).toBeDefined()
+  expect(await ui.find({ text: /Other session work/ })).toBeUndefined()
+  // The two aborted cards show the ■ glyph; the done external Codex card shows ✓.
+  expect((await ui.findAll({ text: /^■$/ })).length).toBe(2)
+  expect((await ui.findAll({ text: /^✓$/ })).length).toBe(1)
+  await ui.unmount()
+
+  // The band above the prompt confirms nothing is left spinning as running.
+  const band = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'AbovePrompt',
+    props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 100, scroll: { offset: 0, bodyRows: 3 }, view: {} },
+  })
+  expect(await band.find({ text: /no agents running/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('restored harness run cards are not duplicated when loadHarnessRuns reloads them from disk', async ($, on) => {
+  const now = 20_000
+  const clock = mock.clock(on, { now })
+  const savedExternal = sampleCard({ id: 'codex-th-1', provider: 'codex', isExternal: true, threadId: 'th-1', title: 'Bash Codex review', status: 'done', startedAt: 10_000, endedAt: 15_000 })
+  const savedHarness = sampleCard({ id: 'h-run-run-1', provider: 'harness', harness: 'antigravity', providerName: 'Antigravity', runId: 'run-1', title: 'Agy research', model: 'gemini', status: 'done', startedAt: 11_000, endedAt: 16_000, output: 'stale copy' })
+  mock.store(on, {
+    harnesses: [],
+    'codex-enabled': false,
+    cards: { 'sid-mix': { savedAt: now - 1000, cards: [savedExternal, savedHarness] } },
+  })
+  on('session.id', () => ({ value: 'sid-mix' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'test-home' : undefined }))
+  const root = '/test-home/.claude/agent-deck/harness-runs'
+  const dir = `${root}/run-1`
+  const files: Record<string, string> = {
+    [`${dir}/meta.json`]: JSON.stringify({ id: 'run-1', harness: 'antigravity', name: 'Antigravity', color: '#3186FF', parser: 'antigravity', title: 'Agy research', cwd: 'project', sessionId: 'sid-mix', startedAt: 11_000, model: 'gemini' }),
+    [`${dir}/exit.txt`]: '0',
+    [`${dir}/stderr.log`]: '',
+    [`${dir}/events.jsonl`]: JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'Fresh from disk' } }) + '\n',
+  }
+  on('fs.list', (_$, e) => {
+    const p = e.path.replace(/\\/g, '/')
+    return { value: p.endsWith(root) ? [{ name: 'run-1', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] : [] }
+  })
+  on('fs.read', (_$, e) => {
+    const p = e.path.replace(/\\/g, '/')
+    const key = Object.keys(files).find(f => p.endsWith(f))
+    return key ? { value: files[key]! } : { deny: 'not found' }
+  })
+  on('fs.exists', () => ({ value: true }))
+
+  await $.session.start({ cwd: 'project', surface: 'desktop', isInteractive: true })
+  await clock.advance(1000)
+  await clock.advance(250)
+
+  const ui = await $.ui.mount({
+    plugin: 'agent-deck',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'agent-deck',
+    props: { title: 'Agents', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  })
+  expect(await ui.find({ text: /Finished · 2/ })).toBeDefined()
+  expect(await ui.find({ text: /Bash Codex review/ })).toBeDefined()
+  await ui.press({ key: 't-h-run-run-1' } as never)
+  await ui.redraw()
+  expect(await ui.find({ text: /Fresh from disk/ })).toBeDefined()
   await ui.unmount()
 })

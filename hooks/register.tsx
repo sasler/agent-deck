@@ -4,11 +4,15 @@ import type { EngineInterface, Register, ToolSpec } from 'claude-code'
 import type { Activity, AgentCard, CacheState, CodexBin, Harness, HarnessModel, HarnessParser, HarnessProvider, HarnessView, LimitWindow, Limits, MeterChoice, MeterProvider, Routing, TaskRoute, Tokens } from '../types'
 import {
   AGENT_RESULT_SPEC,
+  CARD_STALE_MS,
   CODEX_UPDATE_COMMAND,
   DEFAULT_ROUTING,
   DEFAULT_TASKS,
   loadRouting,
+  loadSessionCards,
+  mergeSavedCards,
   resolveRun,
+  restoreCard,
   routeModelChoices,
   routeProblem,
   routedTasks,
@@ -364,14 +368,58 @@ const CODEX_RESULT_SPEC: ToolSpec = {
   },
 }
 
-const persist = ($: $T) =>
-  update($, agents, () => [...cards.values()].slice(-MAX_CARDS))
+const KEY_CARDS = 'cards'
+let flushTimer: { cancel: () => void } | undefined
+let isSavingCards = false
+let hasPendingCardSave = false
+let cardSavePromise: Promise<void> | undefined
+
+const saveCards = ($: $T): Promise<void> => {
+  hasPendingCardSave = true
+  if (isSavingCards && cardSavePromise) return cardSavePromise
+  isSavingCards = true
+  const run = (async () => {
+    try {
+      while (hasPendingCardSave) {
+        hasPendingCardSave = false
+        const sid = sessionId
+        if (!sid) return
+        const list = [...cards.values()].slice(-MAX_CARDS)
+        const now = await $.clock.now()
+        const stored = await $.store.get(KEY_CARDS)
+        const storedObj = stored && typeof stored === 'object' && !Array.isArray(stored) ? (stored as Record<string, unknown>) : undefined
+        const hadSession = !!storedObj && sid in storedObj
+        const next = mergeSavedCards(stored, sid, list, now, { maxCards: MAX_CARDS, maxOutput: MAX_OUTPUT })
+        const pruned = !!storedObj && Object.keys(storedObj).some(k => k !== sid && !(k in next))
+        if (list.length === 0 && !hadSession && !pruned) continue
+        await $.store.set(KEY_CARDS, next)
+      }
+    } finally {
+      isSavingCards = false
+      if (cardSavePromise === run) cardSavePromise = undefined
+    }
+  })()
+  cardSavePromise = run
+  return run
+}
+
+const persist = async ($: $T) => {
+  if (flushPending) {
+    flushTimer?.cancel()
+    flushTimer = undefined
+    flushPending = false
+  }
+  const list = [...cards.values()].slice(-MAX_CARDS)
+  await update($, agents, () => list)
+  if (sessionId) await saveCards($).catch(() => undefined)
+}
 
 const schedule = ($: $T) => {
   if (flushPending) return
   flushPending = true
-  $.clock.after(200, () => {
+  flushTimer = $.clock.after(200, () => {
     flushPending = false
+    flushTimer = undefined
     void persist($)
   })
 }
@@ -508,7 +556,7 @@ const adoptThread = ($: $T, runId: string, thread: string) => {
 
 /** Folds one watcher event about a Codex thread into its card. */
 /** How long a running Codex card has gone without a rollout line, once that passes two minutes. */
-export const STALE_MS = 2 * 60_000
+export const STALE_MS = CARD_STALE_MS
 export const staleFor = (c: AgentCard, now: number): number | undefined => {
   if (c.status !== 'running' || c.provider !== 'codex' || !c.lastEventAt) return undefined
   const quiet = now - c.lastEventAt
@@ -856,7 +904,6 @@ const loadRuns = async ($: $T, root: string) => {
   }
   startRunPoller($)
   startTicking($)
-  await persist($)
 }
 
 const progressOf = (card: AgentCard | undefined): string => {
@@ -1100,7 +1147,6 @@ const loadHarnessRuns = async ($: $T) => {
   }
   startHarnessPoller($)
   startTicking($)
-  await persist($)
 }
 
 const clearTempSecretFile = async ($: $T, file: string) => {
@@ -2002,10 +2048,17 @@ export const register: Register = on => {
     await loadHarnesses($).catch(err => $.ui.toast(`agent-deck: harnesses not loaded: ${String((err as Error)?.message ?? err)}`))
     const started = await next(e)
     sessionId = await $.session.id()
-    for (const c of await read($, agents)) {
-      // Claude subagents can't outlive a reload; Codex runs are re-read from disk below.
-      const isStale = c.status === 'running' && c.provider === 'claude'
-      cards.set(c.id, isStale ? { ...c, status: 'aborted' } : c)
+    const now = await $.clock.now()
+    cards.clear()
+    threadToCard.clear()
+    const fromAtom = await read($, agents)
+    const initial = fromAtom.length
+      ? fromAtom
+      : loadSessionCards(await $.store.get(KEY_CARDS).catch(() => undefined), sessionId, MAX_OUTPUT)
+    for (const raw of initial) {
+      // Claude subagents can't outlive a reload; stale external Codex cards shouldn't spin forever.
+      const c = restoreCard(raw, now, STALE_MS)
+      cards.set(c.id, c)
       if (c.threadId) threadToCard.set(c.threadId, c.id)
     }
     await $.command.register({
@@ -2021,6 +2074,8 @@ export const register: Register = on => {
     const root = await runsRoot($)
     if (root) await loadRuns($, root)
     await loadHarnessRuns($)
+    if (anyRunning()) startTicking($)
+    await persist($)
     if (codexOn) await startCodexWatcher($)
     void refreshClaudeLimits($)
     poller = $.clock.every(60_000, () => void refreshClaudeLimits($))
@@ -2039,6 +2094,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    if (flushPending) await persist($)
     cacheTicker?.cancel()
     cacheSessionEnd()
     strataTimer?.cancel()

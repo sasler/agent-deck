@@ -21,7 +21,7 @@ A Claude Code mod that puts every background agent in one live **Agents** pane: 
   - tokens in and out, cache-hit rate and an API-equivalent cost
   - the AI credits a Copilot run used, with a breakdown by concrete model, including Fusion and subagent work; missing billing is shown as not reported, and incomplete billing as a subtotal
 
-  Finished cards collapse into a list.
+  Finished cards collapse into a list. The pane keeps a session's cards when the session is reopened.
 
 ## Harnesses: Copilot, OpenCode, Antigravity, Gemini, Cursor and more
 

@@ -974,6 +974,92 @@ const sumTokens = (a: Tokens, b: Tokens): Tokens => ({
   input: a.input + b.input, output: a.output + b.output, cacheRead: a.cacheRead + b.cacheRead, cacheWrite: a.cacheWrite + b.cacheWrite, reasoning: a.reasoning + b.reasoning,
 })
 
+// ---------- persisting cards across restarts ----------
+
+export const CARD_TTL_MS = 3 * 86_400_000
+export const CARD_STALE_MS = 2 * 60_000
+
+export type SavedSessionCards = { savedAt: number; cards: AgentCard[] }
+export type SavedCards = Record<string, SavedSessionCards>
+
+const snapshotCard = (c: AgentCard, maxOutput: number): AgentCard => {
+  const output = typeof c.output === 'string' ? c.output : ''
+  return {
+    ...c,
+    output: output.length > maxOutput ? output.slice(-maxOutput) : output,
+    tokens: c.tokens ? { ...c.tokens } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+    activity: Array.isArray(c.activity) ? c.activity.map(a => ({ ...a })) : [],
+    ...(c.modelUsage
+      ? {
+          modelUsage: Object.fromEntries(
+            Object.entries(c.modelUsage).map(([k, u]) => [k, { ...u, tokens: { ...u.tokens } }]),
+          ),
+        }
+      : {}),
+  }
+}
+
+/**
+ * Merges one session's cards into the stored per-session map, trimming each card's
+ * output to maxOutput, capping to maxCards, and pruning entries older than ttlMs.
+ */
+export const mergeSavedCards = (
+  stored: unknown,
+  sessionId: string,
+  cards: readonly AgentCard[],
+  now: number,
+  opts: { maxCards?: number; maxOutput?: number; ttlMs?: number } = {},
+): SavedCards => {
+  const maxCards = opts.maxCards ?? 40
+  const maxOutput = opts.maxOutput ?? MAX_OUTPUT
+  const ttlMs = opts.ttlMs ?? CARD_TTL_MS
+  const next: SavedCards = {}
+  if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+    for (const [sid, entry] of Object.entries(stored as Record<string, unknown>)) {
+      if (!sid || sid === sessionId) continue
+      const o = obj(entry)
+      const savedAt = typeof o.savedAt === 'number' && Number.isFinite(o.savedAt) ? o.savedAt : undefined
+      if (savedAt === undefined || !Array.isArray(o.cards) || now - savedAt > ttlMs) continue
+      next[sid] = { savedAt, cards: o.cards as AgentCard[] }
+    }
+  }
+  if (sessionId && cards.length > 0) {
+    next[sessionId] = {
+      savedAt: now,
+      cards: cards.slice(-maxCards).map(c => snapshotCard(c, maxOutput)),
+    }
+  }
+  return next
+}
+
+/** Reads one session's saved cards from the store value; empty when absent or unreadable. */
+export const loadSessionCards = (stored: unknown, sessionId: string, maxOutput = MAX_OUTPUT): AgentCard[] => {
+  if (!sessionId || !stored || typeof stored !== 'object' || Array.isArray(stored)) return []
+  const entry = obj((stored as Record<string, unknown>)[sessionId])
+  if (!Array.isArray(entry.cards)) return []
+  return entry.cards
+    .filter((c): c is AgentCard => {
+      const o = obj(c)
+      return typeof o.id === 'string' && !!o.id && typeof o.provider === 'string' && typeof o.status === 'string'
+    })
+    .map(c => snapshotCard(c, maxOutput))
+}
+
+/**
+ * Adjusts a restored card's status after a reload or restart: a running Claude subagent
+ * can't outlive the process, and a running external Codex card with no recent rollout
+ * event shouldn't spin forever.
+ */
+export const restoreCard = (card: AgentCard, now: number, staleMs = CARD_STALE_MS): AgentCard => {
+  if (card.status !== 'running') return card
+  if (card.provider === 'claude') return { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? now }
+  if (card.isExternal && card.provider === 'codex') {
+    const last = card.lastEventAt ?? card.startedAt
+    if (now - last > staleMs) return { ...card, status: 'aborted', isThinking: false, endedAt: card.endedAt ?? last }
+  }
+  return card
+}
+
 // ---------- the tools ----------
 
 const MAX_HINTED_MODELS = 15
